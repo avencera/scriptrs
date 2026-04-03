@@ -27,9 +27,9 @@ fn run() -> Result<()> {
 
     #[cfg(feature = "long-form")]
     let result = if args.long_form {
-        LongFormTranscriptionPipeline::from_dir(&args.models_dir)?.run(&audio)?
+        build_long_form_pipeline(&args)?.run(&audio)?
     } else {
-        TranscriptionPipeline::from_dir(&args.models_dir)?.run(&audio)?
+        build_pipeline(&args)?.run(&audio)?
     };
 
     #[cfg(not(feature = "long-form"))]
@@ -37,7 +37,7 @@ fn run() -> Result<()> {
         if args.long_form {
             bail!("rebuild with --features long-form to use --long-form")
         }
-        TranscriptionPipeline::from_dir(&args.models_dir)?.run(&audio)?
+        build_pipeline(&args)?.run(&audio)?
     };
 
     println!("file: {}", args.audio_path.display());
@@ -52,7 +52,8 @@ fn run() -> Result<()> {
 #[derive(Debug, Clone)]
 struct Args {
     audio_path: PathBuf,
-    models_dir: PathBuf,
+    models_dir: Option<PathBuf>,
+    pretrained: bool,
     long_form: bool,
     preview_chars: usize,
 }
@@ -61,14 +62,16 @@ impl Args {
     fn parse(args: impl IntoIterator<Item = String>) -> Result<Self> {
         let mut args = args.into_iter();
         let mut audio_path = None;
-        let mut models_dir = PathBuf::from("fixtures/models");
+        let mut models_dir = None;
+        let mut pretrained = false;
         let mut long_form = false;
         let mut preview_chars = 800usize;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--audio" => audio_path = Some(next_path(&mut args, "--audio")?),
-                "--models-dir" => models_dir = next_path(&mut args, "--models-dir")?,
+                "--models-dir" => models_dir = Some(next_path(&mut args, "--models-dir")?),
+                "--pretrained" => pretrained = true,
                 "--long-form" => long_form = true,
                 "--preview-chars" => {
                     preview_chars = next_value(&mut args, "--preview-chars")?
@@ -92,10 +95,14 @@ impl Args {
         let Some(audio_path) = audio_path else {
             bail!("missing --audio <path.wav>")
         };
+        if pretrained && models_dir.is_some() {
+            bail!("use either --pretrained or --models-dir, not both")
+        }
 
         Ok(Self {
             audio_path,
             models_dir,
+            pretrained,
             long_form,
             preview_chars,
         })
@@ -106,13 +113,52 @@ fn print_usage() {
     eprintln!(
         "Usage:
   cargo run --example transcribe_wav -- --audio <path.wav>
-  cargo run --example transcribe_wav --features long-form -- --audio <path.wav> --long-form
+  cargo run --example transcribe_wav -- --audio <path.wav> --pretrained
+  cargo run --example transcribe_wav --features long-form -- --audio <path.wav> --pretrained --long-form
 
 Options:
-  --models-dir <dir>         scriptrs model bundle directory
+  --models-dir <dir>         local scriptrs model bundle directory
+  --pretrained               download models via the online feature
   --long-form                use LongFormTranscriptionPipeline
   --preview-chars <n>        text preview limit"
     );
+}
+
+fn build_pipeline(args: &Args) -> Result<TranscriptionPipeline> {
+    if let Some(models_dir) = &args.models_dir {
+        return Ok(TranscriptionPipeline::from_dir(models_dir)?);
+    }
+
+    #[cfg(feature = "online")]
+    {
+        let _ = args.pretrained;
+        Ok(TranscriptionPipeline::from_pretrained()?)
+    }
+
+    #[cfg(not(feature = "online"))]
+    {
+        let _ = args.pretrained;
+        bail!("rebuild with the default online feature or pass --models-dir")
+    }
+}
+
+#[cfg(feature = "long-form")]
+fn build_long_form_pipeline(args: &Args) -> Result<LongFormTranscriptionPipeline> {
+    if let Some(models_dir) = &args.models_dir {
+        return Ok(LongFormTranscriptionPipeline::from_dir(models_dir)?);
+    }
+
+    #[cfg(feature = "online")]
+    {
+        let _ = args.pretrained;
+        Ok(LongFormTranscriptionPipeline::from_pretrained()?)
+    }
+
+    #[cfg(not(feature = "online"))]
+    {
+        let _ = args.pretrained;
+        bail!("rebuild with the default online feature or pass --models-dir")
+    }
 }
 
 fn next_path(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<PathBuf> {

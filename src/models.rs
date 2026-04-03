@@ -9,6 +9,10 @@ const JOINT_DECISION_DIR: &str = "parakeet-v2/joint-decision.mlmodelc";
 const VOCAB_FILE: &str = "parakeet-v2/vocab.txt";
 #[cfg(feature = "long-form")]
 const VAD_DIR: &str = "vad/silero-vad.mlmodelc";
+#[cfg(feature = "online")]
+const SCRIPTRS_MODELS_DIR_ENV: &str = "SCRIPTRS_MODELS_DIR";
+#[cfg(feature = "online")]
+const SCRIPTRS_MODELS_REPO_ENV: &str = "SCRIPTRS_MODELS_REPO";
 
 /// Resolved model paths for `scriptrs`
 #[derive(Debug, Clone)]
@@ -39,27 +43,6 @@ impl ModelBundle {
             #[cfg(feature = "long-form")]
             vad_dir: root.join(VAD_DIR),
             root,
-        }
-    }
-
-    #[cfg(feature = "online")]
-    fn from_pretrained_paths(
-        root: PathBuf,
-        encoder_dir: PathBuf,
-        decoder_dir: PathBuf,
-        joint_decision_dir: PathBuf,
-        vocab_path: PathBuf,
-        #[cfg(feature = "long-form")] vad_dir: Option<PathBuf>,
-    ) -> Self {
-        Self {
-            root,
-            encoder_dir,
-            decoder_joint_dir: None,
-            decoder_dir: Some(decoder_dir),
-            joint_decision_dir: Some(joint_decision_dir),
-            vocab_path,
-            #[cfg(feature = "long-form")]
-            vad_dir: vad_dir.unwrap_or_default(),
         }
     }
 
@@ -142,30 +125,29 @@ impl ModelBundle {
     #[cfg(feature = "online")]
     /// Download the base Parakeet model bundle from Hugging Face
     pub fn from_pretrained() -> Result<Self, hf_hub::api::sync::ApiError> {
+        if let Ok(models_dir) = std::env::var(SCRIPTRS_MODELS_DIR_ENV) {
+            return Ok(Self::from_dir(models_dir));
+        }
         ModelManager::new()?.ensure_base()
     }
 
     #[cfg(all(feature = "online", feature = "long-form"))]
     /// Download the Parakeet and VAD model bundle from Hugging Face
     pub fn from_pretrained_long_form() -> Result<Self, hf_hub::api::sync::ApiError> {
+        if let Ok(models_dir) = std::env::var(SCRIPTRS_MODELS_DIR_ENV) {
+            return Ok(Self::from_dir(models_dir));
+        }
         ModelManager::new()?.ensure_long_form()
     }
 }
 
 #[cfg(feature = "online")]
-const PARAKEET_COREML_REPO: &str = "FluidInference/parakeet-tdt-0.6b-v2-coreml";
-#[cfg(feature = "online")]
-const PARAKEET_VOCAB_REPO: &str = "istupakov/parakeet-tdt-0.6b-v2-onnx";
-#[cfg(all(feature = "online", feature = "long-form"))]
-const SILERO_VAD_REPO: &str = "aufklarer/Silero-VAD-v5-CoreML";
+const HF_REPO: &str = "avencera/scriptrs-models";
 
 /// Downloads and caches model bundles from Hugging Face
 #[cfg(feature = "online")]
 pub struct ModelManager {
-    coreml_repo: hf_hub::api::sync::ApiRepo,
-    vocab_repo: hf_hub::api::sync::ApiRepo,
-    #[cfg(feature = "long-form")]
-    vad_repo: hf_hub::api::sync::ApiRepo,
+    repo: hf_hub::api::sync::ApiRepo,
 }
 
 #[cfg(feature = "online")]
@@ -173,66 +155,72 @@ impl ModelManager {
     /// Create a model manager using the default Hugging Face cache
     pub fn new() -> Result<Self, hf_hub::api::sync::ApiError> {
         let api = hf_hub::api::sync::Api::new()?;
-        Ok(Self {
-            coreml_repo: api.model(PARAKEET_COREML_REPO.to_owned()),
-            vocab_repo: api.model(PARAKEET_VOCAB_REPO.to_owned()),
-            #[cfg(feature = "long-form")]
-            vad_repo: api.model(SILERO_VAD_REPO.to_owned()),
-        })
+        Ok(Self::from_api(api))
     }
 
     /// Create a model manager using a custom cache directory
     pub fn with_cache_dir(cache_dir: PathBuf) -> Result<Self, hf_hub::api::sync::ApiError> {
         let api =
             hf_hub::api::sync::ApiBuilder::from_cache(hf_hub::Cache::new(cache_dir)).build()?;
-        Ok(Self {
-            coreml_repo: api.model(PARAKEET_COREML_REPO.to_owned()),
-            vocab_repo: api.model(PARAKEET_VOCAB_REPO.to_owned()),
-            #[cfg(feature = "long-form")]
-            vad_repo: api.model(SILERO_VAD_REPO.to_owned()),
-        })
+        Ok(Self::from_api(api))
+    }
+
+    fn from_api(api: hf_hub::api::sync::Api) -> Self {
+        let repo_id = std::env::var(SCRIPTRS_MODELS_REPO_ENV).unwrap_or_else(|_| HF_REPO.into());
+        Self {
+            repo: api.model(repo_id),
+        }
     }
 
     /// Ensure the base Parakeet model bundle is cached locally
     pub fn ensure_base(&self) -> Result<ModelBundle, hf_hub::api::sync::ApiError> {
-        let encoder_dir = self.download_mlmodelc_bundle(&self.coreml_repo, "Encoder.mlmodelc")?;
-        let decoder_dir = self.download_mlmodelc_bundle(&self.coreml_repo, "Decoder.mlmodelc")?;
-        let joint_decision_dir =
-            self.download_mlmodelc_bundle(&self.coreml_repo, "JointDecision.mlmodelc")?;
-        let vocab_path = self.vocab_repo.get("vocab.txt")?;
-        let root = encoder_dir
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| encoder_dir.clone());
-        Ok(ModelBundle::from_pretrained_paths(
-            root,
-            encoder_dir,
-            decoder_dir,
-            joint_decision_dir,
-            vocab_path,
-            #[cfg(feature = "long-form")]
-            None,
-        ))
+        self.ensure_unified(false)
     }
 
     #[cfg(feature = "long-form")]
     /// Ensure the Parakeet and VAD model bundle is cached locally
     pub fn ensure_long_form(&self) -> Result<ModelBundle, hf_hub::api::sync::ApiError> {
-        let mut bundle = self.ensure_base()?;
-        bundle.vad_dir = self.download_mlmodelc_bundle(&self.vad_repo, "silero_vad.mlmodelc")?;
-        Ok(bundle)
+        self.ensure_unified(true)
     }
 
-    fn download_mlmodelc_bundle(
+    fn ensure_unified(
+        &self,
+        include_vad: bool,
+    ) -> Result<ModelBundle, hf_hub::api::sync::ApiError> {
+        #[cfg(not(feature = "long-form"))]
+        let files = {
+            let _ = include_vad;
+            base_repo_files()
+        };
+        #[cfg(feature = "long-form")]
+        let files = {
+            let mut files = base_repo_files();
+            if include_vad {
+                files.extend(mlmodelc_files(VAD_DIR));
+            }
+            files
+        };
+        let root = self.download_repo_layout(&self.repo, &files)?;
+        Ok(ModelBundle::from_dir(root))
+    }
+
+    fn download_repo_layout(
         &self,
         repo: &hf_hub::api::sync::ApiRepo,
-        prefix: &str,
+        files: &[String],
     ) -> Result<PathBuf, hf_hub::api::sync::ApiError> {
-        for file in mlmodelc_files(prefix) {
-            repo.get(&file)?;
+        let mut first = None;
+        for file in files {
+            let cached_path = repo.get(file)?;
+            if first.is_none() {
+                first = Some((cached_path, file.as_str()));
+            }
         }
-        let model = repo.get(&format!("{prefix}/model.mil"))?;
-        Ok(model.parent().map(Path::to_path_buf).unwrap_or(model))
+
+        let Some((cached_path, relative_path)) = first else {
+            unreachable!("model file list should never be empty");
+        };
+        Ok(snapshot_root_from_cached_file(&cached_path, relative_path))
     }
 }
 
@@ -245,4 +233,51 @@ fn mlmodelc_files(prefix: &str) -> Vec<String> {
         format!("{prefix}/analytics/coremldata.bin"),
         format!("{prefix}/metadata.json"),
     ]
+}
+
+#[cfg(feature = "online")]
+fn base_repo_files() -> Vec<String> {
+    let mut files = vec![VOCAB_FILE.to_owned()];
+    files.extend(mlmodelc_files(ENCODER_DIR));
+    files.extend(mlmodelc_files(DECODER_DIR));
+    files.extend(mlmodelc_files(JOINT_DECISION_DIR));
+    files
+}
+
+#[cfg(feature = "online")]
+fn snapshot_root_from_cached_file(cached_path: &Path, relative_path: &str) -> PathBuf {
+    let mut root = cached_path.to_path_buf();
+    for _ in Path::new(relative_path).components() {
+        root.pop();
+    }
+    root
+}
+
+#[cfg(all(test, feature = "online"))]
+mod tests {
+    use super::{ENCODER_DIR, VOCAB_FILE, base_repo_files, snapshot_root_from_cached_file};
+    use std::path::Path;
+
+    #[test]
+    fn base_repo_files_include_required_assets() {
+        let files = base_repo_files();
+        assert!(files.iter().any(|file| file == VOCAB_FILE));
+        assert!(
+            files
+                .iter()
+                .any(|file| file == &format!("{ENCODER_DIR}/model.mil"))
+        );
+    }
+
+    #[test]
+    fn snapshot_root_strips_relative_layout() {
+        let cached = Path::new(
+            "/tmp/hf/models--avencera--scriptrs-models/snapshots/abc/parakeet-v2/encoder.mlmodelc/model.mil",
+        );
+        let root = snapshot_root_from_cached_file(cached, "parakeet-v2/encoder.mlmodelc/model.mil");
+        assert_eq!(
+            root,
+            Path::new("/tmp/hf/models--avencera--scriptrs-models/snapshots/abc")
+        );
+    }
 }
