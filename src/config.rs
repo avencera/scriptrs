@@ -3,6 +3,10 @@ use crate::constants::{
 };
 
 /// Configuration for single-chunk transcription
+///
+/// The defaults match the current Parakeet TDT v2 frontend. Most callers should
+/// start with `TranscriptionConfig::default()` and only override fields when
+/// they intentionally want to change frontend behavior.
 #[derive(Debug, Clone)]
 pub struct TranscriptionConfig {
     /// Sample rate expected by the pipeline

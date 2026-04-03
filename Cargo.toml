@@ -8,6 +8,10 @@ authors = ["Praveen Perera"]
 description = "Rust transcription with native CoreML Parakeet v2 inference"
 license = "Apache-2.0"
 repository = "https://github.com/avencera/scriptrs"
+homepage = "https://github.com/avencera/scriptrs"
+documentation = "https://docs.rs/scriptrs"
+readme = "README.md"
+keywords = ["asr", "transcription", "speech", "coreml", "macos"]
 
 [features]
 default = ["online"]

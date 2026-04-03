@@ -10,6 +10,14 @@ use crate::vocab::Vocabulary;
 use ndarray::{Array2, s};
 
 /// Single-chunk Parakeet v2 transcription pipeline
+///
+/// This is the base `scriptrs` entry point for audio that already fits inside a
+/// single Parakeet window. It expects mono 16kHz audio samples as `&[f32]`.
+///
+/// If the input is longer than [`TranscriptionConfig::max_audio_samples`], this
+/// pipeline returns [`TranscriptionError::AudioTooLong`] instead of splitting it.
+/// Use `LongFormTranscriptionPipeline` with the `long-form` feature if you want
+/// `scriptrs` to own chunk planning internally.
 #[derive(Debug, Clone)]
 pub struct TranscriptionPipeline {
     bundle: ModelBundle,
@@ -21,6 +29,9 @@ pub struct TranscriptionPipeline {
 
 impl TranscriptionPipeline {
     /// Build a transcription pipeline from a local model directory
+    ///
+    /// The directory must contain the Parakeet runtime bundle expected by
+    /// [`ModelBundle::from_dir`].
     pub fn from_dir(models_dir: impl Into<std::path::PathBuf>) -> Result<Self, TranscriptionError> {
         let bundle = ModelBundle::from_dir(models_dir);
         Self::from_bundle(bundle)
@@ -43,6 +54,10 @@ impl TranscriptionPipeline {
 
     #[cfg(feature = "online")]
     /// Download models and build a transcription pipeline
+    ///
+    /// With the default configuration this resolves models from
+    /// `avencera/scriptrs-models` on Hugging Face. Set `SCRIPTRS_MODELS_DIR` to
+    /// force a local bundle or `SCRIPTRS_MODELS_REPO` to override the repo.
     pub fn from_pretrained() -> Result<Self, TranscriptionError> {
         let bundle = ModelBundle::from_pretrained().map_err(|error| {
             TranscriptionError::CoreMl(format!("model download failed: {error}"))
@@ -51,11 +66,18 @@ impl TranscriptionPipeline {
     }
 
     /// Transcribe a single chunk of audio
+    ///
+    /// `audio` must be mono 16kHz samples. Empty input returns
+    /// [`TranscriptionError::EmptyAudio`]. Oversized input returns
+    /// [`TranscriptionError::AudioTooLong`].
     pub fn run(&self, audio: &[f32]) -> Result<TranscriptionResult, TranscriptionError> {
         self.run_with_config(audio, &self.config)
     }
 
     /// Transcribe a single chunk of audio with an explicit config
+    ///
+    /// This is mainly useful if you want to reuse the same pipeline with a
+    /// tweaked [`TranscriptionConfig`] instead of the default frontend settings.
     pub fn run_with_config(
         &self,
         audio: &[f32],

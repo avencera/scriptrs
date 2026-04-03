@@ -18,6 +18,15 @@ use self::planner::{
 use self::vad::SileroVad;
 
 /// Long-form transcription pipeline with VAD and overlap fallback
+///
+/// This is the opt-in `scriptrs` entry point for long recordings. It wraps the
+/// base [`TranscriptionPipeline`] and adds:
+///
+/// - VAD-based speech region detection
+/// - silence-based splitting when possible
+/// - overlap-window fallback when speech runs too long without silence
+///
+/// It expects the same mono 16kHz `&[f32]` input as the base pipeline.
 #[derive(Debug, Clone)]
 pub struct LongFormTranscriptionPipeline {
     inner: TranscriptionPipeline,
@@ -26,6 +35,9 @@ pub struct LongFormTranscriptionPipeline {
 }
 
 /// Configuration for `LongFormTranscriptionPipeline`
+///
+/// This groups together the base transcription settings, VAD thresholds, and
+/// overlap-fallback settings used for long recordings.
 #[derive(Debug, Clone, Default)]
 pub struct LongFormConfig {
     /// Single-chunk transcription settings
@@ -40,6 +52,9 @@ pub struct LongFormConfig {
 
 impl LongFormTranscriptionPipeline {
     /// Build a long-form pipeline from a local model directory
+    ///
+    /// The directory must contain the base Parakeet bundle plus the VAD model
+    /// expected by [`ModelBundle::validate_long_form`].
     pub fn from_dir(models_dir: impl Into<std::path::PathBuf>) -> Result<Self, TranscriptionError> {
         let bundle = ModelBundle::from_dir(models_dir);
         Self::from_bundle(bundle)
@@ -59,6 +74,10 @@ impl LongFormTranscriptionPipeline {
 
     #[cfg(feature = "online")]
     /// Download models and build a long-form pipeline
+    ///
+    /// With the default configuration this resolves models from
+    /// `avencera/scriptrs-models` on Hugging Face. Set `SCRIPTRS_MODELS_DIR` to
+    /// force a local bundle or `SCRIPTRS_MODELS_REPO` to override the repo.
     pub fn from_pretrained() -> Result<Self, TranscriptionError> {
         let bundle = ModelBundle::from_pretrained_long_form().map_err(|error| {
             TranscriptionError::CoreMl(format!("model download failed: {error}"))
@@ -67,6 +86,9 @@ impl LongFormTranscriptionPipeline {
     }
 
     /// Transcribe audio, applying VAD and overlap fallback when needed
+    ///
+    /// Short clips still go through the base single-chunk path. Longer clips are
+    /// regionized with VAD and split automatically.
     pub fn run(&self, audio: &[f32]) -> Result<TranscriptionResult, TranscriptionError> {
         self.run_with_config(audio, &self.default_config)
     }
@@ -88,6 +110,9 @@ impl LongFormTranscriptionPipeline {
     }
 
     /// Run the inner single-chunk pipeline directly
+    ///
+    /// This is useful when you want to reuse the long-form model bundle but feed
+    /// already-split chunks through the base transcription path yourself.
     pub fn run_chunk(&self, audio: &[f32]) -> Result<TranscriptionResult, TranscriptionError> {
         self.inner.run(audio)
     }

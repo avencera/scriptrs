@@ -1,18 +1,18 @@
 # scriptrs
 
-> [!WARNING]
-> Work in progress
->
-> `scriptrs` is early and intentionally narrow right now:
-> - macOS only
-> - Apple CoreML only
-> - Parakeet TDT v2 only
-> - no CUDA
-> - no non-macOS backend yet
+**Work in progress**
+
+`scriptrs` is early and intentionally narrow right now:
+
+- macOS only
+- Apple CoreML only
+- Parakeet TDT v2 only
+- no CUDA
+- no non-macOS backend yet
 
 Rust transcription with native CoreML Parakeet v2 inference.
 
-The base crate exposes a single-chunk [`TranscriptionPipeline`](./src/pipeline.rs). Long-audio chunking, VAD, and overlap fallback live behind the `long-form` feature via [`LongFormTranscriptionPipeline`](./src/long_form.rs).
+The base crate exposes a single-chunk `TranscriptionPipeline`. Long-audio chunking, VAD, and overlap fallback live behind the `long-form` feature via `LongFormTranscriptionPipeline`.
 
 ## Current scope
 

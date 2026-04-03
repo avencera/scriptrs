@@ -3,9 +3,98 @@
 
 //! Rust transcription with native CoreML Parakeet v2 inference
 //!
+//! `scriptrs` is currently a narrow macOS-first transcription crate:
+//!
+//! - macOS only
+//! - CoreML only
+//! - Parakeet TDT v2 only
+//! - mono 16kHz `&[f32]` input
+//!
 //! The base crate exposes a single-chunk [`TranscriptionPipeline`]. Long-audio
 //! chunking, VAD, and overlap merging are available behind the `long-form`
 //! feature via [`LongFormTranscriptionPipeline`].
+//!
+//! # Choosing a pipeline
+//!
+//! Use [`TranscriptionPipeline`] when your audio already fits in one Parakeet
+//! window. If the input is too long, it returns [`TranscriptionError::AudioTooLong`].
+//!
+//! Use [`LongFormTranscriptionPipeline`] with the `long-form` feature when you
+//! want `scriptrs` to own VAD, chunking, silence-based splitting, and overlap
+//! fallback internally.
+//!
+//! # Model loading
+//!
+//! With the default `online` feature, [`TranscriptionPipeline::from_pretrained`]
+//! and [`LongFormTranscriptionPipeline::from_pretrained`] download the runtime
+//! bundle from `avencera/scriptrs-models` on Hugging Face.
+//!
+//! If you already manage models yourself, use [`TranscriptionPipeline::from_dir`]
+//! or [`LongFormTranscriptionPipeline::from_dir`] with a local bundle layout:
+//!
+//! ```text
+//! models/
+//!   parakeet-v2/
+//!     encoder.mlmodelc/
+//!     decoder.mlmodelc/
+//!     joint-decision.mlmodelc/
+//!     vocab.txt
+//! ```
+//!
+//! With `long-form`, add:
+//!
+//! ```text
+//! models/
+//!   vad/
+//!     silero-vad.mlmodelc/
+//! ```
+//!
+//! You can also override model resolution with environment variables:
+//!
+//! - `SCRIPTRS_MODELS_DIR=/path/to/models`
+//! - `SCRIPTRS_MODELS_REPO=owner/repo`
+//!
+//! # Input requirements
+//!
+//! `scriptrs` expects mono 16kHz audio samples as `&[f32]`. File decoding stays
+//! outside the core library on purpose.
+//!
+//! # Examples
+//!
+//! Single-chunk transcription:
+//!
+//! ```no_run
+//! use scriptrs::TranscriptionPipeline;
+//!
+//! # fn load_audio() -> Vec<f32> { Vec::new() }
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let audio = load_audio();
+//! let pipeline = TranscriptionPipeline::from_pretrained()?;
+//! let result = pipeline.run(&audio)?;
+//!
+//! println!("{}", result.text);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Long-form transcription:
+//!
+//! ```no_run
+//! # #[cfg(feature = "long-form")]
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use scriptrs::LongFormTranscriptionPipeline;
+//!
+//! # fn load_audio() -> Vec<f32> { Vec::new() }
+//! let audio = load_audio();
+//! let pipeline = LongFormTranscriptionPipeline::from_pretrained()?;
+//! let result = pipeline.run(&audio)?;
+//!
+//! println!("{}", result.text);
+//! # Ok(())
+//! # }
+//! # #[cfg(not(feature = "long-form"))]
+//! # fn main() {}
+//! ```
 
 mod config;
 mod constants;

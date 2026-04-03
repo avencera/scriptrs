@@ -15,6 +15,9 @@ const SCRIPTRS_MODELS_DIR_ENV: &str = "SCRIPTRS_MODELS_DIR";
 const SCRIPTRS_MODELS_REPO_ENV: &str = "SCRIPTRS_MODELS_REPO";
 
 /// Resolved model paths for `scriptrs`
+///
+/// Most callers will use `TranscriptionPipeline::from_pretrained` or
+/// `TranscriptionPipeline::from_dir` instead of constructing this directly.
 #[derive(Debug, Clone)]
 pub struct ModelBundle {
     root: PathBuf,
@@ -29,6 +32,9 @@ pub struct ModelBundle {
 
 impl ModelBundle {
     /// Resolve the expected model layout from a local directory
+    ///
+    /// This only resolves paths. File existence is checked later by
+    /// [`Self::validate_base`] or [`Self::validate_long_form`].
     pub fn from_dir(models_dir: impl Into<PathBuf>) -> Self {
         let root = models_dir.into();
         let decoder_joint_dir = root.join(DECODER_JOINT_DIR);
@@ -124,6 +130,10 @@ impl ModelBundle {
 
     #[cfg(feature = "online")]
     /// Download the base Parakeet model bundle from Hugging Face
+    ///
+    /// By default this resolves models from `avencera/scriptrs-models`. Set
+    /// `SCRIPTRS_MODELS_DIR` to force a local bundle or `SCRIPTRS_MODELS_REPO`
+    /// to override the Hugging Face repo.
     pub fn from_pretrained() -> Result<Self, hf_hub::api::sync::ApiError> {
         if let Ok(models_dir) = std::env::var(SCRIPTRS_MODELS_DIR_ENV) {
             return Ok(Self::from_dir(models_dir));
@@ -133,6 +143,10 @@ impl ModelBundle {
 
     #[cfg(all(feature = "online", feature = "long-form"))]
     /// Download the Parakeet and VAD model bundle from Hugging Face
+    ///
+    /// By default this resolves models from `avencera/scriptrs-models`. Set
+    /// `SCRIPTRS_MODELS_DIR` to force a local bundle or `SCRIPTRS_MODELS_REPO`
+    /// to override the Hugging Face repo.
     pub fn from_pretrained_long_form() -> Result<Self, hf_hub::api::sync::ApiError> {
         if let Ok(models_dir) = std::env::var(SCRIPTRS_MODELS_DIR_ENV) {
             return Ok(Self::from_dir(models_dir));
@@ -145,6 +159,9 @@ impl ModelBundle {
 const HF_REPO: &str = "avencera/scriptrs-models";
 
 /// Downloads and caches model bundles from Hugging Face
+///
+/// This is mainly useful if you want direct control over the Hugging Face cache
+/// directory or want to prefetch assets before building a pipeline.
 #[cfg(feature = "online")]
 pub struct ModelManager {
     repo: hf_hub::api::sync::ApiRepo,
@@ -173,12 +190,18 @@ impl ModelManager {
     }
 
     /// Ensure the base Parakeet model bundle is cached locally
+    ///
+    /// The returned [`ModelBundle`] points at the resolved snapshot directory
+    /// inside the Hugging Face cache.
     pub fn ensure_base(&self) -> Result<ModelBundle, hf_hub::api::sync::ApiError> {
         self.ensure_unified(false)
     }
 
     #[cfg(feature = "long-form")]
     /// Ensure the Parakeet and VAD model bundle is cached locally
+    ///
+    /// The returned [`ModelBundle`] points at the resolved snapshot directory
+    /// inside the Hugging Face cache.
     pub fn ensure_long_form(&self) -> Result<ModelBundle, hf_hub::api::sync::ApiError> {
         self.ensure_unified(true)
     }
