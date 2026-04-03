@@ -158,5 +158,5 @@ The example expects mono 16kHz WAV input.
 ## Notes
 
 - The public API is still moving
-- The CoreML model layout is still tied to the currently staged Parakeet export
+- `scriptrs` currently targets the exact file layout and model I/O shipped in `avencera/scriptrs-models`; if you swap in a different CoreML Parakeet export, you may need runtime code changes
 - Long-form is intentionally optional so callers with their own segmentation pipeline do not pay for the extra machinery
