@@ -1,0 +1,14 @@
+[package]
+name = "scriptrs-dev-tools"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+eyre = "0.6.12"
+hound = "3.5.1"
+parakeet-rs = { version = "0.3.4", default-features = false, features = [
+    "cpu",
+    "ort-defaults",
+] }
+scriptrs = { path = "..", default-features = false }
