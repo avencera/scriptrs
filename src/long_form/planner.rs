@@ -1,4 +1,6 @@
-use crate::constants::{MAX_MODEL_SAMPLES, SAMPLE_RATE, SAMPLES_PER_ENCODER_FRAME};
+use crate::constants::{
+    MAX_MODEL_SAMPLES, SAMPLE_RATE, SAMPLES_PER_ENCODER_FRAME, VAD_WINDOW_SAMPLES,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SampleRange {
@@ -139,7 +141,7 @@ pub(crate) fn detect_speech_regions(
         return Vec::new();
     }
 
-    let hop_size = 4096usize;
+    let hop_size = VAD_WINDOW_SAMPLES;
     let min_speech_samples = (config.min_speech_duration * SAMPLE_RATE as f64) as usize;
     let min_silence_samples = (config.min_silence_duration * SAMPLE_RATE as f64) as usize;
     let speech_pad_samples = (config.speech_padding * SAMPLE_RATE as f64) as usize;
@@ -222,8 +224,8 @@ pub(crate) fn detect_speech_regions(
 }
 
 pub(crate) fn region_probability_slice(probabilities: &[f32], region: SampleRange) -> &[f32] {
-    let frame_start = region.start / 4096;
-    let frame_end = region.end.div_ceil(4096);
+    let frame_start = region.start / VAD_WINDOW_SAMPLES;
+    let frame_end = region.end.div_ceil(VAD_WINDOW_SAMPLES);
     &probabilities[frame_start.min(probabilities.len())..frame_end.min(probabilities.len())]
 }
 
@@ -274,13 +276,13 @@ fn silence_spans(
     region_probabilities: &[f32],
     threshold: f32,
 ) -> Vec<SampleRange> {
-    let region_frame_start = region.start / 4096;
+    let region_frame_start = region.start / VAD_WINDOW_SAMPLES;
     let mut spans = Vec::new();
     let mut start = None;
 
     for (index, probability) in region_probabilities.iter().copied().enumerate() {
         let absolute_frame = region_frame_start + index;
-        let sample_start = absolute_frame * 4096;
+        let sample_start = absolute_frame * VAD_WINDOW_SAMPLES;
         if probability <= threshold {
             start.get_or_insert(sample_start);
             continue;
@@ -309,13 +311,14 @@ mod tests {
         OverlapChunkConfig, SampleRange, VadSegmentationConfig, detect_speech_regions,
         plan_region_subsegments,
     };
+    use crate::constants::VAD_WINDOW_SAMPLES;
 
     #[test]
     fn speech_regions_trim_short_silence() {
         let probabilities = vec![0.9, 0.9, 0.1, 0.9, 0.9];
         let regions = detect_speech_regions(
             &probabilities,
-            probabilities.len() * 4096,
+            probabilities.len() * VAD_WINDOW_SAMPLES,
             0.85,
             &VadSegmentationConfig::default(),
         );
@@ -324,20 +327,20 @@ mod tests {
 
     #[test]
     fn silence_split_prefers_internal_gap() {
-        let probabilities = vec![0.9, 0.9, 0.9, 0.2, 0.2, 0.9, 0.9, 0.9];
+        let probabilities = vec![0.9, 0.9, 0.9, 0.2, 0.2, 0.2, 0.2, 0.9, 0.9, 0.9];
         let region = SampleRange {
             start: 0,
-            end: probabilities.len() * 4096,
+            end: probabilities.len() * VAD_WINDOW_SAMPLES,
         };
         let segments = plan_region_subsegments(
             region,
             &probabilities,
             &VadSegmentationConfig::default(),
-            4 * 4096,
+            5 * VAD_WINDOW_SAMPLES,
         )
         .unwrap();
         assert_eq!(segments.len(), 2);
-        assert!(segments[0].end <= 4 * 4096);
+        assert!(segments[0].end <= 5 * VAD_WINDOW_SAMPLES);
     }
 
     #[test]
@@ -345,14 +348,14 @@ mod tests {
         let probabilities = vec![0.9; 10];
         let region = SampleRange {
             start: 0,
-            end: probabilities.len() * 4096,
+            end: probabilities.len() * VAD_WINDOW_SAMPLES,
         };
         assert!(
             plan_region_subsegments(
                 region,
                 &probabilities,
                 &VadSegmentationConfig::default(),
-                4 * 4096
+                4 * VAD_WINDOW_SAMPLES
             )
             .is_none()
         );

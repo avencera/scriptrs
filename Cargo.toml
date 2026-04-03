@@ -3,6 +3,7 @@ name = "scriptrs"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
+exclude = ["fixtures/", "dev-tools/"]
 authors = ["Praveen Perera"]
 description = "Rust transcription with native CoreML Parakeet v2 inference"
 license = "Apache-2.0"
@@ -48,3 +49,5 @@ objc2-foundation = { version = "0.3", features = [
 
 [dev-dependencies]
 approx = "0.5.1"
+eyre = "0.6.12"
+hound = "3.5.1"

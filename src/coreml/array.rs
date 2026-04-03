@@ -86,26 +86,37 @@ pub(super) fn extract_output(
 ) -> Result<(Vec<f32>, Vec<usize>), TranscriptionError> {
     // SAFETY: CoreML guarantees these accessors describe the live MLMultiArray returned
     // SAFETY: by prediction, including the element count, dtype, and backing pointer
-    let (count, ptr, dtype, shape) = unsafe {
+    let (count, ptr, dtype, shape, strides) = unsafe {
         (
             array.count() as usize,
             array.dataPointer(),
             array.dataType(),
             array.shape(),
+            array.strides(),
         )
     };
     let shape: Vec<usize> = (0..shape.len())
         .map(|index| shape.objectAtIndex(index).as_isize() as usize)
         .collect();
+    let strides: Vec<isize> = (0..strides.len())
+        .map(|index| strides.objectAtIndex(index).as_isize())
+        .collect();
     let data = match dtype {
         MLMultiArrayDataType::Float16 => {
-            // SAFETY: CoreML reports `count` Float16 scalars backed by `dataPointer`
-            let fp16 = unsafe { std::slice::from_raw_parts(ptr.as_ptr() as *const u16, count) };
-            fp16.iter().copied().map(f16_to_f32).collect()
+            read_strided(ptr.as_ptr() as *const u16, count, &shape, &strides)?
+                .into_iter()
+                .map(f16_to_f32)
+                .collect()
         }
         MLMultiArrayDataType::Float32 => {
-            // SAFETY: CoreML reports `count` Float32 scalars backed by `dataPointer`
-            unsafe { std::slice::from_raw_parts(ptr.as_ptr() as *const f32, count).to_vec() }
+            read_strided(ptr.as_ptr() as *const f32, count, &shape, &strides)?
+        }
+        MLMultiArrayDataType::Int32 => {
+            read_strided(ptr.as_ptr() as *const i32, count, &shape, &strides)?
+                .iter()
+                .copied()
+                .map(|value| value as f32)
+                .collect()
         }
         _ => {
             return Err(TranscriptionError::CoreMl(format!(
@@ -114,6 +125,53 @@ pub(super) fn extract_output(
         }
     };
     Ok((data, shape))
+}
+
+fn read_strided<T: Copy>(
+    ptr: *const T,
+    count: usize,
+    shape: &[usize],
+    strides: &[isize],
+) -> Result<Vec<T>, TranscriptionError> {
+    if shape.len() != strides.len() {
+        return Err(TranscriptionError::CoreMl(format!(
+            "shape/stride rank mismatch: shape={shape:?} strides={strides:?}"
+        )));
+    }
+
+    let mut values = Vec::with_capacity(count);
+    for linear_index in 0..count {
+        let offset = linear_offset(linear_index, shape, strides)?;
+        // SAFETY: `offset` is computed from the live MLMultiArray shape/strides and points
+        // SAFETY: to the logical element for this row-major linear index
+        values.push(unsafe { *ptr.offset(offset) });
+    }
+
+    Ok(values)
+}
+
+fn linear_offset(
+    mut linear_index: usize,
+    shape: &[usize],
+    strides: &[isize],
+) -> Result<isize, TranscriptionError> {
+    let mut offset = 0isize;
+    for dimension in (0..shape.len()).rev() {
+        let size = shape[dimension];
+        if size == 0 {
+            return Err(TranscriptionError::CoreMl(
+                "CoreML output had a zero-sized dimension".to_owned(),
+            ));
+        }
+        let index = linear_index % size;
+        linear_index /= size;
+        offset += strides[dimension]
+            .checked_mul(index as isize)
+            .ok_or_else(|| {
+                TranscriptionError::CoreMl("CoreML stride offset overflowed".to_owned())
+            })?;
+    }
+    Ok(offset)
 }
 
 fn f16_to_f32(bits: u16) -> f32 {
@@ -140,6 +198,6 @@ fn f16_to_f32(bits: u16) -> f32 {
         return f32::from_bits((sign << 31) | (0xff_u32 << 23) | (mantissa << 13));
     }
 
-    let f32_exp = exp - 15 + 127;
-    f32::from_bits((sign << 31) | (f32_exp << 23) | (mantissa << 13))
+    let f32_exp = (exp as i32) - 15 + 127;
+    f32::from_bits((sign << 31) | ((f32_exp as u32) << 23) | (mantissa << 13))
 }

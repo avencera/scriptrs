@@ -7,6 +7,7 @@ use crate::model::ParakeetModel;
 use crate::models::ModelBundle;
 use crate::types::TranscriptionResult;
 use crate::vocab::Vocabulary;
+use ndarray::{Array2, s};
 
 /// Single-chunk Parakeet v2 transcription pipeline
 #[derive(Debug, Clone)]
@@ -102,7 +103,9 @@ impl TranscriptionPipeline {
         }
 
         let features = self.extractor.extract(audio)?;
-        let mut raw = self.model.transcribe(&features)?;
+        let feature_frames = features.shape()[0];
+        let padded_features = pad_features(features, config.max_feature_frames());
+        let mut raw = self.model.transcribe(&padded_features, feature_frames)?;
         apply_time_offsets(
             &mut raw,
             global_sample_offset / SAMPLES_PER_ENCODER_FRAME,
@@ -110,6 +113,18 @@ impl TranscriptionPipeline {
         );
         Ok(raw)
     }
+}
+
+fn pad_features(features: Array2<f32>, target_frames: usize) -> Array2<f32> {
+    let current_frames = features.shape()[0];
+    if current_frames >= target_frames {
+        return features;
+    }
+
+    let feature_size = features.shape()[1];
+    let mut padded = Array2::<f32>::zeros((target_frames, feature_size));
+    padded.slice_mut(s![..current_frames, ..]).assign(&features);
+    padded
 }
 
 fn apply_time_offsets(raw: &mut RawTranscription, frame_offset: usize, context_frames: usize) {

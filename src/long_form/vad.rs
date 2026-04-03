@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::constants::{VAD_CONTEXT_SAMPLES, VAD_STATE_SIZE, VAD_WINDOW_SAMPLES};
 use crate::coreml::{CoreMlInput, CoreMlModel, CoreMlTensor};
 use crate::error::TranscriptionError;
 use crate::long_form::planner::VadConfig;
@@ -62,57 +63,54 @@ fn process_coreml_vad(model: &CoreMlModel, audio: &[f32]) -> Result<Vec<f32>, Tr
         return Ok(Vec::new());
     }
 
-    let chunk_size = 4096usize;
-    let context_size = 64usize;
-    let state_size = 128usize;
-    let mut probabilities = Vec::with_capacity(audio.len().div_ceil(chunk_size));
-    let mut hidden_state = vec![0.0f32; state_size];
-    let mut cell_state = vec![0.0f32; state_size];
-    let mut context = vec![0.0f32; context_size];
+    let mut probabilities = Vec::with_capacity(audio.len().div_ceil(VAD_WINDOW_SAMPLES));
+    let mut hidden_state = vec![0.0f32; VAD_STATE_SIZE];
+    let mut cell_state = vec![0.0f32; VAD_STATE_SIZE];
+    let mut context = vec![0.0f32; VAD_CONTEXT_SAMPLES];
 
-    for chunk_start in (0..audio.len()).step_by(chunk_size) {
-        let chunk_end = (chunk_start + chunk_size).min(audio.len());
+    for chunk_start in (0..audio.len()).step_by(VAD_WINDOW_SAMPLES) {
+        let chunk_end = (chunk_start + VAD_WINDOW_SAMPLES).min(audio.len());
         let mut chunk = audio[chunk_start..chunk_end].to_vec();
-        if chunk.len() < chunk_size {
+        if chunk.len() < VAD_WINDOW_SAMPLES {
             let last = chunk.last().copied().unwrap_or(0.0);
-            chunk.resize(chunk_size, last);
+            chunk.resize(VAD_WINDOW_SAMPLES, last);
         }
 
-        let next_context = chunk[chunk.len() - context_size..].to_vec();
-        let mut audio_input = Vec::with_capacity(chunk_size + context_size);
-        audio_input.extend_from_slice(&context);
-        audio_input.extend_from_slice(&chunk);
+        let next_context = chunk[chunk.len() - VAD_CONTEXT_SAMPLES..].to_vec();
+        let mut model_input = Vec::with_capacity(VAD_WINDOW_SAMPLES + VAD_CONTEXT_SAMPLES);
+        model_input.extend_from_slice(&context);
+        model_input.extend_from_slice(&chunk);
 
         let outputs = model.predict(
             &[
                 CoreMlInput::F32 {
-                    name: "audio_input",
-                    values: &audio_input,
-                    shape: &[1, chunk_size + context_size],
+                    name: "audio",
+                    values: &model_input,
+                    shape: &[1, 1, VAD_WINDOW_SAMPLES + VAD_CONTEXT_SAMPLES],
                 },
                 CoreMlInput::F32 {
-                    name: "hidden_state",
+                    name: "h",
                     values: &hidden_state,
-                    shape: &[1, state_size],
+                    shape: &[1, 1, VAD_STATE_SIZE],
                 },
                 CoreMlInput::F32 {
-                    name: "cell_state",
+                    name: "c",
                     values: &cell_state,
-                    shape: &[1, state_size],
+                    shape: &[1, 1, VAD_STATE_SIZE],
                 },
             ],
-            &["vad_output", "new_hidden_state", "new_cell_state"],
+            &["probability", "h_out", "c_out"],
         )?;
 
         let probability = outputs
-            .get("vad_output")
+            .get("probability")
             .and_then(|tensor| tensor.data.first())
             .copied()
             .ok_or_else(|| {
-                TranscriptionError::CoreMl("VAD output `vad_output` was empty".to_owned())
+                TranscriptionError::CoreMl("VAD output `probability` was empty".to_owned())
             })?;
-        hidden_state = take_state(outputs.get("new_hidden_state"), state_size)?;
-        cell_state = take_state(outputs.get("new_cell_state"), state_size)?;
+        hidden_state = take_state(outputs.get("h_out"), VAD_STATE_SIZE)?;
+        cell_state = take_state(outputs.get("c_out"), VAD_STATE_SIZE)?;
         probabilities.push(probability);
         context = next_context;
     }

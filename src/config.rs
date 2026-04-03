@@ -42,4 +42,8 @@ impl TranscriptionConfig {
     pub(crate) fn max_duration_seconds(&self) -> f64 {
         self.max_audio_samples as f64 / self.sample_rate as f64
     }
+
+    pub(crate) fn max_feature_frames(&self) -> usize {
+        self.max_audio_samples / self.hop_length + 1
+    }
 }

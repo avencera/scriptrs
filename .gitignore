@@ -1,1 +1,5 @@
 /target
+/dev-tools
+/fixtures/models
+/.venv
+/**/__pycache__
