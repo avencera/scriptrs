@@ -77,15 +77,15 @@ def main() -> None:
     )
     encoder_coreml = ct.models.CompiledMLModel(
         str(parakeet_dir / "encoder.mlmodelc"),
-        compute_units=ct.ComputeUnit.ALL,
+        compute_units=ct.ComputeUnit.CPU_AND_NE,
     )
     decoder_coreml = ct.models.CompiledMLModel(
         str(parakeet_dir / "decoder.mlmodelc"),
-        compute_units=ct.ComputeUnit.ALL,
+        compute_units=ct.ComputeUnit.CPU_AND_NE,
     )
     joint_coreml = ct.models.CompiledMLModel(
         str(parakeet_dir / "joint-decision.mlmodelc"),
-        compute_units=ct.ComputeUnit.ALL,
+        compute_units=ct.ComputeUnit.CPU_AND_NE,
     )
 
     np.random.seed(0)
@@ -227,6 +227,9 @@ def compare_greedy_decode(
     onnx_cell = np.zeros((DECODER_LAYERS, 1, DECODER_HIDDEN_SIZE), dtype=np.float32)
     coreml_hidden = np.zeros((DECODER_LAYERS, 1, DECODER_HIDDEN_SIZE), dtype=np.float32)
     coreml_cell = np.zeros((DECODER_LAYERS, 1, DECODER_HIDDEN_SIZE), dtype=np.float32)
+    coreml_decoder_step = None
+    coreml_next_hidden = None
+    coreml_next_cell = None
     onnx_last_token = blank_id
     coreml_last_token = blank_id
     onnx_frame = 0
@@ -267,79 +270,77 @@ def compare_greedy_decode(
             onnx_frame,
             onnx_duration,
             onnx_token_id,
-            onnx_emitted,
             blank_id,
+            onnx_emitted,
         )
 
-        coreml_frame_input = coreml_encoder[
-            :, :, coreml_frame : coreml_frame + 1
-        ].astype(np.float32)
-        decoder_outputs = decoder_coreml.predict(
-            {
-                "targets": np.array([[coreml_last_token]], dtype=np.int32),
-                "target_length": np.array([1], dtype=np.int32),
-                "h_in": coreml_hidden,
-                "c_in": coreml_cell,
-            }
+        coreml_frame_input = coreml_encoder[:, :, coreml_frame : coreml_frame + 1].astype(
+            np.float32
         )
+        if coreml_decoder_step is None:
+            decoder_outputs = decoder_coreml.predict(
+                {
+                    "targets": np.array([[coreml_last_token]], dtype=np.int32),
+                    "target_length": np.array([1], dtype=np.int32),
+                    "h_in": coreml_hidden,
+                    "c_in": coreml_cell,
+                }
+            )
+            coreml_decoder_step = np.asarray(decoder_outputs["decoder"], dtype=np.float32)
+            coreml_next_hidden = np.asarray(decoder_outputs["h_out"], dtype=np.float32)
+            coreml_next_cell = np.asarray(decoder_outputs["c_out"], dtype=np.float32)
         joint_outputs = joint_coreml.predict(
             {
                 "encoder_step": coreml_frame_input,
-                "decoder_step": np.asarray(decoder_outputs["decoder"], dtype=np.float32),
+                "decoder_step": coreml_decoder_step,
             }
         )
-        coreml_token_id = int(
-            np.asarray(joint_outputs["token_id"], dtype=np.int32).reshape(-1)[0]
-        )
-        coreml_duration = int(
-            np.asarray(joint_outputs["duration"], dtype=np.int32).reshape(-1)[0]
-        )
+        coreml_token_id = int(np.asarray(joint_outputs["token_id"], dtype=np.int32).reshape(-1)[0])
+        coreml_duration = int(np.asarray(joint_outputs["duration"], dtype=np.int32).reshape(-1)[0])
         if coreml_token_id != blank_id:
-            coreml_hidden = np.asarray(decoder_outputs["h_out"], dtype=np.float32)
-            coreml_cell = np.asarray(decoder_outputs["c_out"], dtype=np.float32)
+            coreml_hidden = coreml_next_hidden
+            coreml_cell = coreml_next_cell
             coreml_last_token = coreml_token_id
             coreml_emitted += 1
+            coreml_decoder_step = None
+            coreml_next_hidden = None
+            coreml_next_cell = None
         coreml_frame, coreml_emitted = advance_state(
             coreml_frame,
             coreml_duration,
             coreml_token_id,
-            coreml_emitted,
             blank_id,
+            coreml_emitted,
         )
 
-        if (
-            onnx_token_id != coreml_token_id
-            or onnx_duration != coreml_duration
-            or onnx_frame != coreml_frame
-            or onnx_last_token != coreml_last_token
-        ):
+        if onnx_token_id != coreml_token_id or onnx_duration != coreml_duration:
             raise SystemExit(
-                "greedy parity failed:"
+                "greedy mismatch"
                 f" step={step}"
-                f" onnx=(frame={onnx_frame}, token={onnx_token_id}, duration={onnx_duration}, last={onnx_last_token})"
-                f" coreml=(frame={coreml_frame}, token={coreml_token_id}, duration={coreml_duration}, last={coreml_last_token})"
+                f" token_id={onnx_token_id}/{coreml_token_id}"
+                f" duration={onnx_duration}/{coreml_duration}"
             )
-
-    print(f"greedy matched for {greedy_steps} steps")
 
 
 def advance_state(
-    frame_index: int,
-    duration_step: int,
+    frame_idx: int,
+    duration: int,
     token_id: int,
-    emitted_tokens: int,
     blank_id: int,
+    emitted_tokens: int,
 ) -> tuple[int, int]:
-    if duration_step > 0:
-        return frame_index + duration_step, 0
+    if duration > 0:
+        return frame_idx + duration, 0
+
     if token_id == blank_id or emitted_tokens >= 10:
-        return frame_index + 1, 0
-    return frame_index, emitted_tokens
+        return frame_idx + 1, 0
+
+    return frame_idx, emitted_tokens
 
 
 def count_vocab_entries(path: Path) -> int:
-    with path.open("r", encoding="utf-8") as file:
-        return sum(1 for line in file if line.strip())
+    with path.open("r", encoding="utf-8") as handle:
+        return sum(1 for line in handle if line.strip())
 
 
 def max_abs(left: np.ndarray, right: np.ndarray) -> float:
@@ -348,9 +349,9 @@ def max_abs(left: np.ndarray, right: np.ndarray) -> float:
 
 def softmax_max(logits: np.ndarray) -> float:
     shifted = logits - np.max(logits)
-    probabilities = np.exp(shifted)
-    probabilities /= np.sum(probabilities)
-    return float(np.max(probabilities))
+    probs = np.exp(shifted)
+    probs /= np.sum(probs)
+    return float(np.max(probs))
 
 
 if __name__ == "__main__":

@@ -14,6 +14,9 @@ export-models output_dir="../fixtures/models":
 compare-coreml models_dir="../fixtures/models":
     uv run python/compare_coreml.py --models-dir {{models_dir}}
 
+deploy-models models_dir="../fixtures/models" repo_id="avencera/scriptrs-models":
+    uv run python/upload_models.py --models-dir {{models_dir}} --repo-id {{repo_id}}
+
 compare-parakeet audio models_dir="../fixtures/models":
     cargo run --bin compare_parakeet_rs -- --audio {{audio}} --models-dir {{models_dir}}
 

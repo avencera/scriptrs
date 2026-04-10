@@ -14,5 +14,4 @@ pub(crate) const SECONDS_PER_ENCODER_FRAME: f64 =
 pub(crate) const ENCODER_HIDDEN_SIZE: usize = 1_024;
 pub(crate) const DECODER_HIDDEN_SIZE: usize = 640;
 pub(crate) const DECODER_LAYERS: usize = 2;
-pub(crate) const TOKEN_DURATION_CLASSES: usize = 5;
 pub(crate) const MAX_TOKENS_PER_STEP: usize = 10;
