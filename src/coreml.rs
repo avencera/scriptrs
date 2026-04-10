@@ -37,7 +37,7 @@ use crate::error::TranscriptionError;
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone)]
 pub(crate) struct ParakeetSplitCoreMlModel {
-    encoder: EncoderCoreMlModel,
+    encoder: CoreMlModel,
     decoder: DecoderCoreMlModel,
     joint_decision: JointDecisionCoreMlModel,
 }
@@ -50,7 +50,7 @@ impl ParakeetSplitCoreMlModel {
         joint_decision_path: &Path,
     ) -> Result<Self, TranscriptionError> {
         Ok(Self {
-            encoder: EncoderCoreMlModel::new(encoder_path)?,
+            encoder: CoreMlModel::new(encoder_path)?,
             decoder: DecoderCoreMlModel::new(decoder_path)?,
             joint_decision: JointDecisionCoreMlModel::new(joint_decision_path)?,
         })
@@ -61,7 +61,62 @@ impl ParakeetSplitCoreMlModel {
         mel: Array3<f32>,
         lengths: Vec<i32>,
     ) -> Result<(Array3<f32>, usize), TranscriptionError> {
-        self.encoder.run(mel, lengths)
+        let inputs = [
+            CoreMlInput::F32 {
+                name: "mel",
+                values: mel.as_slice().ok_or_else(|| {
+                    TranscriptionError::InvalidModelOutput(
+                        "encoder input was not contiguous".to_owned(),
+                    )
+                })?,
+                shape: &[1, mel.shape()[1], mel.shape()[2]],
+            },
+            CoreMlInput::I32 {
+                name: "mel_length",
+                values: &lengths,
+                shape: &[1],
+            },
+        ];
+        let outputs = self
+            .encoder
+            .predict(&inputs, &["encoder", "encoder_length"])?;
+        let tensor = outputs.get("encoder").ok_or_else(|| {
+            TranscriptionError::InvalidModelOutput("encoder output `encoder` missing".to_owned())
+        })?;
+        let shape = tensor.shape.as_slice();
+        if shape.len() != 3 {
+            return Err(TranscriptionError::InvalidModelOutput(format!(
+                "encoder output shape was not 3D: {shape:?}"
+            )));
+        }
+
+        let encoder = match shape {
+            [1, hidden, time] if *hidden == ENCODER_HIDDEN_SIZE => {
+                array3_from_parts(tensor.data.clone(), shape, "encoder output")?
+            }
+            [1, time, hidden] if *hidden == ENCODER_HIDDEN_SIZE => {
+                Array3::from_shape_vec((1, *time, *hidden), tensor.data.clone())
+                    .map_err(|error| {
+                        TranscriptionError::InvalidModelOutput(format!(
+                            "failed to shape encoder output: {error}"
+                        ))
+                    })?
+                    .permuted_axes([0, 2, 1])
+            }
+            _ => {
+                return Err(TranscriptionError::InvalidModelOutput(format!(
+                    "unexpected encoder output shape: {shape:?}"
+                )));
+            }
+        };
+        let time_steps = outputs
+            .get("encoder_length")
+            .and_then(|tensor| tensor.data.first())
+            .copied()
+            .map(|value| value as usize)
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| encoder.shape()[2]);
+        Ok((encoder, time_steps))
     }
 
     pub(crate) fn run_decoder(
@@ -112,79 +167,6 @@ impl ParakeetSplitCoreMlModel {
                 )
             })?,
         )
-    }
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Debug, Clone)]
-struct EncoderCoreMlModel {
-    model: CoreMlModel,
-    encoder_output: CachedOutputKey,
-    encoder_length_output: CachedOutputKey,
-}
-
-#[cfg(target_os = "macos")]
-impl EncoderCoreMlModel {
-    fn new(path: &Path) -> Result<Self, TranscriptionError> {
-        Ok(Self {
-            model: CoreMlModel::new(path)?,
-            encoder_output: CachedOutputKey::new("encoder"),
-            encoder_length_output: CachedOutputKey::new("encoder_length"),
-        })
-    }
-
-    fn run(
-        &self,
-        mel: Array3<f32>,
-        lengths: Vec<i32>,
-    ) -> Result<(Array3<f32>, usize), TranscriptionError> {
-        let inputs = [
-            CoreMlInput::F32 {
-                name: "mel",
-                values: mel.as_slice().ok_or_else(|| {
-                    TranscriptionError::InvalidModelOutput(
-                        "encoder input was not contiguous".to_owned(),
-                    )
-                })?,
-                shape: &[1, mel.shape()[1], mel.shape()[2]],
-            },
-            CoreMlInput::I32 {
-                name: "mel_length",
-                values: &lengths,
-                shape: &[1],
-            },
-        ];
-        self.model.predict_with_output_handler(&inputs, |output| {
-            let tensor = tensor_from_output(output, &self.encoder_output)?;
-            let shape = tensor.shape.as_slice();
-            if shape.len() != 3 {
-                return Err(TranscriptionError::InvalidModelOutput(format!(
-                    "encoder output shape was not 3D: {shape:?}"
-                )));
-            }
-
-            let encoder = match shape {
-                [1, hidden, time] if *hidden == ENCODER_HIDDEN_SIZE => {
-                    array3_from_parts(tensor.data, shape, "encoder output")?
-                }
-                [1, time, hidden] if *hidden == ENCODER_HIDDEN_SIZE => {
-                    Array3::from_shape_vec((1, *time, *hidden), tensor.data)
-                        .map_err(|error| {
-                            TranscriptionError::InvalidModelOutput(format!(
-                                "failed to shape encoder output: {error}"
-                            ))
-                        })?
-                        .permuted_axes([0, 2, 1])
-                }
-                _ => {
-                    return Err(TranscriptionError::InvalidModelOutput(format!(
-                        "unexpected encoder output shape: {shape:?}"
-                    )));
-                }
-            };
-            let time_steps = scalar_usize(output, &self.encoder_length_output)?;
-            Ok((encoder, time_steps.max(1)))
-        })
     }
 }
 
@@ -368,15 +350,8 @@ impl CoreMlModel {
         inputs: &[CoreMlInput<'_>],
         output_names: &[&str],
     ) -> Result<HashMap<String, CoreMlTensor>, TranscriptionError> {
-        self.predict_with_output_handler(inputs, |output| {
-            let mut outputs = HashMap::with_capacity(output_names.len());
-            for output_name in output_names {
-                let key = NSString::from_str(output_name);
-                let array = runtime::output_multi_array(output, &key, output_name)?;
-                let (data, shape) = extract_output(&array)?;
-                outputs.insert((*output_name).to_owned(), CoreMlTensor { data, shape });
-            }
-            Ok(outputs)
+        self.with_cleared_input_dict(|input_dict, deallocator| {
+            runtime::predict(&self.model, input_dict, deallocator, inputs, output_names)
         })
     }
 
@@ -395,27 +370,6 @@ impl CoreMlModel {
                     deallocator,
                     *input,
                 )?);
-            }
-
-            let input_provider = runtime::build_feature_provider(input_dict)?;
-            let input_ref: &ProtocolObject<dyn MLFeatureProvider> =
-                ProtocolObject::from_ref(&*input_provider);
-            let output_provider = runtime::predict_features(&self.model, input_ref)?;
-            output_handler(&output_provider)
-        })
-    }
-
-    fn predict_with_output_handler<T>(
-        &self,
-        inputs: &[CoreMlInput<'_>],
-        output_handler: impl FnOnce(
-            &ProtocolObject<dyn MLFeatureProvider>,
-        ) -> Result<T, TranscriptionError>,
-    ) -> Result<T, TranscriptionError> {
-        self.with_cleared_input_dict(|input_dict, deallocator| {
-            let mut arrays = Vec::with_capacity(inputs.len());
-            for input in inputs {
-                arrays.push(runtime::insert_input(input_dict, deallocator, *input)?);
             }
 
             let input_provider = runtime::build_feature_provider(input_dict)?;
@@ -539,20 +493,9 @@ fn array3_from_output(
     key: &CachedOutputKey,
     context: &str,
 ) -> Result<Array3<f32>, TranscriptionError> {
-    let tensor = tensor_from_output(output, key)?;
-    let shape = tensor.shape;
-    let data = tensor.data;
-    array3_from_parts(data, &shape, context)
-}
-
-#[cfg(target_os = "macos")]
-fn tensor_from_output(
-    output: &ProtocolObject<dyn MLFeatureProvider>,
-    key: &CachedOutputKey,
-) -> Result<CoreMlTensor, TranscriptionError> {
     let array = runtime::output_multi_array(output, &key.key, key.name)?;
     let (data, shape) = extract_output(&array)?;
-    Ok(CoreMlTensor { data, shape })
+    array3_from_parts(data, &shape, context)
 }
 
 #[cfg(target_os = "macos")]
