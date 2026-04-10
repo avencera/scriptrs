@@ -7,6 +7,7 @@ use objc2::rc::Retained;
 use objc2_core_ml::{MLMultiArray, MLMultiArrayDataType};
 use objc2_foundation::{NSArray, NSNumber};
 
+use crate::coreml::CachedInputShape;
 use crate::error::TranscriptionError;
 
 pub(super) fn ns_number_array(values: &[usize]) -> Retained<NSArray<NSNumber>> {
@@ -18,7 +19,7 @@ pub(super) fn ns_number_array(values: &[usize]) -> Retained<NSArray<NSNumber>> {
     NSArray::from_retained_slice(&numbers)
 }
 
-fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
+pub(super) fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
     let mut strides = vec![1usize; shape.len()];
     for index in (0..shape.len().saturating_sub(1)).rev() {
         strides[index] = strides[index + 1] * shape[index + 1];
@@ -39,6 +40,19 @@ pub(super) fn multi_array_f32(
     )
 }
 
+pub(super) fn multi_array_f32_cached(
+    values: &[f32],
+    cached: &CachedInputShape,
+    deallocator: &RcBlock<dyn Fn(NonNull<c_void>)>,
+) -> Result<Retained<MLMultiArray>, TranscriptionError> {
+    multi_array_cached(
+        values.as_ptr().cast::<c_void>() as *mut c_void,
+        cached,
+        MLMultiArrayDataType::Float32,
+        deallocator,
+    )
+}
+
 pub(super) fn multi_array_i32(
     values: &[i32],
     shape: &[usize],
@@ -47,6 +61,19 @@ pub(super) fn multi_array_i32(
     multi_array(
         values.as_ptr().cast::<c_void>() as *mut c_void,
         shape,
+        MLMultiArrayDataType::Int32,
+        deallocator,
+    )
+}
+
+pub(super) fn multi_array_i32_cached(
+    values: &[i32],
+    cached: &CachedInputShape,
+    deallocator: &RcBlock<dyn Fn(NonNull<c_void>)>,
+) -> Result<Retained<MLMultiArray>, TranscriptionError> {
+    multi_array_cached(
+        values.as_ptr().cast::<c_void>() as *mut c_void,
+        cached,
         MLMultiArrayDataType::Int32,
         deallocator,
     )
@@ -74,6 +101,32 @@ fn multi_array(
             &ns_shape,
             data_type,
             &ns_strides,
+            Some(deallocator),
+        )
+    }
+    .map_err(|error| TranscriptionError::CoreMl(format!("failed to create MLMultiArray: {error}")))
+}
+
+fn multi_array_cached(
+    ptr: *mut c_void,
+    cached: &CachedInputShape,
+    data_type: MLMultiArrayDataType,
+    deallocator: &RcBlock<dyn Fn(NonNull<c_void>)>,
+) -> Result<Retained<MLMultiArray>, TranscriptionError> {
+    let ptr = NonNull::new(ptr).ok_or_else(|| {
+        TranscriptionError::CoreMl("input tensor had a null data pointer".to_owned())
+    })?;
+
+    #[allow(deprecated)]
+    // SAFETY: the pointer, cached shape, and cached strides all describe the same borrowed
+    // SAFETY: tensor buffer, and CoreML only reads them during the prediction call
+    unsafe {
+        MLMultiArray::initWithDataPointer_shape_dataType_strides_deallocator_error(
+            MLMultiArray::alloc(),
+            ptr,
+            &cached.ns_shape,
+            data_type,
+            &cached.ns_strides,
             Some(deallocator),
         )
     }

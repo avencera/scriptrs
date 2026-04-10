@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use eyre::{Result, bail, eyre};
 use parakeet_rs::{ParakeetTDT, TimestampMode, Transcriber};
@@ -11,6 +12,9 @@ const DEFAULT_DATASET: &str = "voxconverse";
 const DEFAULT_MAX_FILES: usize = 3;
 const DEFAULT_CHUNKS_PER_FILE: usize = 2;
 const DEFAULT_CHUNK_SECONDS: f64 = 15.0;
+const DEFAULT_BENCHMARK_WARMUP: usize = 1;
+const DEFAULT_BENCHMARK_RUNS: usize = 0;
+const COREML_RUNTIME_MODE_ENV: &str = "SCRIPTRS_COREML_RUNTIME_MODE";
 const DEV_TOOLS_DIR: &str = env!("CARGO_MANIFEST_DIR");
 
 fn main() -> ExitCode {
@@ -25,6 +29,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     let args = Args::parse(env::args().skip(1))?;
+    configure_runtime_mode(args.runtime_mode);
     let scriptrs_pipeline = TranscriptionPipeline::from_dir(&args.models_dir)?;
     let parakeet_dir = PreparedParakeetDir::new(&args.models_dir, &args.onnx_dir)?;
     let mut parakeet = ParakeetTDT::from_pretrained(parakeet_dir.path(), None)?;
@@ -35,13 +40,16 @@ fn run() -> Result<()> {
             let chunk = AudioChunk::new(audio_path.display().to_string(), 0, audio);
             let comparison = compare_chunk(&scriptrs_pipeline, &mut parakeet, &chunk)?;
             print_single_report(&args, &comparison);
+            maybe_print_benchmark(&args, &scriptrs_pipeline, std::slice::from_ref(&chunk))?;
             if args.strict && !comparison.summary.is_match() {
                 bail!("scriptrs and parakeet-rs results differ")
             }
         }
         InputMode::Dataset(dataset_dir) => {
-            let report = compare_dataset(&args, &dataset_dir, &scriptrs_pipeline, &mut parakeet)?;
+            let chunks = load_dataset_chunks(&args, &dataset_dir)?;
+            let report = compare_chunks(&scriptrs_pipeline, &mut parakeet, &chunks)?;
             print_dataset_report(&args, &dataset_dir, &report);
+            maybe_print_benchmark(&args, &scriptrs_pipeline, &chunks)?;
             if args.strict && report.mismatch_count > 0 {
                 bail!("found {} mismatching chunks", report.mismatch_count)
             }
@@ -61,12 +69,38 @@ struct Args {
     max_files: usize,
     chunks_per_file: usize,
     chunk_seconds: f64,
+    benchmark_warmup: usize,
+    benchmark_runs: usize,
+    runtime_mode: RuntimeMode,
 }
 
 #[derive(Debug, Clone)]
 enum InputMode {
     Audio(PathBuf),
     Dataset(PathBuf),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeMode {
+    Sync,
+    AsyncExperiment,
+}
+
+impl RuntimeMode {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "sync" => Ok(Self::Sync),
+            "async-experiment" => Ok(Self::AsyncExperiment),
+            _ => bail!("invalid --runtime-mode value: {value}"),
+        }
+    }
+
+    fn as_env_value(self) -> &'static str {
+        match self {
+            Self::Sync => "sync",
+            Self::AsyncExperiment => "async-experiment",
+        }
+    }
 }
 
 impl Args {
@@ -81,6 +115,9 @@ impl Args {
         let mut max_files = DEFAULT_MAX_FILES;
         let mut chunks_per_file = DEFAULT_CHUNKS_PER_FILE;
         let mut chunk_seconds = DEFAULT_CHUNK_SECONDS;
+        let mut benchmark_warmup = DEFAULT_BENCHMARK_WARMUP;
+        let mut benchmark_runs = DEFAULT_BENCHMARK_RUNS;
+        let mut runtime_mode = RuntimeMode::Sync;
 
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -113,6 +150,19 @@ impl Args {
                         .parse()
                         .map_err(|error| eyre!("invalid --chunk-seconds value: {error}"))?;
                 }
+                "--benchmark-warmup" => {
+                    benchmark_warmup = next_value(&mut args, "--benchmark-warmup")?
+                        .parse()
+                        .map_err(|error| eyre!("invalid --benchmark-warmup value: {error}"))?;
+                }
+                "--benchmark-runs" => {
+                    benchmark_runs = next_value(&mut args, "--benchmark-runs")?
+                        .parse()
+                        .map_err(|error| eyre!("invalid --benchmark-runs value: {error}"))?;
+                }
+                "--runtime-mode" => {
+                    runtime_mode = RuntimeMode::parse(&next_value(&mut args, "--runtime-mode")?)?;
+                }
                 "--help" | "-h" => {
                     print_usage();
                     std::process::exit(0);
@@ -136,6 +186,9 @@ impl Args {
         if chunks_per_file == 0 {
             bail!("--chunks-per-file must be at least 1")
         }
+        if benchmark_runs > 0 && benchmark_warmup == 0 {
+            bail!("--benchmark-warmup must be at least 1 when benchmarking")
+        }
 
         let input = match (audio_path, dataset_dir, speakrs_dataset) {
             (Some(audio_path), None, None) => InputMode::Audio(audio_path),
@@ -157,6 +210,9 @@ impl Args {
             max_files,
             chunks_per_file,
             chunk_seconds,
+            benchmark_warmup,
+            benchmark_runs,
+            runtime_mode,
         })
     }
 }
@@ -175,9 +231,19 @@ Options:
   --max-files <n>            dataset files to sample (default: 3)
   --chunks-per-file <n>      15s chunks sampled per file (default: 2)
   --chunk-seconds <n>        chunk length in seconds (default: 15)
+  --benchmark-warmup <n>     warmup passes before timing (default: 1)
+  --benchmark-runs <n>       timed passes for scriptrs (default: 0)
+  --runtime-mode <mode>      sync or async-experiment (default: sync)
   --token-limit <n>          token preview rows (default: 12)
   --strict                   exit non-zero on mismatch"
     );
+}
+
+fn configure_runtime_mode(runtime_mode: RuntimeMode) {
+    // safe because this CLI mutates the process environment before starting worker threads
+    unsafe {
+        env::set_var(COREML_RUNTIME_MODE_ENV, runtime_mode.as_env_value());
+    }
 }
 
 fn resolve_speakrs_dataset_dir(dataset_id: &str) -> PathBuf {
@@ -247,18 +313,25 @@ struct DatasetReport {
     max_end_delta: f64,
 }
 
-fn compare_dataset(
-    args: &Args,
-    dataset_dir: &Path,
-    scriptrs_pipeline: &TranscriptionPipeline,
-    parakeet: &mut ParakeetTDT,
-) -> Result<DatasetReport> {
+#[derive(Debug, Clone)]
+struct BenchmarkReport {
+    runtime_mode: RuntimeMode,
+    warmup_runs: usize,
+    timed_runs: usize,
+    chunk_count: usize,
+    total_duration: Duration,
+    mean_duration: Duration,
+    p50_duration: Duration,
+    p95_duration: Duration,
+}
+
+fn load_dataset_chunks(args: &Args, dataset_dir: &Path) -> Result<Vec<AudioChunk>> {
     let wav_paths = discover_wavs(dataset_dir)?;
     if wav_paths.is_empty() {
         bail!("no wav files found in {}", dataset_dir.display())
     }
 
-    let mut comparisons = Vec::new();
+    let mut chunks = Vec::new();
     let chunk_samples = (args.chunk_seconds * 16_000.0).round() as usize;
     for wav_path in wav_paths.into_iter().take(args.max_files) {
         let audio = read_mono_16khz_wav(&wav_path)?;
@@ -266,9 +339,21 @@ fn compare_dataset(
             sample_chunks(&wav_path, &audio, chunk_samples, args.chunks_per_file)
         {
             let label = format!("{}#{}", wav_path.display(), chunk_index);
-            let chunk = AudioChunk::new(label, chunk.len(), chunk);
-            comparisons.push(compare_chunk(scriptrs_pipeline, parakeet, &chunk)?);
+            chunks.push(AudioChunk::new(label, chunk.len(), chunk));
         }
+    }
+
+    Ok(chunks)
+}
+
+fn compare_chunks(
+    scriptrs_pipeline: &TranscriptionPipeline,
+    parakeet: &mut ParakeetTDT,
+    chunks: &[AudioChunk],
+) -> Result<DatasetReport> {
+    let mut comparisons = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        comparisons.push(compare_chunk(scriptrs_pipeline, parakeet, chunk)?);
     }
 
     let mismatch_count = comparisons
@@ -310,6 +395,87 @@ fn compare_dataset(
         max_start_delta,
         max_end_delta,
     })
+}
+
+fn maybe_print_benchmark(
+    args: &Args,
+    scriptrs_pipeline: &TranscriptionPipeline,
+    chunks: &[AudioChunk],
+) -> Result<()> {
+    if args.benchmark_runs == 0 {
+        return Ok(());
+    }
+
+    let report = benchmark_scriptrs(
+        scriptrs_pipeline,
+        chunks,
+        args.runtime_mode,
+        args.benchmark_warmup,
+        args.benchmark_runs,
+    )?;
+    print_benchmark_report(&report);
+    Ok(())
+}
+
+fn benchmark_scriptrs(
+    scriptrs_pipeline: &TranscriptionPipeline,
+    chunks: &[AudioChunk],
+    runtime_mode: RuntimeMode,
+    warmup_runs: usize,
+    timed_runs: usize,
+) -> Result<BenchmarkReport> {
+    let benchmark_inputs: Vec<_> = chunks
+        .iter()
+        .map(|chunk| {
+            pad_audio_for_scriptrs(&chunk.audio, scriptrs_pipeline.config().max_audio_samples)
+        })
+        .collect();
+
+    for _ in 0..warmup_runs {
+        run_benchmark_pass(scriptrs_pipeline, &benchmark_inputs)?;
+    }
+
+    let mut durations = Vec::with_capacity(timed_runs);
+    for _ in 0..timed_runs {
+        durations.push(run_benchmark_pass(scriptrs_pipeline, &benchmark_inputs)?);
+    }
+    let total_duration = durations.iter().copied().sum::<Duration>();
+    let mean_duration = total_duration.div_f64(timed_runs as f64);
+    let (p50_duration, p95_duration) = percentile_durations(&durations);
+
+    Ok(BenchmarkReport {
+        runtime_mode,
+        warmup_runs,
+        timed_runs,
+        chunk_count: benchmark_inputs.len(),
+        total_duration,
+        mean_duration,
+        p50_duration,
+        p95_duration,
+    })
+}
+
+fn run_benchmark_pass(
+    scriptrs_pipeline: &TranscriptionPipeline,
+    benchmark_inputs: &[Vec<f32>],
+) -> Result<Duration> {
+    let start = Instant::now();
+    for audio in benchmark_inputs {
+        let _ = scriptrs_pipeline.run(audio)?;
+    }
+    Ok(start.elapsed())
+}
+
+fn percentile_durations(durations: &[Duration]) -> (Duration, Duration) {
+    let mut sorted = durations.to_vec();
+    sorted.sort_unstable();
+    let p50_index = percentile_index(sorted.len(), 50);
+    let p95_index = percentile_index(sorted.len(), 95);
+    (sorted[p50_index], sorted[p95_index])
+}
+
+fn percentile_index(len: usize, percentile: usize) -> usize {
+    ((len - 1) * percentile).div_ceil(100)
 }
 
 fn compare_chunk(
@@ -535,6 +701,7 @@ impl ComparisonSummary {
 fn print_single_report(args: &Args, comparison: &Comparison) {
     println!("models_dir: {}", args.models_dir.display());
     println!("onnx_dir: {}", args.onnx_dir.display());
+    println!("runtime_mode: {}", args.runtime_mode.as_env_value());
     println!("label: {}", comparison.label);
     println!(
         "original_duration: {:.3}s",
@@ -586,6 +753,7 @@ fn print_single_report(args: &Args, comparison: &Comparison) {
 fn print_dataset_report(args: &Args, dataset_dir: &Path, report: &DatasetReport) {
     println!("models_dir: {}", args.models_dir.display());
     println!("onnx_dir: {}", args.onnx_dir.display());
+    println!("runtime_mode: {}", args.runtime_mode.as_env_value());
     println!("dataset_dir: {}", dataset_dir.display());
     println!("files_sampled: {}", args.max_files);
     println!("chunks_per_file: {}", args.chunks_per_file);
@@ -633,6 +801,32 @@ fn print_dataset_report(args: &Args, dataset_dir: &Path, report: &DatasetReport)
     }
 }
 
+fn print_benchmark_report(report: &BenchmarkReport) {
+    println!(
+        "benchmark_runtime_mode: {}",
+        report.runtime_mode.as_env_value()
+    );
+    println!("benchmark_warmup_runs: {}", report.warmup_runs);
+    println!("benchmark_timed_runs: {}", report.timed_runs);
+    println!("benchmark_chunks_per_run: {}", report.chunk_count);
+    println!(
+        "benchmark_total_duration: {}",
+        format_duration_secs(report.total_duration)
+    );
+    println!(
+        "benchmark_mean_duration: {}",
+        format_duration_secs(report.mean_duration)
+    );
+    println!(
+        "benchmark_p50_duration: {}",
+        format_duration_secs(report.p50_duration)
+    );
+    println!(
+        "benchmark_p95_duration: {}",
+        format_duration_secs(report.p95_duration)
+    );
+}
+
 fn print_token_rows(
     scriptrs_tokens: &[TimedToken],
     parakeet_tokens: &[parakeet_rs::TimedToken],
@@ -672,6 +866,10 @@ fn format_token(token: Option<&ComparableToken>) -> String {
         token.start,
         token.end
     )
+}
+
+fn format_duration_secs(duration: Duration) -> String {
+    format!("{:.6}s", duration.as_secs_f64())
 }
 
 fn normalize_whitespace(text: &str) -> String {

@@ -5,22 +5,25 @@ use std::ptr::NonNull;
 
 use block2::RcBlock;
 use objc2::AnyThread;
-use objc2::rc::autoreleasepool;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2_core_ml::{
     MLComputeUnits, MLDictionaryFeatureProvider, MLFeatureProvider, MLFeatureValue, MLModel,
-    MLModelConfiguration,
+    MLModelConfiguration, MLMultiArray,
 };
 use objc2_foundation::{NSCopying, NSMutableDictionary, NSString, NSURL};
 
-use crate::coreml::array::{extract_output, multi_array_f32, multi_array_i32};
-use crate::coreml::{CoreMlInput, CoreMlTensor};
+use crate::coreml::array::{
+    extract_output, multi_array_f32, multi_array_f32_cached, multi_array_i32,
+    multi_array_i32_cached,
+};
+use crate::coreml::{CachedCoreMlInput, CoreMlInput, CoreMlTensor};
 use crate::error::TranscriptionError;
 
 pub(super) fn load_model(
     path: &Path,
     compute_units: MLComputeUnits,
-) -> Result<objc2::rc::Retained<MLModel>, TranscriptionError> {
+) -> Result<Retained<MLModel>, TranscriptionError> {
     let path_str = NSString::from_str(&path.to_string_lossy());
     let url = NSURL::fileURLWithPath_isDirectory(&path_str, true);
     // SAFETY: the URL and configuration are valid Objective-C objects for the duration
@@ -35,12 +38,12 @@ pub(super) fn load_model(
 
 pub(super) fn predict(
     model: &MLModel,
+    input_dict: &NSMutableDictionary<NSString, AnyObject>,
+    deallocator: &RcBlock<dyn Fn(NonNull<c_void>)>,
     inputs: &[CoreMlInput<'_>],
     output_names: &[&str],
 ) -> Result<HashMap<String, CoreMlTensor>, TranscriptionError> {
     autoreleasepool(|_| {
-        let noop_deallocator = RcBlock::new(|_: NonNull<c_void>| {});
-        let input_dict = NSMutableDictionary::<NSString, AnyObject>::new();
         let mut arrays = Vec::with_capacity(inputs.len());
 
         for input in inputs {
@@ -49,59 +52,102 @@ pub(super) fn predict(
                     name,
                     values,
                     shape,
-                } => (*name, multi_array_f32(values, shape, &noop_deallocator)?),
+                } => (*name, multi_array_f32(values, shape, deallocator)?),
                 CoreMlInput::I32 {
                     name,
                     values,
                     shape,
-                } => (*name, multi_array_i32(values, shape, &noop_deallocator)?),
+                } => (*name, multi_array_i32(values, shape, deallocator)?),
             };
             let key = NSString::from_str(name);
             let key_copy: &ProtocolObject<dyn NSCopying> = ProtocolObject::from_ref(&*key);
-            // SAFETY: the feature value wraps the live MLMultiArray for this call, and the
-            // SAFETY: dictionary retains inserted Objective-C objects before returning
-            unsafe {
-                let feature_value = MLFeatureValue::featureValueWithMultiArray(&array);
-                input_dict.setObject_forKey(feature_value_as_any_object(&feature_value), key_copy);
-            }
+            insert_input_feature(input_dict, key_copy, &array);
             arrays.push(array);
         }
 
-        // SAFETY: the dictionary contains NSString keys and MLFeatureValue-backed objects,
-        // SAFETY: which is exactly what MLDictionaryFeatureProvider expects
-        let input_provider = unsafe {
-            MLDictionaryFeatureProvider::initWithDictionary_error(
-                MLDictionaryFeatureProvider::alloc(),
-                &input_dict,
-            )
-        }
-        .map_err(|error| TranscriptionError::CoreMl(format!("feature provider failed: {error}")))?;
-
-        let input_ref: &ProtocolObject<dyn MLFeatureProvider> =
-            ProtocolObject::from_ref(&*input_provider);
-        // SAFETY: `input_ref` is a valid feature provider built from the live dictionary above
-        let output_provider = unsafe { model.predictionFromFeatures_error(input_ref) }
-            .map_err(|error| TranscriptionError::CoreMl(format!("prediction failed: {error}")))?;
-
+        let output_provider = predict_features(
+            model,
+            ProtocolObject::from_ref(&*build_feature_provider(input_dict)?),
+        )?;
         let mut outputs = HashMap::with_capacity(output_names.len());
         for output_name in output_names {
             let key = NSString::from_str(output_name);
-            // SAFETY: `key` names a declared output in the CoreML model when prediction succeeds
-            let feature =
-                unsafe { output_provider.featureValueForName(&key) }.ok_or_else(|| {
-                    TranscriptionError::CoreMl(format!("missing CoreML output `{output_name}`"))
-                })?;
-            // SAFETY: the retrieved feature value is expected to contain an MLMultiArray tensor
-            let array = unsafe { feature.multiArrayValue() }.ok_or_else(|| {
-                TranscriptionError::CoreMl(format!(
-                    "CoreML output `{output_name}` was not an array"
-                ))
-            })?;
+            let array = output_multi_array(&output_provider, &key, output_name)?;
             let (data, shape) = extract_output(&array)?;
             outputs.insert((*output_name).to_owned(), CoreMlTensor { data, shape });
         }
 
         Ok(outputs)
+    })
+}
+
+pub(super) fn insert_cached_input(
+    input_dict: &NSMutableDictionary<NSString, AnyObject>,
+    deallocator: &RcBlock<dyn Fn(NonNull<c_void>)>,
+    input: CachedCoreMlInput<'_>,
+) -> Result<Retained<MLMultiArray>, TranscriptionError> {
+    let (cached, array) = match input {
+        CachedCoreMlInput::F32 { cached, values } => {
+            debug_assert_eq!(values.len(), cached.total_elements);
+            (cached, multi_array_f32_cached(values, cached, deallocator)?)
+        }
+        CachedCoreMlInput::I32 { cached, values } => {
+            debug_assert_eq!(values.len(), cached.total_elements);
+            (cached, multi_array_i32_cached(values, cached, deallocator)?)
+        }
+    };
+    let key_copy: &ProtocolObject<dyn NSCopying> = ProtocolObject::from_ref(&*cached.name);
+    insert_input_feature(input_dict, key_copy, &array);
+    Ok(array)
+}
+
+pub(super) fn insert_input_feature(
+    input_dict: &NSMutableDictionary<NSString, AnyObject>,
+    key_copy: &ProtocolObject<dyn NSCopying>,
+    multi_array: &MLMultiArray,
+) {
+    // SAFETY: multi_array is a live CoreML object for this prediction call, and setObject retains
+    // SAFETY: the inserted feature value before the temporary Retained<MLFeatureValue> is dropped
+    unsafe {
+        let feature_value = MLFeatureValue::featureValueWithMultiArray(multi_array);
+        input_dict.setObject_forKey(feature_value_as_any_object(&feature_value), key_copy);
+    }
+}
+
+pub(super) fn build_feature_provider(
+    input_dict: &NSMutableDictionary<NSString, AnyObject>,
+) -> Result<Retained<MLDictionaryFeatureProvider>, TranscriptionError> {
+    // SAFETY: input_dict only contains NSString keys and MLFeatureValue-backed Objective-C objects
+    unsafe {
+        MLDictionaryFeatureProvider::initWithDictionary_error(
+            MLDictionaryFeatureProvider::alloc(),
+            input_dict,
+        )
+    }
+    .map_err(|error| TranscriptionError::CoreMl(format!("feature provider failed: {error}")))
+}
+
+pub(super) fn predict_features(
+    model: &MLModel,
+    input_ref: &ProtocolObject<dyn MLFeatureProvider>,
+) -> Result<Retained<ProtocolObject<dyn MLFeatureProvider>>, TranscriptionError> {
+    // SAFETY: input_ref is a valid feature provider built from live Objective-C objects
+    unsafe { model.predictionFromFeatures_error(input_ref) }
+        .map_err(|error| TranscriptionError::CoreMl(format!("prediction failed: {error}")))
+}
+
+pub(super) fn output_multi_array(
+    output: &ProtocolObject<dyn MLFeatureProvider>,
+    output_key: &NSString,
+    output_name: &str,
+) -> Result<Retained<MLMultiArray>, TranscriptionError> {
+    // SAFETY: output is a retained CoreML feature provider produced by a successful prediction call
+    let feature = unsafe { output.featureValueForName(output_key) }.ok_or_else(|| {
+        TranscriptionError::CoreMl(format!("missing CoreML output `{output_name}`"))
+    })?;
+    // SAFETY: output_key names the declared tensor output for this model
+    unsafe { feature.multiArrayValue() }.ok_or_else(|| {
+        TranscriptionError::CoreMl(format!("CoreML output `{output_name}` was not an array"))
     })
 }
 
