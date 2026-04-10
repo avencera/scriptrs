@@ -39,17 +39,7 @@ impl ParakeetModel {
         features: &Array2<f32>,
         feature_frames: usize,
     ) -> Result<(Array3<f32>, usize), TranscriptionError> {
-        let feature_size = features.shape()[1];
-        let input = Array3::from_shape_vec(
-            (1, feature_size, features.shape()[0]),
-            features.t().iter().copied().collect(),
-        )
-        .map_err(|error| {
-            TranscriptionError::InvalidModelOutput(format!(
-                "failed to shape encoder input: {error}"
-            ))
-        })?;
-        self.inner.run_encoder(input, vec![feature_frames as i32])
+        self.inner.run_encoder(features, feature_frames as i32)
     }
 
     fn greedy_decode(
@@ -240,12 +230,12 @@ impl ParakeetModelInner {
 
     fn run_encoder(
         &self,
-        input: Array3<f32>,
-        lengths: Vec<i32>,
+        features: &Array2<f32>,
+        feature_frames: i32,
     ) -> Result<(Array3<f32>, usize), TranscriptionError> {
         match self {
             #[cfg(target_os = "macos")]
-            Self::SplitCoreMl(model) => model.run_encoder(input, lengths),
+            Self::SplitCoreMl(model) => model.run_encoder(features, feature_frames),
             #[cfg(not(target_os = "macos"))]
             Self::Unsupported => Err(TranscriptionError::UnsupportedPlatform),
         }

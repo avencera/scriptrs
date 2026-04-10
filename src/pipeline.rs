@@ -125,7 +125,7 @@ impl TranscriptionPipeline {
         }
 
         let features = self.extractor.extract(audio)?;
-        let feature_frames = features.shape()[0];
+        let feature_frames = features.shape()[1];
         let padded_features = pad_features(features, config.max_feature_frames());
         let mut raw = self.model.transcribe(&padded_features, feature_frames)?;
         apply_time_offsets(
@@ -138,14 +138,14 @@ impl TranscriptionPipeline {
 }
 
 fn pad_features(features: Array2<f32>, target_frames: usize) -> Array2<f32> {
-    let current_frames = features.shape()[0];
+    let current_frames = features.shape()[1];
     if current_frames >= target_frames {
         return features;
     }
 
-    let feature_size = features.shape()[1];
-    let mut padded = Array2::<f32>::zeros((target_frames, feature_size));
-    padded.slice_mut(s![..current_frames, ..]).assign(&features);
+    let feature_size = features.shape()[0];
+    let mut padded = Array2::<f32>::zeros((feature_size, target_frames));
+    padded.slice_mut(s![.., ..current_frames]).assign(&features);
     padded
 }
 
