@@ -17,7 +17,7 @@ use std::ptr::NonNull;
 #[cfg(target_os = "macos")]
 use block2::RcBlock;
 #[cfg(target_os = "macos")]
-use ndarray::{Array1, Array2, Array3, ArrayView3};
+use ndarray::{Array1, Array2, Array3};
 #[cfg(target_os = "macos")]
 use objc2::rc::{Retained, autoreleasepool};
 #[cfg(target_os = "macos")]
@@ -150,27 +150,23 @@ impl ParakeetSplitCoreMlModel {
         )
     }
 
-    pub(crate) fn run_joint_frame(
+    pub(crate) fn run_joint(
         &self,
-        encoder_output: &Array3<f32>,
-        frame_idx: usize,
+        encoder_step: &Array3<f32>,
         decoder_step: &Array3<f32>,
     ) -> Result<JointDecision, TranscriptionError> {
-        let decoder_step = decoder_step.as_slice().ok_or_else(|| {
-            TranscriptionError::InvalidModelOutput(
-                "joint decoder step was not contiguous".to_owned(),
-            )
-        })?;
-        let time_steps = encoder_output.shape()[2];
-        if frame_idx >= time_steps {
-            return Err(TranscriptionError::InvalidModelOutput(format!(
-                "joint frame index out of bounds: {frame_idx} >= {time_steps}"
-            )));
-        }
-
-        let encoder_step = encoder_output.slice(ndarray::s![0..1, .., frame_idx..frame_idx + 1]);
-        self.joint_decision
-            .run_encoder_frame(encoder_step, decoder_step)
+        self.joint_decision.run(
+            encoder_step.as_slice().ok_or_else(|| {
+                TranscriptionError::InvalidModelOutput(
+                    "joint encoder step was not contiguous".to_owned(),
+                )
+            })?,
+            decoder_step.as_slice().ok_or_else(|| {
+                TranscriptionError::InvalidModelOutput(
+                    "joint decoder step was not contiguous".to_owned(),
+                )
+            })?,
+        )
     }
 }
 
@@ -271,31 +267,16 @@ impl JointDecisionCoreMlModel {
         })
     }
 
-    fn run_encoder_frame(
+    fn run(
         &self,
-        encoder_step: ArrayView3<'_, f32>,
+        encoder_step: &[f32],
         decoder_step: &[f32],
     ) -> Result<JointDecision, TranscriptionError> {
-        let encoder_ptr = encoder_step.as_ptr();
-        let encoder_strides = encoder_step
-            .strides()
-            .iter()
-            .copied()
-            .map(|stride| {
-                usize::try_from(stride).map_err(|_| {
-                    TranscriptionError::InvalidModelOutput(format!(
-                        "joint encoder stride was negative: {stride}"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
         self.model.predict_cached(
             &[
-                CachedCoreMlInput::F32Strided {
+                CachedCoreMlInput::F32 {
                     cached: &self.encoder_step,
-                    ptr: encoder_ptr,
-                    strides: &encoder_strides,
+                    values: encoder_step,
                 },
                 CachedCoreMlInput::F32 {
                     cached: &self.decoder_step,
@@ -473,11 +454,6 @@ pub(crate) enum CachedCoreMlInput<'a> {
     F32 {
         cached: &'a CachedInputShape,
         values: &'a [f32],
-    },
-    F32Strided {
-        cached: &'a CachedInputShape,
-        ptr: *const f32,
-        strides: &'a [usize],
     },
     I32 {
         cached: &'a CachedInputShape,

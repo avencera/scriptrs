@@ -14,8 +14,8 @@ use objc2_core_ml::{
 use objc2_foundation::{NSCopying, NSMutableDictionary, NSString, NSURL};
 
 use crate::coreml::array::{
-    extract_output, multi_array_f32, multi_array_f32_cached, multi_array_f32_strided_cached,
-    multi_array_i32, multi_array_i32_cached,
+    extract_output, multi_array_f32, multi_array_f32_cached, multi_array_i32,
+    multi_array_i32_cached,
 };
 use crate::coreml::{CachedCoreMlInput, CoreMlInput, CoreMlTensor};
 use crate::error::TranscriptionError;
@@ -91,14 +91,6 @@ pub(super) fn insert_cached_input(
             debug_assert_eq!(values.len(), cached.total_elements);
             (cached, multi_array_f32_cached(values, cached, deallocator)?)
         }
-        CachedCoreMlInput::F32Strided {
-            cached,
-            ptr,
-            strides,
-        } => (
-            cached,
-            multi_array_f32_strided_cached(ptr, cached, strides, deallocator)?,
-        ),
         CachedCoreMlInput::I32 { cached, values } => {
             debug_assert_eq!(values.len(), cached.total_elements);
             (cached, multi_array_i32_cached(values, cached, deallocator)?)

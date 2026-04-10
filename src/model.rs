@@ -1,6 +1,8 @@
 use ndarray::{Array1, Array2, Array3};
 
-use crate::constants::{DECODER_HIDDEN_SIZE, DECODER_LAYERS, MAX_TOKENS_PER_STEP};
+use crate::constants::{
+    DECODER_HIDDEN_SIZE, DECODER_LAYERS, ENCODER_HIDDEN_SIZE, MAX_TOKENS_PER_STEP,
+};
 use crate::decode::RawTranscription;
 use crate::error::TranscriptionError;
 use crate::models::ModelBundle;
@@ -59,12 +61,9 @@ impl ParakeetModel {
 
         while state.frame_idx < time_steps {
             state.ensure_decoder_step(&self.inner)?;
+            let frame = reshape_encoder_frame(encoder_output, state.frame_idx)?;
             let cached_decoder = state.cached_decoder()?;
-            let decision = self.inner.run_joint_frame(
-                encoder_output,
-                state.frame_idx,
-                &cached_decoder.decoder_step,
-            )?;
+            let decision = self.inner.run_joint(&frame, &cached_decoder.decoder_step)?;
 
             if decision.token_id != self.blank_id {
                 let cached_decoder = state.take_cached_decoder()?;
@@ -188,6 +187,23 @@ struct CachedDecoderStep {
     cell_state: Array3<f32>,
 }
 
+fn reshape_encoder_frame(
+    encoder_output: &Array3<f32>,
+    frame_idx: usize,
+) -> Result<Array3<f32>, TranscriptionError> {
+    let frame = encoder_output
+        .slice(ndarray::s![0, .., frame_idx])
+        .to_owned()
+        .to_shape((1, ENCODER_HIDDEN_SIZE, 1))
+        .map_err(|error| {
+            TranscriptionError::InvalidModelOutput(format!(
+                "failed to reshape encoder frame: {error}"
+            ))
+        })?
+        .to_owned();
+    Ok(frame)
+}
+
 #[derive(Debug, Clone)]
 struct JointDecision {
     token_id: usize,
@@ -257,16 +273,15 @@ impl ParakeetModelInner {
         }
     }
 
-    fn run_joint_frame(
+    fn run_joint(
         &self,
-        encoder_output: &Array3<f32>,
-        frame_idx: usize,
+        encoder_step: &Array3<f32>,
         decoder_step: &Array3<f32>,
     ) -> Result<JointDecision, TranscriptionError> {
         match self {
             #[cfg(target_os = "macos")]
             Self::SplitCoreMl(model) => {
-                let output = model.run_joint_frame(encoder_output, frame_idx, decoder_step)?;
+                let output = model.run_joint(encoder_step, decoder_step)?;
                 Ok(JointDecision {
                     token_id: output.token_id,
                     duration_step: output.duration_step,
