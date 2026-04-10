@@ -1,5 +1,6 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
+use std::slice;
 
 use block2::RcBlock;
 use objc2::AnyThread;
@@ -156,16 +157,16 @@ pub(super) fn extract_output(
         .collect();
     let data = match dtype {
         MLMultiArrayDataType::Float16 => {
-            read_strided(ptr.as_ptr() as *const u16, count, &shape, &strides)?
+            read_output(ptr.as_ptr() as *const u16, count, &shape, &strides)?
                 .into_iter()
                 .map(f16_to_f32)
                 .collect()
         }
         MLMultiArrayDataType::Float32 => {
-            read_strided(ptr.as_ptr() as *const f32, count, &shape, &strides)?
+            read_output(ptr.as_ptr() as *const f32, count, &shape, &strides)?
         }
         MLMultiArrayDataType::Int32 => {
-            read_strided(ptr.as_ptr() as *const i32, count, &shape, &strides)?
+            read_output(ptr.as_ptr() as *const i32, count, &shape, &strides)?
                 .iter()
                 .copied()
                 .map(|value| value as f32)
@@ -180,18 +181,55 @@ pub(super) fn extract_output(
     Ok((data, shape))
 }
 
+fn read_output<T: Copy>(
+    ptr: *const T,
+    count: usize,
+    shape: &[usize],
+    strides: &[isize],
+) -> Result<Vec<T>, TranscriptionError> {
+    validate_shape_and_strides(shape, strides)?;
+
+    if is_contiguous(shape, strides) {
+        return Ok(read_contiguous(ptr, count));
+    }
+
+    read_strided(ptr, count, shape, strides)
+}
+
+fn validate_shape_and_strides(
+    shape: &[usize],
+    strides: &[isize],
+) -> Result<(), TranscriptionError> {
+    if shape.len() != strides.len() {
+        return Err(TranscriptionError::CoreMl(format!(
+            "shape/stride rank mismatch: shape={shape:?} strides={strides:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn is_contiguous(shape: &[usize], strides: &[isize]) -> bool {
+    contiguous_strides(shape)
+        .into_iter()
+        .map(|stride| stride as isize)
+        .eq(strides.iter().copied())
+}
+
+fn read_contiguous<T: Copy>(ptr: *const T, count: usize) -> Vec<T> {
+    if count == 0 {
+        return Vec::new();
+    }
+
+    // SAFETY: contiguous outputs expose `count` initialized elements in row-major order
+    unsafe { slice::from_raw_parts(ptr, count) }.to_vec()
+}
+
 fn read_strided<T: Copy>(
     ptr: *const T,
     count: usize,
     shape: &[usize],
     strides: &[isize],
 ) -> Result<Vec<T>, TranscriptionError> {
-    if shape.len() != strides.len() {
-        return Err(TranscriptionError::CoreMl(format!(
-            "shape/stride rank mismatch: shape={shape:?} strides={strides:?}"
-        )));
-    }
-
     let mut values = Vec::with_capacity(count);
     for linear_index in 0..count {
         let offset = linear_offset(linear_index, shape, strides)?;
