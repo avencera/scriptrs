@@ -67,19 +67,21 @@ fn process_coreml_vad(model: &CoreMlModel, audio: &[f32]) -> Result<Vec<f32>, Tr
     let mut hidden_state = vec![0.0f32; VAD_STATE_SIZE];
     let mut cell_state = vec![0.0f32; VAD_STATE_SIZE];
     let mut context = vec![0.0f32; VAD_CONTEXT_SAMPLES];
+    let mut chunk = vec![0.0f32; VAD_WINDOW_SAMPLES];
+    let mut model_input = vec![0.0f32; VAD_WINDOW_SAMPLES + VAD_CONTEXT_SAMPLES];
 
     for chunk_start in (0..audio.len()).step_by(VAD_WINDOW_SAMPLES) {
         let chunk_end = (chunk_start + VAD_WINDOW_SAMPLES).min(audio.len());
-        let mut chunk = audio[chunk_start..chunk_end].to_vec();
-        if chunk.len() < VAD_WINDOW_SAMPLES {
-            let last = chunk.last().copied().unwrap_or(0.0);
-            chunk.resize(VAD_WINDOW_SAMPLES, last);
+        let chunk_len = chunk_end - chunk_start;
+        chunk[..chunk_len].copy_from_slice(&audio[chunk_start..chunk_end]);
+
+        if chunk_len < VAD_WINDOW_SAMPLES {
+            let last = chunk[chunk_len.saturating_sub(1)];
+            chunk[chunk_len..].fill(last);
         }
 
-        let next_context = chunk[chunk.len() - VAD_CONTEXT_SAMPLES..].to_vec();
-        let mut model_input = Vec::with_capacity(VAD_WINDOW_SAMPLES + VAD_CONTEXT_SAMPLES);
-        model_input.extend_from_slice(&context);
-        model_input.extend_from_slice(&chunk);
+        model_input[..VAD_CONTEXT_SAMPLES].copy_from_slice(&context);
+        model_input[VAD_CONTEXT_SAMPLES..].copy_from_slice(&chunk);
 
         let outputs = model.predict(
             &[
@@ -109,30 +111,28 @@ fn process_coreml_vad(model: &CoreMlModel, audio: &[f32]) -> Result<Vec<f32>, Tr
             .ok_or_else(|| {
                 TranscriptionError::CoreMl("VAD output `probability` was empty".to_owned())
             })?;
-        hidden_state = take_state(outputs.get("h_out"), VAD_STATE_SIZE)?;
-        cell_state = take_state(outputs.get("c_out"), VAD_STATE_SIZE)?;
+        copy_state(outputs.get("h_out"), &mut hidden_state)?;
+        copy_state(outputs.get("c_out"), &mut cell_state)?;
         probabilities.push(probability);
-        context = next_context;
+        context.copy_from_slice(&chunk[VAD_WINDOW_SAMPLES - VAD_CONTEXT_SAMPLES..]);
     }
 
     Ok(probabilities)
 }
 
 #[cfg(target_os = "macos")]
-fn take_state(
-    tensor: Option<&CoreMlTensor>,
-    state_size: usize,
-) -> Result<Vec<f32>, TranscriptionError> {
+fn copy_state(tensor: Option<&CoreMlTensor>, state: &mut [f32]) -> Result<(), TranscriptionError> {
     let tensor = tensor.ok_or_else(|| {
         TranscriptionError::CoreMl("missing recurrent VAD state output".to_owned())
     })?;
-    if tensor.data.len() < state_size {
+    if tensor.data.len() < state.len() {
         return Err(TranscriptionError::CoreMl(format!(
             "invalid recurrent VAD state length: {}",
             tensor.data.len()
         )));
     }
-    Ok(tensor.data[..state_size].to_vec())
+    state.copy_from_slice(&tensor.data[..state.len()]);
+    Ok(())
 }
 
 #[cfg(test)]
