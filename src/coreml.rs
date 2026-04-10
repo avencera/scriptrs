@@ -72,10 +72,9 @@ impl ParakeetSplitCoreMlModel {
 
     pub(crate) fn run_encoder(
         &self,
-        mel: &Array2<f32>,
-        length: i32,
+        mel: Array3<f32>,
+        lengths: Vec<i32>,
     ) -> Result<(Array3<f32>, usize), TranscriptionError> {
-        let lengths = [length];
         let inputs = [
             CoreMlInput::F32 {
                 name: "mel",
@@ -84,7 +83,7 @@ impl ParakeetSplitCoreMlModel {
                         "encoder input was not contiguous".to_owned(),
                     )
                 })?,
-                shape: &[1, mel.shape()[0], mel.shape()[1]],
+                shape: &[1, mel.shape()[1], mel.shape()[2]],
             },
             CoreMlInput::I32 {
                 name: "mel_length",

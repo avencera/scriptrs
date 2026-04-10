@@ -36,10 +36,13 @@ impl ParakeetFeatureExtractor {
             self.config.hop_length,
             self.config.win_length,
         )?;
-        let mut features = self.mel_filterbank.dot(&spectrogram);
+        let mel_spectrogram = self.mel_filterbank.dot(&spectrogram);
         let log_zero_guard = 2.0f32.powi(-24);
-        features.mapv_inplace(|value| (value + log_zero_guard).ln());
-        normalize_features(&mut features);
+        let mut features = mel_spectrogram
+            .mapv(|value| (value + log_zero_guard).ln())
+            .t()
+            .to_owned();
+        normalize_columns(&mut features);
         Ok(features)
     }
 }
@@ -159,16 +162,19 @@ fn create_mel_filterbank(n_fft: usize, n_mels: usize, sample_rate: usize) -> Arr
     filterbank
 }
 
-fn normalize_features(features: &mut Array2<f32>) {
-    let num_frames = features.shape()[1];
-    let num_features = features.shape()[0];
+fn normalize_columns(features: &mut Array2<f32>) {
+    let num_frames = features.shape()[0];
+    let num_features = features.shape()[1];
     for feature_idx in 0..num_features {
-        let mut row = features.row_mut(feature_idx);
-        let mean = row.iter().sum::<f32>() / num_frames as f32;
-        let variance = row.iter().map(|value| (*value - mean).powi(2)).sum::<f32>()
+        let mut column = features.column_mut(feature_idx);
+        let mean = column.iter().sum::<f32>() / num_frames as f32;
+        let variance = column
+            .iter()
+            .map(|value| (*value - mean).powi(2))
+            .sum::<f32>()
             / (num_frames as f32 - 1.0);
         let std = variance.sqrt() + 1e-5;
-        for value in &mut row {
+        for value in &mut column {
             *value = (*value - mean) / std;
         }
     }
@@ -216,8 +222,8 @@ mod tests {
         let extractor = ParakeetFeatureExtractor::new(&TranscriptionConfig::default());
         let audio = sine_wave(440.0, 16_000, 16_000);
         let features = extractor.extract(&audio).unwrap();
-        assert_eq!(features.shape()[0], 128);
-        assert!(features.shape()[1] > 0);
+        assert_eq!(features.shape()[1], 128);
+        assert!(features.shape()[0] > 0);
     }
 
     #[test]
@@ -225,8 +231,8 @@ mod tests {
         let extractor = ParakeetFeatureExtractor::new(&TranscriptionConfig::default());
         let audio = sine_wave(440.0, 16_000, 16_000);
         let features = extractor.extract(&audio).unwrap();
-        let feature = features.row(0);
-        let mean = feature.iter().sum::<f32>() / feature.len() as f32;
+        let column = features.column(0);
+        let mean = column.iter().sum::<f32>() / column.len() as f32;
         assert_abs_diff_eq!(mean, 0.0, epsilon = 1e-4);
     }
 }
