@@ -42,7 +42,7 @@ impl TranscriptionPipeline {
         bundle.validate_base()?;
         let config = TranscriptionConfig::default();
         let vocab = Vocabulary::from_file(bundle.vocab_path())?;
-        let model = ParakeetModel::from_bundle(&bundle, &vocab)?;
+        let model = ParakeetModel::from_bundle(&bundle, &vocab, &config)?;
         Ok(Self {
             extractor: ParakeetFeatureExtractor::new(&config),
             decoder: ParakeetTdtDecoder::new(vocab),
@@ -127,7 +127,11 @@ impl TranscriptionPipeline {
         let features = self.extractor.extract(audio)?;
         let feature_frames = features.shape()[0];
         let padded_features = pad_features(features, config.max_feature_frames());
-        let mut raw = self.model.transcribe(&padded_features, feature_frames)?;
+        let mut raw = self.model.transcribe(
+            &padded_features,
+            feature_frames,
+            config.max_feature_frames(),
+        )?;
         apply_time_offsets(
             &mut raw,
             global_sample_offset / SAMPLES_PER_ENCODER_FRAME,

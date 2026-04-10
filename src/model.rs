@@ -1,5 +1,8 @@
+use std::cell::RefCell;
+
 use ndarray::{Array1, Array2, Array3};
 
+use crate::config::TranscriptionConfig;
 use crate::constants::{
     DECODER_HIDDEN_SIZE, DECODER_LAYERS, ENCODER_HIDDEN_SIZE, MAX_TOKENS_PER_STEP,
 };
@@ -12,16 +15,22 @@ use crate::vocab::Vocabulary;
 pub(crate) struct ParakeetModel {
     inner: ParakeetModelInner,
     blank_id: usize,
+    encoder_input: RefCell<EncoderInputBuffer>,
 }
 
 impl ParakeetModel {
     pub(crate) fn from_bundle(
         bundle: &ModelBundle,
         vocab: &Vocabulary,
+        config: &TranscriptionConfig,
     ) -> Result<Self, TranscriptionError> {
         Ok(Self {
             inner: ParakeetModelInner::from_bundle(bundle)?,
             blank_id: vocab.blank_id(),
+            encoder_input: RefCell::new(EncoderInputBuffer::new(
+                config.feature_size,
+                config.max_feature_frames(),
+            )),
         })
     }
 
@@ -29,8 +38,10 @@ impl ParakeetModel {
         &self,
         features: &Array2<f32>,
         feature_frames: usize,
+        target_frames: usize,
     ) -> Result<RawTranscription, TranscriptionError> {
-        let (encoder_output, time_steps) = self.run_encoder(features, feature_frames)?;
+        let (encoder_output, time_steps) =
+            self.run_encoder(features, feature_frames, target_frames)?;
         self.greedy_decode(&encoder_output, time_steps)
     }
 
@@ -38,18 +49,16 @@ impl ParakeetModel {
         &self,
         features: &Array2<f32>,
         feature_frames: usize,
+        target_frames: usize,
     ) -> Result<(Array3<f32>, usize), TranscriptionError> {
-        let feature_size = features.shape()[1];
-        let input = Array3::from_shape_vec(
-            (1, feature_size, features.shape()[0]),
-            features.t().iter().copied().collect(),
+        let mut encoder_input = self.encoder_input.borrow_mut();
+        encoder_input.copy_from_features(features, feature_frames, target_frames)?;
+        self.inner.run_encoder(
+            encoder_input.values(),
+            encoder_input.feature_size(),
+            encoder_input.target_frames(),
+            feature_frames,
         )
-        .map_err(|error| {
-            TranscriptionError::InvalidModelOutput(format!(
-                "failed to shape encoder input: {error}"
-            ))
-        })?;
-        self.inner.run_encoder(input, vec![feature_frames as i32])
     }
 
     fn greedy_decode(
@@ -187,6 +196,76 @@ struct CachedDecoderStep {
     cell_state: Array3<f32>,
 }
 
+#[derive(Debug, Clone)]
+struct EncoderInputBuffer {
+    values: Vec<f32>,
+    feature_size: usize,
+    target_frames: usize,
+    last_feature_frames: usize,
+}
+
+impl EncoderInputBuffer {
+    fn new(feature_size: usize, target_frames: usize) -> Self {
+        Self {
+            values: vec![0.0; feature_size * target_frames],
+            feature_size,
+            target_frames,
+            last_feature_frames: 0,
+        }
+    }
+
+    fn copy_from_features(
+        &mut self,
+        features: &Array2<f32>,
+        feature_frames: usize,
+        target_frames: usize,
+    ) -> Result<(), TranscriptionError> {
+        if features.shape()[1] != self.feature_size {
+            return Err(TranscriptionError::InvalidModelOutput(format!(
+                "feature size {} did not match encoder input {}",
+                features.shape()[1],
+                self.feature_size
+            )));
+        }
+        if self.target_frames != target_frames {
+            self.values.resize(self.feature_size * target_frames, 0.0);
+            self.target_frames = target_frames;
+            self.last_feature_frames = 0;
+        }
+        if feature_frames > self.target_frames {
+            return Err(TranscriptionError::InvalidModelOutput(format!(
+                "feature frame count {feature_frames} exceeded encoder target {}",
+                self.target_frames
+            )));
+        }
+
+        for feature_idx in 0..self.feature_size {
+            let base = feature_idx * self.target_frames;
+            for frame_idx in 0..feature_frames {
+                self.values[base + frame_idx] = features[[frame_idx, feature_idx]];
+            }
+            if feature_frames < self.last_feature_frames {
+                self.values[base + feature_frames..base + self.last_feature_frames].fill(0.0);
+            }
+        }
+
+        self.last_feature_frames = feature_frames;
+        Ok(())
+    }
+
+    fn values(&self) -> &[f32] {
+        &self.values
+    }
+
+    fn feature_size(&self) -> usize {
+        self.feature_size
+    }
+
+    fn target_frames(&self) -> usize {
+        self.target_frames
+    }
+}
+
 fn reshape_encoder_frame(
     encoder_output: &Array3<f32>,
     frame_idx: usize,
@@ -240,12 +319,16 @@ impl ParakeetModelInner {
 
     fn run_encoder(
         &self,
-        input: Array3<f32>,
-        lengths: Vec<i32>,
+        input: &[f32],
+        feature_size: usize,
+        target_frames: usize,
+        feature_frames: usize,
     ) -> Result<(Array3<f32>, usize), TranscriptionError> {
         match self {
             #[cfg(target_os = "macos")]
-            Self::SplitCoreMl(model) => model.run_encoder(input, lengths),
+            Self::SplitCoreMl(model) => {
+                model.run_encoder(input, feature_size, target_frames, &[feature_frames as i32])
+            }
             #[cfg(not(target_os = "macos"))]
             Self::Unsupported => Err(TranscriptionError::UnsupportedPlatform),
         }
