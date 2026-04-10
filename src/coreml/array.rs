@@ -54,6 +54,21 @@ pub(super) fn multi_array_f32_cached(
     )
 }
 
+pub(super) fn multi_array_f32_strided_cached(
+    ptr: *const f32,
+    cached: &CachedInputShape,
+    strides: &[usize],
+    deallocator: &RcBlock<dyn Fn(NonNull<c_void>)>,
+) -> Result<Retained<MLMultiArray>, TranscriptionError> {
+    multi_array_cached_strides(
+        ptr.cast::<c_void>() as *mut c_void,
+        cached,
+        strides,
+        MLMultiArrayDataType::Float32,
+        deallocator,
+    )
+}
+
 pub(super) fn multi_array_i32(
     values: &[i32],
     shape: &[usize],
@@ -128,6 +143,34 @@ fn multi_array_cached(
             &cached.ns_shape,
             data_type,
             &cached.ns_strides,
+            Some(deallocator),
+        )
+    }
+    .map_err(|error| TranscriptionError::CoreMl(format!("failed to create MLMultiArray: {error}")))
+}
+
+fn multi_array_cached_strides(
+    ptr: *mut c_void,
+    cached: &CachedInputShape,
+    strides: &[usize],
+    data_type: MLMultiArrayDataType,
+    deallocator: &RcBlock<dyn Fn(NonNull<c_void>)>,
+) -> Result<Retained<MLMultiArray>, TranscriptionError> {
+    let ptr = NonNull::new(ptr).ok_or_else(|| {
+        TranscriptionError::CoreMl("input tensor had a null data pointer".to_owned())
+    })?;
+    let ns_strides = ns_number_array(strides);
+
+    #[allow(deprecated)]
+    // SAFETY: the pointer, cached shape, and supplied strides all describe the same borrowed
+    // SAFETY: tensor buffer, and CoreML only reads them during the prediction call
+    unsafe {
+        MLMultiArray::initWithDataPointer_shape_dataType_strides_deallocator_error(
+            MLMultiArray::alloc(),
+            ptr,
+            &cached.ns_shape,
+            data_type,
+            &ns_strides,
             Some(deallocator),
         )
     }
