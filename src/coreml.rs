@@ -29,6 +29,8 @@ use objc2_foundation::{NSArray, NSMutableDictionary, NSNumber, NSString};
 
 #[cfg(target_os = "macos")]
 use crate::constants::{DECODER_HIDDEN_SIZE, DECODER_LAYERS, ENCODER_HIDDEN_SIZE};
+#[cfg(all(target_os = "macos", feature = "long-form"))]
+use crate::constants::{VAD_CONTEXT_SAMPLES, VAD_STATE_SIZE, VAD_WINDOW_SAMPLES};
 #[cfg(target_os = "macos")]
 use crate::coreml::array::{contiguous_strides, extract_output, ns_number_array};
 #[cfg(target_os = "macos")]
@@ -40,6 +42,18 @@ pub(crate) struct ParakeetSplitCoreMlModel {
     encoder: CoreMlModel,
     decoder: DecoderCoreMlModel,
     joint_decision: JointDecisionCoreMlModel,
+}
+
+#[cfg(all(target_os = "macos", feature = "long-form"))]
+#[derive(Debug, Clone)]
+pub(crate) struct SileroVadCoreMlModel {
+    model: CoreMlModel,
+    audio: CachedInputShape,
+    hidden_state: CachedInputShape,
+    cell_state: CachedInputShape,
+    probability_output: CachedOutputKey,
+    hidden_output: CachedOutputKey,
+    cell_output: CachedOutputKey,
 }
 
 #[cfg(target_os = "macos")]
@@ -166,6 +180,55 @@ impl ParakeetSplitCoreMlModel {
                     "joint decoder step was not contiguous".to_owned(),
                 )
             })?,
+        )
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "long-form"))]
+impl SileroVadCoreMlModel {
+    pub(crate) fn new(path: &Path) -> Result<Self, TranscriptionError> {
+        Ok(Self {
+            model: CoreMlModel::new(path)?,
+            audio: CachedInputShape::new(
+                "audio",
+                &[1, 1, VAD_WINDOW_SAMPLES + VAD_CONTEXT_SAMPLES],
+            ),
+            hidden_state: CachedInputShape::new("h", &[1, 1, VAD_STATE_SIZE]),
+            cell_state: CachedInputShape::new("c", &[1, 1, VAD_STATE_SIZE]),
+            probability_output: CachedOutputKey::new("probability"),
+            hidden_output: CachedOutputKey::new("h_out"),
+            cell_output: CachedOutputKey::new("c_out"),
+        })
+    }
+
+    pub(crate) fn run(
+        &self,
+        audio: &[f32],
+        hidden_state: &[f32],
+        cell_state: &[f32],
+    ) -> Result<SileroVadOutput, TranscriptionError> {
+        self.model.predict_cached(
+            &[
+                CachedCoreMlInput::F32 {
+                    cached: &self.audio,
+                    values: audio,
+                },
+                CachedCoreMlInput::F32 {
+                    cached: &self.hidden_state,
+                    values: hidden_state,
+                },
+                CachedCoreMlInput::F32 {
+                    cached: &self.cell_state,
+                    values: cell_state,
+                },
+            ],
+            |output| {
+                Ok(SileroVadOutput {
+                    probability: scalar_f32(output, &self.probability_output)?,
+                    hidden_state: vector_f32(output, &self.hidden_output)?,
+                    cell_state: vector_f32(output, &self.cell_output)?,
+                })
+            },
         )
     }
 }
@@ -300,6 +363,14 @@ pub(crate) struct SplitDecoderCoreMlOutput {
     pub decoder_step: Array3<f32>,
     pub hidden_state: Array3<f32>,
     pub cell_state: Array3<f32>,
+}
+
+#[cfg(all(target_os = "macos", feature = "long-form"))]
+#[derive(Debug, Clone)]
+pub(crate) struct SileroVadOutput {
+    pub probability: f32,
+    pub hidden_state: Vec<f32>,
+    pub cell_state: Vec<f32>,
 }
 
 #[cfg(target_os = "macos")]
@@ -539,4 +610,14 @@ fn scalar_usize(
         )));
     }
     Ok(value as usize)
+}
+
+#[cfg(all(target_os = "macos", feature = "long-form"))]
+fn vector_f32(
+    output: &ProtocolObject<dyn MLFeatureProvider>,
+    key: &CachedOutputKey,
+) -> Result<Vec<f32>, TranscriptionError> {
+    let array = runtime::output_multi_array(output, &key.key, key.name)?;
+    let (data, _) = extract_output(&array)?;
+    Ok(data)
 }

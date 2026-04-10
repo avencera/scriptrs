@@ -1,7 +1,8 @@
 use std::path::Path;
 
 use crate::constants::{VAD_CONTEXT_SAMPLES, VAD_STATE_SIZE, VAD_WINDOW_SAMPLES};
-use crate::coreml::{CoreMlInput, CoreMlModel, CoreMlTensor};
+#[cfg(target_os = "macos")]
+use crate::coreml::SileroVadCoreMlModel;
 use crate::error::TranscriptionError;
 use crate::long_form::planner::VadConfig;
 
@@ -29,7 +30,7 @@ impl SileroVad {
 #[derive(Debug, Clone)]
 enum VadModelInner {
     #[cfg(target_os = "macos")]
-    CoreMl(CoreMlModel),
+    CoreMl(SileroVadCoreMlModel),
     #[cfg(not(target_os = "macos"))]
     Unsupported,
 }
@@ -38,7 +39,7 @@ impl VadModelInner {
     fn new(model_path: &Path) -> Result<Self, TranscriptionError> {
         #[cfg(target_os = "macos")]
         {
-            Ok(Self::CoreMl(CoreMlModel::new(model_path)?))
+            Ok(Self::CoreMl(SileroVadCoreMlModel::new(model_path)?))
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -58,7 +59,10 @@ impl VadModelInner {
 }
 
 #[cfg(target_os = "macos")]
-fn process_coreml_vad(model: &CoreMlModel, audio: &[f32]) -> Result<Vec<f32>, TranscriptionError> {
+fn process_coreml_vad(
+    model: &SileroVadCoreMlModel,
+    audio: &[f32],
+) -> Result<Vec<f32>, TranscriptionError> {
     if audio.is_empty() {
         return Ok(Vec::new());
     }
@@ -83,37 +87,10 @@ fn process_coreml_vad(model: &CoreMlModel, audio: &[f32]) -> Result<Vec<f32>, Tr
         model_input[..VAD_CONTEXT_SAMPLES].copy_from_slice(&context);
         model_input[VAD_CONTEXT_SAMPLES..].copy_from_slice(&chunk);
 
-        let outputs = model.predict(
-            &[
-                CoreMlInput::F32 {
-                    name: "audio",
-                    values: &model_input,
-                    shape: &[1, 1, VAD_WINDOW_SAMPLES + VAD_CONTEXT_SAMPLES],
-                },
-                CoreMlInput::F32 {
-                    name: "h",
-                    values: &hidden_state,
-                    shape: &[1, 1, VAD_STATE_SIZE],
-                },
-                CoreMlInput::F32 {
-                    name: "c",
-                    values: &cell_state,
-                    shape: &[1, 1, VAD_STATE_SIZE],
-                },
-            ],
-            &["probability", "h_out", "c_out"],
-        )?;
-
-        let probability = outputs
-            .get("probability")
-            .and_then(|tensor| tensor.data.first())
-            .copied()
-            .ok_or_else(|| {
-                TranscriptionError::CoreMl("VAD output `probability` was empty".to_owned())
-            })?;
-        copy_state(outputs.get("h_out"), &mut hidden_state)?;
-        copy_state(outputs.get("c_out"), &mut cell_state)?;
-        probabilities.push(probability);
+        let outputs = model.run(&model_input, &hidden_state, &cell_state)?;
+        copy_state_vec(&outputs.hidden_state, &mut hidden_state)?;
+        copy_state_vec(&outputs.cell_state, &mut cell_state)?;
+        probabilities.push(outputs.probability);
         context.copy_from_slice(&chunk[VAD_WINDOW_SAMPLES - VAD_CONTEXT_SAMPLES..]);
     }
 
@@ -121,17 +98,14 @@ fn process_coreml_vad(model: &CoreMlModel, audio: &[f32]) -> Result<Vec<f32>, Tr
 }
 
 #[cfg(target_os = "macos")]
-fn copy_state(tensor: Option<&CoreMlTensor>, state: &mut [f32]) -> Result<(), TranscriptionError> {
-    let tensor = tensor.ok_or_else(|| {
-        TranscriptionError::CoreMl("missing recurrent VAD state output".to_owned())
-    })?;
-    if tensor.data.len() < state.len() {
+fn copy_state_vec(values: &[f32], state: &mut [f32]) -> Result<(), TranscriptionError> {
+    if values.len() < state.len() {
         return Err(TranscriptionError::CoreMl(format!(
             "invalid recurrent VAD state length: {}",
-            tensor.data.len()
+            values.len()
         )));
     }
-    state.copy_from_slice(&tensor.data[..state.len()]);
+    state.copy_from_slice(&values[..state.len()]);
     Ok(())
 }
 
