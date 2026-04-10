@@ -1,11 +1,10 @@
-use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::Path;
 use std::ptr::NonNull;
 
 use block2::RcBlock;
 use objc2::AnyThread;
-use objc2::rc::{Retained, autoreleasepool};
+use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2_core_ml::{
     MLComputeUnits, MLDictionaryFeatureProvider, MLFeatureProvider, MLFeatureValue, MLModel,
@@ -14,10 +13,9 @@ use objc2_core_ml::{
 use objc2_foundation::{NSCopying, NSMutableDictionary, NSString, NSURL};
 
 use crate::coreml::array::{
-    extract_output, multi_array_f32, multi_array_f32_cached, multi_array_i32,
-    multi_array_i32_cached,
+    multi_array_f32, multi_array_f32_cached, multi_array_i32, multi_array_i32_cached,
 };
-use crate::coreml::{CachedCoreMlInput, CoreMlInput, CoreMlTensor};
+use crate::coreml::{CachedCoreMlInput, CoreMlInput};
 use crate::error::TranscriptionError;
 
 pub(super) fn load_model(
@@ -36,49 +34,27 @@ pub(super) fn load_model(
     .map_err(|error| TranscriptionError::CoreMl(format!("failed to load model: {error}")))
 }
 
-pub(super) fn predict(
-    model: &MLModel,
+pub(super) fn insert_input(
     input_dict: &NSMutableDictionary<NSString, AnyObject>,
     deallocator: &RcBlock<dyn Fn(NonNull<c_void>)>,
-    inputs: &[CoreMlInput<'_>],
-    output_names: &[&str],
-) -> Result<HashMap<String, CoreMlTensor>, TranscriptionError> {
-    autoreleasepool(|_| {
-        let mut arrays = Vec::with_capacity(inputs.len());
-
-        for input in inputs {
-            let (name, array) = match input {
-                CoreMlInput::F32 {
-                    name,
-                    values,
-                    shape,
-                } => (*name, multi_array_f32(values, shape, deallocator)?),
-                CoreMlInput::I32 {
-                    name,
-                    values,
-                    shape,
-                } => (*name, multi_array_i32(values, shape, deallocator)?),
-            };
-            let key = NSString::from_str(name);
-            let key_copy: &ProtocolObject<dyn NSCopying> = ProtocolObject::from_ref(&*key);
-            insert_input_feature(input_dict, key_copy, &array);
-            arrays.push(array);
-        }
-
-        let output_provider = predict_features(
-            model,
-            ProtocolObject::from_ref(&*build_feature_provider(input_dict)?),
-        )?;
-        let mut outputs = HashMap::with_capacity(output_names.len());
-        for output_name in output_names {
-            let key = NSString::from_str(output_name);
-            let array = output_multi_array(&output_provider, &key, output_name)?;
-            let (data, shape) = extract_output(&array)?;
-            outputs.insert((*output_name).to_owned(), CoreMlTensor { data, shape });
-        }
-
-        Ok(outputs)
-    })
+    input: CoreMlInput<'_>,
+) -> Result<Retained<MLMultiArray>, TranscriptionError> {
+    let (name, array) = match input {
+        CoreMlInput::F32 {
+            name,
+            values,
+            shape,
+        } => (name, multi_array_f32(values, shape, deallocator)?),
+        CoreMlInput::I32 {
+            name,
+            values,
+            shape,
+        } => (name, multi_array_i32(values, shape, deallocator)?),
+    };
+    let key = NSString::from_str(name);
+    let key_copy: &ProtocolObject<dyn NSCopying> = ProtocolObject::from_ref(&*key);
+    insert_input_feature(input_dict, key_copy, &array);
+    Ok(array)
 }
 
 pub(super) fn insert_cached_input(
