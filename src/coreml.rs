@@ -35,11 +35,13 @@ use crate::constants::{VAD_CONTEXT_SAMPLES, VAD_STATE_SIZE, VAD_WINDOW_SAMPLES};
 use crate::coreml::array::{contiguous_strides, extract_output, ns_number_array};
 #[cfg(target_os = "macos")]
 use crate::error::TranscriptionError;
+#[cfg(target_os = "macos")]
+use crate::models::EncoderModelSpec;
 
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone)]
 pub(crate) struct ParakeetSplitCoreMlModel {
-    encoder: CoreMlModel,
+    encoder: EncoderCoreMlModel,
     decoder: DecoderCoreMlModel,
     joint_decision: JointDecisionCoreMlModel,
 }
@@ -62,9 +64,10 @@ impl ParakeetSplitCoreMlModel {
         encoder_path: &Path,
         decoder_path: &Path,
         joint_decision_path: &Path,
+        encoder_spec: EncoderModelSpec,
     ) -> Result<Self, TranscriptionError> {
         Ok(Self {
-            encoder: CoreMlModel::new(encoder_path)?,
+            encoder: EncoderCoreMlModel::new(encoder_path, encoder_spec)?,
             decoder: DecoderCoreMlModel::new(decoder_path)?,
             joint_decision: JointDecisionCoreMlModel::new(joint_decision_path)?,
         })
@@ -75,62 +78,7 @@ impl ParakeetSplitCoreMlModel {
         mel: Array3<f32>,
         lengths: Vec<i32>,
     ) -> Result<(Array3<f32>, usize), TranscriptionError> {
-        let inputs = [
-            CoreMlInput::F32 {
-                name: "mel",
-                values: mel.as_slice().ok_or_else(|| {
-                    TranscriptionError::InvalidModelOutput(
-                        "encoder input was not contiguous".to_owned(),
-                    )
-                })?,
-                shape: &[1, mel.shape()[1], mel.shape()[2]],
-            },
-            CoreMlInput::I32 {
-                name: "mel_length",
-                values: &lengths,
-                shape: &[1],
-            },
-        ];
-        let outputs = self
-            .encoder
-            .predict(&inputs, &["encoder", "encoder_length"])?;
-        let tensor = outputs.get("encoder").ok_or_else(|| {
-            TranscriptionError::InvalidModelOutput("encoder output `encoder` missing".to_owned())
-        })?;
-        let shape = tensor.shape.as_slice();
-        if shape.len() != 3 {
-            return Err(TranscriptionError::InvalidModelOutput(format!(
-                "encoder output shape was not 3D: {shape:?}"
-            )));
-        }
-
-        let encoder = match shape {
-            [1, hidden, time] if *hidden == ENCODER_HIDDEN_SIZE => {
-                array3_from_parts(tensor.data.clone(), shape, "encoder output")?
-            }
-            [1, time, hidden] if *hidden == ENCODER_HIDDEN_SIZE => {
-                Array3::from_shape_vec((1, *time, *hidden), tensor.data.clone())
-                    .map_err(|error| {
-                        TranscriptionError::InvalidModelOutput(format!(
-                            "failed to shape encoder output: {error}"
-                        ))
-                    })?
-                    .permuted_axes([0, 2, 1])
-            }
-            _ => {
-                return Err(TranscriptionError::InvalidModelOutput(format!(
-                    "unexpected encoder output shape: {shape:?}"
-                )));
-            }
-        };
-        let time_steps = outputs
-            .get("encoder_length")
-            .and_then(|tensor| tensor.data.first())
-            .copied()
-            .map(|value| value as usize)
-            .filter(|value| *value > 0)
-            .unwrap_or_else(|| encoder.shape()[2]);
-        Ok((encoder, time_steps))
+        self.encoder.run(mel, &lengths)
     }
 
     pub(crate) fn run_decoder(
@@ -181,6 +129,95 @@ impl ParakeetSplitCoreMlModel {
                 )
             })?,
         )
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone)]
+struct EncoderCoreMlModel {
+    model: CoreMlModel,
+    input_name: String,
+    length_name: String,
+    output_name: String,
+    output_length_name: String,
+}
+
+#[cfg(target_os = "macos")]
+impl EncoderCoreMlModel {
+    fn new(path: &Path, spec: EncoderModelSpec) -> Result<Self, TranscriptionError> {
+        Ok(Self {
+            model: CoreMlModel::new(path)?,
+            input_name: spec.input_name,
+            length_name: spec.length_name,
+            output_name: spec.output_name,
+            output_length_name: spec.output_length_name,
+        })
+    }
+
+    fn run(
+        &self,
+        mel: Array3<f32>,
+        lengths: &[i32],
+    ) -> Result<(Array3<f32>, usize), TranscriptionError> {
+        let inputs = [
+            CoreMlInput::F32 {
+                name: &self.input_name,
+                values: mel.as_slice().ok_or_else(|| {
+                    TranscriptionError::InvalidModelOutput(
+                        "encoder input was not contiguous".to_owned(),
+                    )
+                })?,
+                shape: &[1, mel.shape()[1], mel.shape()[2]],
+            },
+            CoreMlInput::I32 {
+                name: &self.length_name,
+                values: lengths,
+                shape: &[1],
+            },
+        ];
+        let outputs = self
+            .model
+            .predict(&inputs, &[&self.output_name, &self.output_length_name])?;
+        let tensor = outputs.get(&self.output_name).ok_or_else(|| {
+            TranscriptionError::InvalidModelOutput(format!(
+                "encoder output `{}` missing",
+                self.output_name
+            ))
+        })?;
+        let shape = tensor.shape.as_slice();
+        if shape.len() != 3 {
+            return Err(TranscriptionError::InvalidModelOutput(format!(
+                "encoder output shape was not 3D: {shape:?}"
+            )));
+        }
+
+        let encoder = match shape {
+            [1, hidden, time] if *hidden == ENCODER_HIDDEN_SIZE => {
+                array3_from_parts(tensor.data.clone(), shape, "encoder output")?
+            }
+            [1, time, hidden] if *hidden == ENCODER_HIDDEN_SIZE => {
+                Array3::from_shape_vec((1, *time, *hidden), tensor.data.clone())
+                    .map_err(|error| {
+                        TranscriptionError::InvalidModelOutput(format!(
+                            "failed to shape encoder output: {error}"
+                        ))
+                    })?
+                    .permuted_axes([0, 2, 1])
+            }
+            _ => {
+                return Err(TranscriptionError::InvalidModelOutput(format!(
+                    "unexpected encoder output shape: {shape:?}"
+                )));
+            }
+        };
+        let time_steps = outputs
+            .get(&self.output_length_name)
+            .and_then(|tensor| tensor.data.first())
+            .copied()
+            .map(|value| value as usize)
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| encoder.shape()[2]);
+        Ok((encoder, time_steps))
     }
 }
 

@@ -18,6 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 PARAKEET_COREML_REPO = "FluidInference/parakeet-tdt-0.6b-v2-coreml"
 PARAKEET_VOCAB_REPO = "istupakov/parakeet-tdt-0.6b-v2-onnx"
 SILERO_VAD_REPO = "aufklarer/Silero-VAD-v5-CoreML"
+ALT_ENCODER_VARIANT = "ParakeetEncoder_v2.mlmodelc"
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,6 +31,11 @@ def parse_args() -> argparse.Namespace:
         default=REPO_ROOT / "fixtures/models",
         help="Directory where the staged models should be written",
     )
+    parser.add_argument(
+        "--include-encoder-v2",
+        action="store_true",
+        help="Stage the upstream ParakeetEncoder_v2 bundle as encoder-v2.mlmodelc",
+    )
     return parser.parse_args()
 
 
@@ -41,11 +47,7 @@ def main() -> None:
     print("Downloading Parakeet CoreML bundles...")
     parakeet_coreml_dir = download_snapshot(
         PARAKEET_COREML_REPO,
-        [
-            "Encoder.mlmodelc/*",
-            "Decoder.mlmodelc/*",
-            "JointDecision.mlmodelc/*",
-        ],
+        base_coreml_patterns(include_encoder_v2=args.include_encoder_v2),
     )
 
     print("Downloading Parakeet ONNX reference assets...")
@@ -66,9 +68,25 @@ def main() -> None:
         ["silero_vad.mlmodelc/*"],
     )
 
-    stage_parakeet(parakeet_coreml_dir, parakeet_onnx_dir, output_dir)
+    stage_parakeet(
+        parakeet_coreml_dir,
+        parakeet_onnx_dir,
+        output_dir,
+        include_encoder_v2=args.include_encoder_v2,
+    )
     stage_vad(vad_dir, output_dir)
     print(f"Staged models in {output_dir}")
+
+
+def base_coreml_patterns(*, include_encoder_v2: bool) -> list[str]:
+    patterns = [
+        "Encoder.mlmodelc/*",
+        "Decoder.mlmodelc/*",
+        "JointDecision.mlmodelc/*",
+    ]
+    if include_encoder_v2:
+        patterns.append(f"{ALT_ENCODER_VARIANT}/*")
+    return patterns
 
 
 def download_snapshot(repo_id: str, allow_patterns: list[str]) -> Path:
@@ -80,11 +98,19 @@ def download_snapshot(repo_id: str, allow_patterns: list[str]) -> Path:
     )
 
 
-def stage_parakeet(coreml_dir: Path, onnx_dir: Path, output_dir: Path) -> None:
+def stage_parakeet(
+    coreml_dir: Path,
+    onnx_dir: Path,
+    output_dir: Path,
+    *,
+    include_encoder_v2: bool,
+) -> None:
     parakeet_dir = output_dir / "parakeet-v2"
     if parakeet_dir.exists():
         shutil.rmtree(parakeet_dir)
     copy_bundle(coreml_dir / "Encoder.mlmodelc", parakeet_dir / "encoder.mlmodelc")
+    if include_encoder_v2:
+        copy_bundle(coreml_dir / ALT_ENCODER_VARIANT, parakeet_dir / "encoder-v2.mlmodelc")
     copy_bundle(coreml_dir / "Decoder.mlmodelc", parakeet_dir / "decoder.mlmodelc")
     copy_bundle(
         coreml_dir / "JointDecision.mlmodelc",

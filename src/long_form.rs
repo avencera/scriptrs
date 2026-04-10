@@ -50,6 +50,19 @@ pub struct LongFormConfig {
     pub overlap: OverlapChunkConfig,
 }
 
+impl LongFormConfig {
+    fn from_transcription(transcription: TranscriptionConfig) -> Self {
+        Self {
+            overlap: OverlapChunkConfig {
+                max_model_samples: transcription.max_audio_samples,
+                ..OverlapChunkConfig::default()
+            },
+            transcription,
+            ..Self::default()
+        }
+    }
+}
+
 impl LongFormTranscriptionPipeline {
     /// Build a long-form pipeline from a local model directory
     ///
@@ -65,10 +78,11 @@ impl LongFormTranscriptionPipeline {
         bundle.validate_long_form()?;
         let inner = TranscriptionPipeline::from_bundle(bundle.clone())?;
         let vad = SileroVad::new(bundle.vad_dir())?;
+        let default_config = LongFormConfig::from_transcription(inner.config().clone());
         Ok(Self {
             inner,
             vad,
-            default_config: LongFormConfig::default(),
+            default_config,
         })
     }
 

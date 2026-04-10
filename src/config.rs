@@ -43,6 +43,12 @@ impl Default for TranscriptionConfig {
 }
 
 impl TranscriptionConfig {
+    pub(crate) fn from_encoder_max_frames(max_frames: usize) -> Self {
+        let mut config = Self::default();
+        config.max_audio_samples = max_frames.saturating_sub(1) * config.hop_length;
+        config
+    }
+
     pub(crate) fn max_duration_seconds(&self) -> f64 {
         self.max_audio_samples as f64 / self.sample_rate as f64
     }
