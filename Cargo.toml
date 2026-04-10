@@ -29,12 +29,27 @@ tracing = "0.1.44"
 objc2 = "0.6"
 block2 = "0.6"
 objc2-core-ml = { version = "0.3", features = [
+    "MLAllComputeDevices",
+    "MLCPUComputeDevice",
+    "MLComputeDeviceProtocol",
+    "MLComputePlan",
+    "MLComputePlanDeviceUsage",
     "MLModel",
     "MLMultiArray",
     "MLModelConfiguration",
     "MLDictionaryFeatureProvider",
     "MLFeatureValue",
     "MLFeatureProvider",
+    "MLGPUComputeDevice",
+    "MLModelStructure",
+    "MLModelStructureNeuralNetwork",
+    "MLModelStructurePipeline",
+    "MLModelStructureProgram",
+    "MLModelStructureProgramBlock",
+    "MLModelStructureProgramFunction",
+    "MLModelStructureProgramOperation",
+    "MLModel_MLComputeDevice",
+    "MLNeuralEngineComputeDevice",
     "alloc",
     "block2",
 ] }

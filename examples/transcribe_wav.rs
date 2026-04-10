@@ -23,13 +23,17 @@ fn main() -> ExitCode {
 fn run() -> Result<()> {
     let args = Args::parse(env::args().skip(1))?;
     let audio = read_mono_16khz_wav(&args.audio_path)?;
-    let started_at = Instant::now();
+    let pipeline_started_at = Instant::now();
 
     #[cfg(feature = "long-form")]
     let result = if args.long_form {
-        build_long_form_pipeline(&args)?.run(&audio)?
+        let pipeline = build_long_form_pipeline(&args)?;
+        let pipeline_elapsed = pipeline_started_at.elapsed().as_secs_f64();
+        run_long_form_pipeline(&pipeline, &audio, &args, pipeline_elapsed)?
     } else {
-        build_pipeline(&args)?.run(&audio)?
+        let pipeline = build_pipeline(&args)?;
+        let pipeline_elapsed = pipeline_started_at.elapsed().as_secs_f64();
+        run_pipeline(&pipeline, &audio, &args, pipeline_elapsed)?
     };
 
     #[cfg(not(feature = "long-form"))]
@@ -37,12 +41,13 @@ fn run() -> Result<()> {
         if args.long_form {
             bail!("rebuild with --features long-form to use --long-form")
         }
-        build_pipeline(&args)?.run(&audio)?
+        let pipeline = build_pipeline(&args)?;
+        let pipeline_elapsed = pipeline_started_at.elapsed().as_secs_f64();
+        run_pipeline(&pipeline, &audio, &args, pipeline_elapsed)?
     };
 
     println!("file: {}", args.audio_path.display());
     println!("audio_seconds: {:.1}", audio.len() as f64 / 16_000.0);
-    println!("elapsed_seconds: {:.2}", started_at.elapsed().as_secs_f64());
     println!("chunks: {}", result.chunks.len());
     println!("tokens: {}", result.tokens.len());
     println!("{}", preview(&result.text, args.preview_chars));
@@ -55,6 +60,8 @@ struct Args {
     models_dir: Option<PathBuf>,
     pretrained: bool,
     long_form: bool,
+    warmup_runs: usize,
+    benchmark_runs: usize,
     preview_chars: usize,
 }
 
@@ -65,6 +72,8 @@ impl Args {
         let mut models_dir = None;
         let mut pretrained = false;
         let mut long_form = false;
+        let mut warmup_runs = 1usize;
+        let mut benchmark_runs = 0usize;
         let mut preview_chars = 800usize;
 
         while let Some(arg) = args.next() {
@@ -73,6 +82,16 @@ impl Args {
                 "--models-dir" => models_dir = Some(next_path(&mut args, "--models-dir")?),
                 "--pretrained" => pretrained = true,
                 "--long-form" => long_form = true,
+                "--warmup-runs" => {
+                    warmup_runs = next_value(&mut args, "--warmup-runs")?
+                        .parse()
+                        .map_err(|error| eyre!("invalid --warmup-runs value: {error}"))?;
+                }
+                "--benchmark-runs" => {
+                    benchmark_runs = next_value(&mut args, "--benchmark-runs")?
+                        .parse()
+                        .map_err(|error| eyre!("invalid --benchmark-runs value: {error}"))?;
+                }
                 "--preview-chars" => {
                     preview_chars = next_value(&mut args, "--preview-chars")?
                         .parse()
@@ -98,12 +117,17 @@ impl Args {
         if pretrained && models_dir.is_some() {
             bail!("use either --pretrained or --models-dir, not both")
         }
+        if benchmark_runs > 0 && warmup_runs == 0 {
+            bail!("--warmup-runs must be at least 1 when benchmarking")
+        }
 
         Ok(Self {
             audio_path,
             models_dir,
             pretrained,
             long_form,
+            warmup_runs,
+            benchmark_runs,
             preview_chars,
         })
     }
@@ -120,8 +144,89 @@ Options:
   --models-dir <dir>         local scriptrs model bundle directory
   --pretrained               download models via the online feature
   --long-form                use LongFormTranscriptionPipeline
+  --warmup-runs <n>          warmup runs before timing (default: 1)
+  --benchmark-runs <n>       timed runs after warmup on one loaded pipeline
   --preview-chars <n>        text preview limit"
     );
+}
+
+fn run_pipeline(
+    pipeline: &TranscriptionPipeline,
+    audio: &[f32],
+    args: &Args,
+    pipeline_elapsed: f64,
+) -> Result<scriptrs::TranscriptionResult> {
+    if args.benchmark_runs == 0 {
+        let started_at = Instant::now();
+        let result = pipeline.run(audio)?;
+        println!("pipeline_load_seconds: {:.2}", pipeline_elapsed);
+        println!("elapsed_seconds: {:.2}", started_at.elapsed().as_secs_f64());
+        return Ok(result);
+    }
+
+    for _ in 0..args.warmup_runs {
+        let _ = pipeline.run(audio)?;
+    }
+
+    let mut total_seconds = 0.0;
+    let mut result = None;
+    for _ in 0..args.benchmark_runs {
+        let started_at = Instant::now();
+        let run_result = pipeline.run(audio)?;
+        total_seconds += started_at.elapsed().as_secs_f64();
+        result = Some(run_result);
+    }
+
+    let result = result.expect("benchmark_runs should be positive");
+    println!("pipeline_load_seconds: {:.2}", pipeline_elapsed);
+    println!("warmup_runs: {}", args.warmup_runs);
+    println!("benchmark_runs: {}", args.benchmark_runs);
+    println!("elapsed_seconds: {:.2}", total_seconds);
+    println!(
+        "mean_elapsed_seconds: {:.2}",
+        total_seconds / args.benchmark_runs as f64
+    );
+    Ok(result)
+}
+
+#[cfg(feature = "long-form")]
+fn run_long_form_pipeline(
+    pipeline: &LongFormTranscriptionPipeline,
+    audio: &[f32],
+    args: &Args,
+    pipeline_elapsed: f64,
+) -> Result<scriptrs::TranscriptionResult> {
+    if args.benchmark_runs == 0 {
+        let started_at = Instant::now();
+        let result = pipeline.run(audio)?;
+        println!("pipeline_load_seconds: {:.2}", pipeline_elapsed);
+        println!("elapsed_seconds: {:.2}", started_at.elapsed().as_secs_f64());
+        return Ok(result);
+    }
+
+    for _ in 0..args.warmup_runs {
+        let _ = pipeline.run(audio)?;
+    }
+
+    let mut total_seconds = 0.0;
+    let mut result = None;
+    for _ in 0..args.benchmark_runs {
+        let started_at = Instant::now();
+        let run_result = pipeline.run(audio)?;
+        total_seconds += started_at.elapsed().as_secs_f64();
+        result = Some(run_result);
+    }
+
+    let result = result.expect("benchmark_runs should be positive");
+    println!("pipeline_load_seconds: {:.2}", pipeline_elapsed);
+    println!("warmup_runs: {}", args.warmup_runs);
+    println!("benchmark_runs: {}", args.benchmark_runs);
+    println!("elapsed_seconds: {:.2}", total_seconds);
+    println!(
+        "mean_elapsed_seconds: {:.2}",
+        total_seconds / args.benchmark_runs as f64
+    );
+    Ok(result)
 }
 
 fn build_pipeline(args: &Args) -> Result<TranscriptionPipeline> {

@@ -8,6 +8,8 @@ use std::cell::RefCell;
 #[cfg(target_os = "macos")]
 use std::collections::HashMap;
 #[cfg(target_os = "macos")]
+use std::env;
+#[cfg(target_os = "macos")]
 use std::ffi::c_void;
 #[cfg(target_os = "macos")]
 use std::path::Path;
@@ -410,7 +412,7 @@ impl Clone for CoreMlModel {
 impl CoreMlModel {
     pub(crate) fn new(path: &Path) -> Result<Self, TranscriptionError> {
         Ok(Self {
-            model: runtime::load_model(path, MLComputeUnits::CPUAndNeuralEngine)?,
+            model: runtime::load_model(path, configured_compute_units()?)?,
             noop_deallocator: RcBlock::new(|_: NonNull<c_void>| {}),
             input_dict: RefCell::new(NSMutableDictionary::new()),
         })
@@ -463,6 +465,28 @@ impl CoreMlModel {
             input_dict.removeAllObjects();
             f(&input_dict, &self.noop_deallocator)
         })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn configured_compute_units() -> Result<MLComputeUnits, TranscriptionError> {
+    let Some(value) = env::var_os("SCRIPTRS_COREML_COMPUTE_UNITS") else {
+        return Ok(MLComputeUnits::CPUAndNeuralEngine);
+    };
+
+    // allow benchmark tooling to sweep CoreML backends without changing the default runtime
+    let value = value.to_string_lossy();
+    let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
+    match normalized.as_str() {
+        "cpu_only" => Ok(MLComputeUnits::CPUOnly),
+        "cpu_and_gpu" => Ok(MLComputeUnits::CPUAndGPU),
+        "all" => Ok(MLComputeUnits::All),
+        "cpu_and_neural_engine" | "cpu_and_ane" | "default" => {
+            Ok(MLComputeUnits::CPUAndNeuralEngine)
+        }
+        _ => Err(TranscriptionError::CoreMl(format!(
+            "unsupported SCRIPTRS_COREML_COMPUTE_UNITS value `{value}` expected cpu_only, cpu_and_gpu, all, or cpu_and_neural_engine"
+        ))),
     }
 }
 
