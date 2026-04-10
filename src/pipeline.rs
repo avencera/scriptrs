@@ -40,10 +40,9 @@ impl TranscriptionPipeline {
     /// Build a transcription pipeline from a resolved model bundle
     pub fn from_bundle(bundle: ModelBundle) -> Result<Self, TranscriptionError> {
         bundle.validate_base()?;
-        let encoder_spec = bundle.encoder_spec()?;
-        let config = TranscriptionConfig::from_encoder_max_frames(encoder_spec.max_frames);
+        let config = TranscriptionConfig::default();
         let vocab = Vocabulary::from_file(bundle.vocab_path())?;
-        let model = ParakeetModel::from_bundle(&bundle, &vocab, encoder_spec)?;
+        let model = ParakeetModel::from_bundle(&bundle, &vocab)?;
         Ok(Self {
             extractor: ParakeetFeatureExtractor::new(&config),
             decoder: ParakeetTdtDecoder::new(vocab),

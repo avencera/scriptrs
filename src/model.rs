@@ -5,7 +5,7 @@ use crate::constants::{
 };
 use crate::decode::RawTranscription;
 use crate::error::TranscriptionError;
-use crate::models::{EncoderModelSpec, ModelBundle};
+use crate::models::ModelBundle;
 use crate::vocab::Vocabulary;
 
 #[derive(Debug, Clone)]
@@ -18,10 +18,9 @@ impl ParakeetModel {
     pub(crate) fn from_bundle(
         bundle: &ModelBundle,
         vocab: &Vocabulary,
-        encoder_spec: EncoderModelSpec,
     ) -> Result<Self, TranscriptionError> {
         Ok(Self {
-            inner: ParakeetModelInner::from_bundle(bundle, encoder_spec)?,
+            inner: ParakeetModelInner::from_bundle(bundle)?,
             blank_id: vocab.blank_id(),
         })
     }
@@ -221,10 +220,7 @@ enum ParakeetModelInner {
 }
 
 impl ParakeetModelInner {
-    fn from_bundle(
-        bundle: &ModelBundle,
-        encoder_spec: EncoderModelSpec,
-    ) -> Result<Self, TranscriptionError> {
+    fn from_bundle(bundle: &ModelBundle) -> Result<Self, TranscriptionError> {
         #[cfg(target_os = "macos")]
         {
             Ok(Self::SplitCoreMl(
@@ -232,7 +228,6 @@ impl ParakeetModelInner {
                     bundle.encoder_dir(),
                     bundle.decoder_dir(),
                     bundle.joint_decision_dir(),
-                    encoder_spec,
                 )?,
             ))
         }

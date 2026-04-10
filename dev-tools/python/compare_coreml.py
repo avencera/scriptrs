@@ -11,7 +11,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 
 import coremltools as ct
@@ -22,6 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DECODER_HIDDEN_SIZE = 640
 DECODER_LAYERS = 2
 FEATURE_SIZE = 128
+MAX_MEL_FRAMES = 1501
 
 
 def parse_args() -> argparse.Namespace:
@@ -66,8 +66,6 @@ def main() -> None:
     parakeet_dir = args.models_dir / "parakeet-v2"
     onnx_dir = parakeet_dir / "onnx"
     vocab_size = count_vocab_entries(parakeet_dir / "vocab.txt")
-    encoder_dir = resolve_encoder_dir(parakeet_dir)
-    encoder_schema = load_encoder_schema(encoder_dir)
 
     encoder_ort = ort.InferenceSession(
         str(onnx_dir / "encoder-model.onnx"),
@@ -78,7 +76,7 @@ def main() -> None:
         providers=["CPUExecutionProvider"],
     )
     encoder_coreml = ct.models.CompiledMLModel(
-        str(encoder_dir),
+        str(parakeet_dir / "encoder.mlmodelc"),
         compute_units=ct.ComputeUnit.CPU_AND_NE,
     )
     decoder_coreml = ct.models.CompiledMLModel(
@@ -91,9 +89,9 @@ def main() -> None:
     )
 
     np.random.seed(0)
-    mel = np.random.randn(1, FEATURE_SIZE, encoder_schema.max_frames).astype(np.float32)
-    mel_length_coreml = np.array([encoder_schema.max_frames], dtype=np.int32)
-    mel_length_onnx = np.array([encoder_schema.max_frames], dtype=np.int64)
+    mel = np.random.randn(1, FEATURE_SIZE, MAX_MEL_FRAMES).astype(np.float32)
+    mel_length_coreml = np.array([MAX_MEL_FRAMES], dtype=np.int32)
+    mel_length_onnx = np.array([MAX_MEL_FRAMES], dtype=np.int64)
 
     onnx_encoder = np.asarray(
         encoder_ort.run(
@@ -108,13 +106,12 @@ def main() -> None:
     coreml_encoder = np.asarray(
         encoder_coreml.predict(
             {
-                encoder_schema.input_name: mel,
-                encoder_schema.length_name: mel_length_coreml,
+                "mel": mel,
+                "mel_length": mel_length_coreml,
             }
-        )[encoder_schema.output_name],
+        )["encoder"],
         dtype=np.float32,
     )
-    coreml_encoder = align_encoder_output(coreml_encoder, onnx_encoder.shape)
     encoder_max_abs = max_abs(onnx_encoder, coreml_encoder)
     print(f"encoder max_abs={encoder_max_abs:.6e}")
     if encoder_max_abs > args.encoder_atol:
@@ -344,62 +341,6 @@ def advance_state(
 def count_vocab_entries(path: Path) -> int:
     with path.open("r", encoding="utf-8") as handle:
         return sum(1 for line in handle if line.strip())
-
-
-class EncoderSchema:
-    def __init__(self, input_name: str, length_name: str, output_name: str, max_frames: int):
-        self.input_name = input_name
-        self.length_name = length_name
-        self.output_name = output_name
-        self.max_frames = max_frames
-
-
-def resolve_encoder_dir(parakeet_dir: Path) -> Path:
-    encoder_v2 = parakeet_dir / "encoder-v2.mlmodelc"
-    if encoder_v2.exists():
-        return encoder_v2
-    return parakeet_dir / "encoder.mlmodelc"
-
-
-def load_encoder_schema(bundle_dir: Path) -> EncoderSchema:
-    metadata = json.loads((bundle_dir / "metadata.json").read_text())
-    schema = metadata[0]
-    input_schema = {entry["name"]: entry for entry in schema["inputSchema"]}
-    output_schema = {entry["name"]: entry for entry in schema["outputSchema"]}
-    input_name = first_present(input_schema, "mel", "audio_signal")
-    length_name = first_present(input_schema, "mel_length", "length")
-    output_name = first_present(output_schema, "encoder", "encoder_output")
-    shape = parse_shape(input_schema[input_name]["shape"])
-    return EncoderSchema(
-        input_name=input_name,
-        length_name=length_name,
-        output_name=output_name,
-        max_frames=shape[2],
-    )
-
-
-def first_present(entries: dict[str, object], *names: str) -> str:
-    for name in names:
-        if name in entries:
-            return name
-    raise KeyError(f"expected one of {names}, found {list(entries)}")
-
-
-def parse_shape(raw_shape: object) -> list[int]:
-    if isinstance(raw_shape, list):
-        return [int(value) for value in raw_shape]
-    if isinstance(raw_shape, str):
-        return [int(value) for value in json.loads(raw_shape)]
-    raise TypeError(f"unsupported shape value: {raw_shape!r}")
-
-
-def align_encoder_output(output: np.ndarray, target_shape: tuple[int, ...]) -> np.ndarray:
-    if tuple(output.shape) == target_shape:
-        return output
-    transposed = output.transpose(0, 2, 1)
-    if tuple(transposed.shape) == target_shape:
-        return transposed
-    raise ValueError(f"unable to align encoder output shape {output.shape} to {target_shape}")
 
 
 def max_abs(left: np.ndarray, right: np.ndarray) -> float:

@@ -1441,7 +1441,6 @@ dependencies = [
  "objc2-core-ml",
  "objc2-foundation",
  "realfft",
- "serde_json",
  "tempfile",
  "thiserror",
  "tracing",
