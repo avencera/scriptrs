@@ -236,29 +236,21 @@ fn apply_time_offsets(raw: &mut RawTranscription, frame_offset: usize, context_f
         return;
     }
 
-    let mut keep_indices = Vec::new();
-    for (index, frame_idx) in raw.frame_indices.iter_mut().enumerate() {
-        if *frame_idx < context_frames {
+    let mut write_idx = 0usize;
+    for read_idx in 0..raw.frame_indices.len() {
+        if raw.frame_indices[read_idx] < context_frames {
             continue;
         }
-        *frame_idx = *frame_idx - context_frames + frame_offset;
-        keep_indices.push(index);
+
+        raw.token_ids[write_idx] = raw.token_ids[read_idx];
+        raw.frame_indices[write_idx] = raw.frame_indices[read_idx] - context_frames + frame_offset;
+        raw.durations[write_idx] = raw.durations[read_idx];
+        raw.confidences[write_idx] = raw.confidences[read_idx];
+        write_idx += 1;
     }
 
-    raw.token_ids = keep_indices
-        .iter()
-        .map(|index| raw.token_ids[*index])
-        .collect();
-    raw.frame_indices = keep_indices
-        .iter()
-        .map(|index| raw.frame_indices[*index])
-        .collect();
-    raw.durations = keep_indices
-        .iter()
-        .map(|index| raw.durations[*index])
-        .collect();
-    raw.confidences = keep_indices
-        .iter()
-        .map(|index| raw.confidences[*index])
-        .collect();
+    raw.token_ids.truncate(write_idx);
+    raw.frame_indices.truncate(write_idx);
+    raw.durations.truncate(write_idx);
+    raw.confidences.truncate(write_idx);
 }
