@@ -1,8 +1,10 @@
+use std::cell::RefCell;
+
 use ndarray::{Array1, Array2, Array3};
 
+use crate::config::TranscriptionConfig;
 use crate::constants::{
     DECODER_HIDDEN_SIZE, DECODER_LAYERS, ENCODER_HIDDEN_SIZE, MAX_TOKENS_PER_STEP,
-    TOKEN_DURATION_CLASSES,
 };
 use crate::decode::RawTranscription;
 use crate::error::TranscriptionError;
@@ -13,16 +15,22 @@ use crate::vocab::Vocabulary;
 pub(crate) struct ParakeetModel {
     inner: ParakeetModelInner,
     blank_id: usize,
+    encoder_input: RefCell<EncoderInputBuffer>,
 }
 
 impl ParakeetModel {
     pub(crate) fn from_bundle(
         bundle: &ModelBundle,
         vocab: &Vocabulary,
+        config: &TranscriptionConfig,
     ) -> Result<Self, TranscriptionError> {
         Ok(Self {
             inner: ParakeetModelInner::from_bundle(bundle)?,
             blank_id: vocab.blank_id(),
+            encoder_input: RefCell::new(EncoderInputBuffer::new(
+                config.feature_size,
+                config.max_feature_frames(),
+            )),
         })
     }
 
@@ -30,8 +38,10 @@ impl ParakeetModel {
         &self,
         features: &Array2<f32>,
         feature_frames: usize,
+        target_frames: usize,
     ) -> Result<RawTranscription, TranscriptionError> {
-        let (encoder_output, time_steps) = self.run_encoder(features, feature_frames)?;
+        let (encoder_output, time_steps) =
+            self.run_encoder(features, feature_frames, target_frames)?;
         self.greedy_decode(&encoder_output, time_steps)
     }
 
@@ -39,18 +49,16 @@ impl ParakeetModel {
         &self,
         features: &Array2<f32>,
         feature_frames: usize,
+        target_frames: usize,
     ) -> Result<(Array3<f32>, usize), TranscriptionError> {
-        let feature_size = features.shape()[1];
-        let input = Array3::from_shape_vec(
-            (1, feature_size, features.shape()[0]),
-            features.t().iter().copied().collect(),
+        let mut encoder_input = self.encoder_input.borrow_mut();
+        encoder_input.copy_from_features(features, feature_frames, target_frames)?;
+        self.inner.run_encoder(
+            encoder_input.values(),
+            encoder_input.feature_size(),
+            encoder_input.target_frames(),
+            feature_frames,
         )
-        .map_err(|error| {
-            TranscriptionError::InvalidModelOutput(format!(
-                "failed to shape encoder input: {error}"
-            ))
-        })?;
-        self.inner.run_encoder(input, vec![feature_frames as i32])
     }
 
     fn greedy_decode(
@@ -61,31 +69,25 @@ impl ParakeetModel {
         let mut state = GreedyDecodeState::new(self.blank_id);
 
         while state.frame_idx < time_steps {
-            let frame = reshape_encoder_frame(encoder_output, state.frame_idx)?;
-            let (targets, target_length) = state.decoder_inputs()?;
-            let decoder_output = self.inner.run_decoder_step(
-                frame,
-                targets,
-                target_length,
-                state.hidden_state.clone(),
-                state.cell_state.clone(),
-            )?;
+            state.ensure_decoder_step(&self.inner)?;
+            state.copy_encoder_frame(encoder_output)?;
+            let cached_decoder = state.cached_decoder()?;
+            let decision = self
+                .inner
+                .run_joint(state.encoder_step(), &cached_decoder.decoder_step)?;
 
-            if decoder_output.token_id != self.blank_id {
+            if decision.token_id != self.blank_id {
+                let cached_decoder = state.take_cached_decoder()?;
                 state.record_emission(
-                    decoder_output.token_id,
-                    decoder_output.duration_step,
-                    decoder_output.confidence,
-                    decoder_output.hidden_state,
-                    decoder_output.cell_state,
+                    decision.token_id,
+                    decision.duration_step,
+                    decision.confidence,
+                    cached_decoder.hidden_state,
+                    cached_decoder.cell_state,
                 );
             }
 
-            state.advance(
-                decoder_output.token_id,
-                decoder_output.duration_step,
-                self.blank_id,
-            );
+            state.advance(decision.token_id, decision.duration_step, self.blank_id);
         }
 
         Ok(state.into_raw())
@@ -96,6 +98,10 @@ impl ParakeetModel {
 struct GreedyDecodeState {
     hidden_state: Array3<f32>,
     cell_state: Array3<f32>,
+    decoder_targets: Array2<i32>,
+    decoder_target_length: Array1<i32>,
+    encoder_step: Array3<f32>,
+    cached_decoder: Option<CachedDecoderStep>,
     raw: RawTranscription,
     frame_idx: usize,
     emitted_tokens: usize,
@@ -107,6 +113,10 @@ impl GreedyDecodeState {
         Self {
             hidden_state: Array3::<f32>::zeros((DECODER_LAYERS, 1, DECODER_HIDDEN_SIZE)),
             cell_state: Array3::<f32>::zeros((DECODER_LAYERS, 1, DECODER_HIDDEN_SIZE)),
+            decoder_targets: Array2::<i32>::zeros((1, 1)),
+            decoder_target_length: Array1::from_elem(1, 1i32),
+            encoder_step: Array3::<f32>::zeros((1, ENCODER_HIDDEN_SIZE, 1)),
+            cached_decoder: None,
             raw: RawTranscription::empty(),
             frame_idx: 0,
             emitted_tokens: 0,
@@ -114,11 +124,57 @@ impl GreedyDecodeState {
         }
     }
 
-    fn decoder_inputs(&self) -> Result<(Array2<i32>, Array1<i32>), TranscriptionError> {
-        let targets = Array2::from_shape_vec((1, 1), vec![self.last_token]).map_err(|error| {
-            TranscriptionError::InvalidModelOutput(format!("failed to shape targets: {error}"))
-        })?;
-        Ok((targets, Array1::from_vec(vec![1i32])))
+    fn copy_encoder_frame(
+        &mut self,
+        encoder_output: &Array3<f32>,
+    ) -> Result<(), TranscriptionError> {
+        if self.frame_idx >= encoder_output.shape()[2] {
+            return Err(TranscriptionError::InvalidModelOutput(format!(
+                "encoder frame index {} exceeded time steps {}",
+                self.frame_idx,
+                encoder_output.shape()[2]
+            )));
+        }
+
+        for hidden_idx in 0..ENCODER_HIDDEN_SIZE {
+            self.encoder_step[[0, hidden_idx, 0]] = encoder_output[[0, hidden_idx, self.frame_idx]];
+        }
+
+        Ok(())
+    }
+
+    fn ensure_decoder_step(
+        &mut self,
+        model: &ParakeetModelInner,
+    ) -> Result<(), TranscriptionError> {
+        if self.cached_decoder.is_some() {
+            return Ok(());
+        }
+
+        self.decoder_targets[[0, 0]] = self.last_token;
+        self.cached_decoder = Some(model.run_decoder(
+            &self.decoder_targets,
+            &self.decoder_target_length,
+            &self.hidden_state,
+            &self.cell_state,
+        )?);
+        Ok(())
+    }
+
+    fn cached_decoder(&self) -> Result<&CachedDecoderStep, TranscriptionError> {
+        self.cached_decoder.as_ref().ok_or_else(|| {
+            TranscriptionError::InvalidModelOutput("decoder cache was not primed".to_owned())
+        })
+    }
+
+    fn take_cached_decoder(&mut self) -> Result<CachedDecoderStep, TranscriptionError> {
+        self.cached_decoder.take().ok_or_else(|| {
+            TranscriptionError::InvalidModelOutput("decoder cache was not primed".to_owned())
+        })
+    }
+
+    fn encoder_step(&self) -> &Array3<f32> {
+        &self.encoder_step
     }
 
     fn record_emission(
@@ -157,62 +213,92 @@ impl GreedyDecodeState {
     }
 }
 
-fn reshape_encoder_frame(
-    encoder_output: &Array3<f32>,
-    frame_idx: usize,
-) -> Result<Array3<f32>, TranscriptionError> {
-    let frame = encoder_output
-        .slice(ndarray::s![0, .., frame_idx])
-        .to_owned()
-        .to_shape((1, ENCODER_HIDDEN_SIZE, 1))
-        .map_err(|error| {
-            TranscriptionError::InvalidModelOutput(format!(
-                "failed to reshape encoder frame: {error}"
-            ))
-        })?
-        .to_owned();
-    Ok(frame)
-}
-
-fn max_logit_index(logits: &[f32]) -> Option<usize> {
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|(_, left), (_, right)| left.total_cmp(right))
-        .map(|(index, _)| index)
-}
-
-fn softmax_max(logits: &[f32]) -> f32 {
-    if logits.is_empty() {
-        return 0.0;
-    }
-    let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let exp_sum = logits
-        .iter()
-        .map(|logit| (*logit - max_logit).exp())
-        .sum::<f32>();
-    if exp_sum == 0.0 {
-        return 0.0;
-    }
-    logits
-        .iter()
-        .map(|logit| (*logit - max_logit).exp() / exp_sum)
-        .fold(0.0, f32::max)
-}
-
 #[derive(Debug, Clone)]
-struct DecoderOutput {
-    token_id: usize,
-    duration_step: usize,
-    confidence: f32,
+struct CachedDecoderStep {
+    decoder_step: Array3<f32>,
     hidden_state: Array3<f32>,
     cell_state: Array3<f32>,
 }
 
 #[derive(Debug, Clone)]
+struct EncoderInputBuffer {
+    values: Vec<f32>,
+    feature_size: usize,
+    target_frames: usize,
+    last_feature_frames: usize,
+}
+
+impl EncoderInputBuffer {
+    fn new(feature_size: usize, target_frames: usize) -> Self {
+        Self {
+            values: vec![0.0; feature_size * target_frames],
+            feature_size,
+            target_frames,
+            last_feature_frames: 0,
+        }
+    }
+
+    fn copy_from_features(
+        &mut self,
+        features: &Array2<f32>,
+        feature_frames: usize,
+        target_frames: usize,
+    ) -> Result<(), TranscriptionError> {
+        if features.shape()[1] != self.feature_size {
+            return Err(TranscriptionError::InvalidModelOutput(format!(
+                "feature size {} did not match encoder input {}",
+                features.shape()[1],
+                self.feature_size
+            )));
+        }
+        if self.target_frames != target_frames {
+            self.values.resize(self.feature_size * target_frames, 0.0);
+            self.target_frames = target_frames;
+            self.last_feature_frames = 0;
+        }
+        if feature_frames > self.target_frames {
+            return Err(TranscriptionError::InvalidModelOutput(format!(
+                "feature frame count {feature_frames} exceeded encoder target {}",
+                self.target_frames
+            )));
+        }
+
+        for feature_idx in 0..self.feature_size {
+            let base = feature_idx * self.target_frames;
+            for frame_idx in 0..feature_frames {
+                self.values[base + frame_idx] = features[[frame_idx, feature_idx]];
+            }
+            if feature_frames < self.last_feature_frames {
+                self.values[base + feature_frames..base + self.last_feature_frames].fill(0.0);
+            }
+        }
+
+        self.last_feature_frames = feature_frames;
+        Ok(())
+    }
+
+    fn values(&self) -> &[f32] {
+        &self.values
+    }
+
+    fn feature_size(&self) -> usize {
+        self.feature_size
+    }
+
+    fn target_frames(&self) -> usize {
+        self.target_frames
+    }
+}
+
+#[derive(Debug, Clone)]
+struct JointDecision {
+    token_id: usize,
+    duration_step: usize,
+    confidence: f32,
+}
+
+#[derive(Debug, Clone)]
 enum ParakeetModelInner {
-    #[cfg(target_os = "macos")]
-    FusedCoreMl(crate::coreml::ParakeetFusedCoreMlModel),
     #[cfg(target_os = "macos")]
     SplitCoreMl(crate::coreml::ParakeetSplitCoreMlModel),
     #[cfg(not(target_os = "macos"))]
@@ -223,33 +309,11 @@ impl ParakeetModelInner {
     fn from_bundle(bundle: &ModelBundle) -> Result<Self, TranscriptionError> {
         #[cfg(target_os = "macos")]
         {
-            if let Some(decoder_joint_dir) = bundle.decoder_joint_dir() {
-                if decoder_joint_dir.exists() {
-                    return Ok(Self::FusedCoreMl(
-                        crate::coreml::ParakeetFusedCoreMlModel::new(
-                            bundle.encoder_dir(),
-                            decoder_joint_dir,
-                        )?,
-                    ));
-                }
-            }
-
-            let decoder_dir =
-                bundle
-                    .decoder_dir()
-                    .ok_or_else(|| TranscriptionError::MissingModelAsset {
-                        path: bundle.root().join("parakeet-v2/decoder.mlmodelc"),
-                    })?;
-            let joint_decision_dir = bundle.joint_decision_dir().ok_or_else(|| {
-                TranscriptionError::MissingModelAsset {
-                    path: bundle.root().join("parakeet-v2/joint-decision.mlmodelc"),
-                }
-            })?;
             Ok(Self::SplitCoreMl(
                 crate::coreml::ParakeetSplitCoreMlModel::new(
                     bundle.encoder_dir(),
-                    decoder_dir,
-                    joint_decision_dir,
+                    bundle.decoder_dir(),
+                    bundle.joint_decision_dir(),
                 )?,
             ))
         }
@@ -262,68 +326,56 @@ impl ParakeetModelInner {
 
     fn run_encoder(
         &self,
-        input: Array3<f32>,
-        lengths: Vec<i32>,
+        input: &[f32],
+        feature_size: usize,
+        target_frames: usize,
+        feature_frames: usize,
     ) -> Result<(Array3<f32>, usize), TranscriptionError> {
         match self {
             #[cfg(target_os = "macos")]
-            Self::FusedCoreMl(model) => model.run_encoder(input, lengths),
-            #[cfg(target_os = "macos")]
-            Self::SplitCoreMl(model) => model.run_encoder(input, lengths),
+            Self::SplitCoreMl(model) => {
+                model.run_encoder(input, feature_size, target_frames, &[feature_frames as i32])
+            }
             #[cfg(not(target_os = "macos"))]
             Self::Unsupported => Err(TranscriptionError::UnsupportedPlatform),
         }
     }
 
-    fn run_decoder_step(
+    fn run_decoder(
         &self,
-        frame: Array3<f32>,
-        targets: Array2<i32>,
-        target_length: Array1<i32>,
-        hidden_state: Array3<f32>,
-        cell_state: Array3<f32>,
-    ) -> Result<DecoderOutput, TranscriptionError> {
+        targets: &Array2<i32>,
+        target_length: &Array1<i32>,
+        hidden_state: &Array3<f32>,
+        cell_state: &Array3<f32>,
+    ) -> Result<CachedDecoderStep, TranscriptionError> {
         match self {
             #[cfg(target_os = "macos")]
-            Self::FusedCoreMl(model) => {
-                let output =
-                    model.run_decoder(frame, targets, target_length, hidden_state, cell_state)?;
-                let vocab_logits: Vec<f32> = output
-                    .logits
-                    .iter()
-                    .take(output.vocab_size)
-                    .copied()
-                    .collect();
-                let duration_logits: Vec<f32> = output
-                    .logits
-                    .iter()
-                    .skip(output.vocab_size)
-                    .take(TOKEN_DURATION_CLASSES)
-                    .copied()
-                    .collect();
-                Ok(DecoderOutput {
-                    token_id: max_logit_index(&vocab_logits).unwrap_or(0),
-                    duration_step: max_logit_index(&duration_logits).unwrap_or(0),
-                    confidence: softmax_max(&vocab_logits),
+            Self::SplitCoreMl(model) => {
+                let output = model.run_decoder(targets, target_length, hidden_state, cell_state)?;
+                Ok(CachedDecoderStep {
+                    decoder_step: output.decoder_step,
                     hidden_state: output.hidden_state,
                     cell_state: output.cell_state,
                 })
             }
+            #[cfg(not(target_os = "macos"))]
+            Self::Unsupported => Err(TranscriptionError::UnsupportedPlatform),
+        }
+    }
+
+    fn run_joint(
+        &self,
+        encoder_step: &Array3<f32>,
+        decoder_step: &Array3<f32>,
+    ) -> Result<JointDecision, TranscriptionError> {
+        match self {
             #[cfg(target_os = "macos")]
             Self::SplitCoreMl(model) => {
-                let output = model.run_decoder_step(
-                    targets,
-                    target_length,
-                    hidden_state,
-                    cell_state,
-                    frame,
-                )?;
-                Ok(DecoderOutput {
+                let output = model.run_joint(encoder_step, decoder_step)?;
+                Ok(JointDecision {
                     token_id: output.token_id,
-                    duration_step: output.duration,
+                    duration_step: output.duration_step,
                     confidence: output.token_prob,
-                    hidden_state: output.hidden_state,
-                    cell_state: output.cell_state,
                 })
             }
             #[cfg(not(target_os = "macos"))]

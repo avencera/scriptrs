@@ -1,19 +1,93 @@
+use std::cell::RefCell;
 use std::f32::consts::PI;
+use std::sync::Arc;
 
 use ndarray::Array2;
-use realfft::RealFftPlanner;
+use realfft::{RealFftPlanner, RealToComplex, num_complex::Complex};
 
 use crate::config::TranscriptionConfig;
 use crate::error::TranscriptionError;
 
-#[derive(Debug, Clone)]
 pub(crate) struct ParakeetFeatureExtractor {
     config: TranscriptionConfig,
     mel_filterbank: Array2<f32>,
+    window: Vec<f32>,
+    r2c: Arc<dyn RealToComplex<f32>>,
+    stft_workspace: RefCell<StftWorkspace>,
+}
+
+impl std::fmt::Debug for ParakeetFeatureExtractor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParakeetFeatureExtractor")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Clone for ParakeetFeatureExtractor {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            mel_filterbank: self.mel_filterbank.clone(),
+            window: self.window.clone(),
+            r2c: self.r2c.clone(),
+            stft_workspace: RefCell::new(StftWorkspace::new(&self.r2c)),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StftWorkspace {
+    preemphasized: Vec<f32>,
+    padded: Vec<f32>,
+    input: Vec<f32>,
+    output: Vec<Complex<f32>>,
+    scratch: Vec<Complex<f32>>,
+}
+
+impl StftWorkspace {
+    fn new(r2c: &Arc<dyn RealToComplex<f32>>) -> Self {
+        Self {
+            preemphasized: Vec::new(),
+            padded: Vec::new(),
+            input: r2c.make_input_vec(),
+            output: r2c.make_output_vec(),
+            scratch: r2c.make_scratch_vec(),
+        }
+    }
+
+    fn prepare_padded_audio(&mut self, pad_amount: usize) {
+        self.padded.clear();
+        self.padded.resize(pad_amount, 0.0);
+        self.padded.extend_from_slice(&self.preemphasized);
+        self.padded
+            .resize(self.preemphasized.len() + pad_amount * 2, 0.0);
+    }
+
+    fn process_frame(
+        &mut self,
+        r2c: &Arc<dyn RealToComplex<f32>>,
+        window: &[f32],
+        start: usize,
+        available: usize,
+    ) -> Result<(), TranscriptionError> {
+        self.input.fill(0.0);
+        for (window_idx, window_value) in window.iter().take(available).copied().enumerate() {
+            self.input[window_idx] = self.padded[start + window_idx] * window_value;
+        }
+
+        let input = &mut self.input;
+        let output = &mut self.output;
+        let scratch = &mut self.scratch;
+        r2c.process_with_scratch(input, output, scratch)
+            .map_err(|error| TranscriptionError::InvalidModelOutput(format!("fft failed: {error}")))
+    }
 }
 
 impl ParakeetFeatureExtractor {
     pub(crate) fn new(config: &TranscriptionConfig) -> Self {
+        let mut planner = RealFftPlanner::<f32>::new();
+        let r2c = planner.plan_fft_forward(config.n_fft);
         Self {
             config: config.clone(),
             mel_filterbank: create_mel_filterbank(
@@ -21,6 +95,9 @@ impl ParakeetFeatureExtractor {
                 config.feature_size,
                 config.sample_rate,
             ),
+            window: hann_window(config.win_length),
+            stft_workspace: RefCell::new(StftWorkspace::new(&r2c)),
+            r2c,
         }
     }
 
@@ -29,13 +106,7 @@ impl ParakeetFeatureExtractor {
             return Err(TranscriptionError::EmptyAudio);
         }
 
-        let preemphasized = apply_preemphasis(audio, self.config.preemphasis);
-        let spectrogram = stft(
-            &preemphasized,
-            self.config.n_fft,
-            self.config.hop_length,
-            self.config.win_length,
-        )?;
+        let spectrogram = self.stft(audio)?;
         let mel_spectrogram = self.mel_filterbank.dot(&spectrogram);
         let log_zero_guard = 2.0f32.powi(-24);
         let mut features = mel_spectrogram
@@ -45,57 +116,46 @@ impl ParakeetFeatureExtractor {
         normalize_columns(&mut features);
         Ok(features)
     }
+
+    fn stft(&self, audio: &[f32]) -> Result<Array2<f32>, TranscriptionError> {
+        let mut workspace = self.stft_workspace.borrow_mut();
+        apply_preemphasis_into(audio, self.config.preemphasis, &mut workspace.preemphasized);
+
+        let pad_amount = self.config.n_fft / 2;
+        workspace.prepare_padded_audio(pad_amount);
+
+        let num_frames = (workspace.padded.len() - self.config.n_fft) / self.config.hop_length + 1;
+        let freq_bins = self.config.n_fft / 2 + 1;
+        let mut spectrogram = Array2::<f32>::zeros((freq_bins, num_frames));
+
+        // reuse the FFT plan and temporary buffers across chunk extractions
+        for frame_idx in 0..num_frames {
+            let start = frame_idx * self.config.hop_length;
+            let available = self
+                .config
+                .win_length
+                .min(workspace.padded.len().saturating_sub(start));
+
+            workspace.process_frame(&self.r2c, &self.window, start, available)?;
+
+            for bin in 0..freq_bins {
+                spectrogram[[bin, frame_idx]] = workspace.output[bin].norm_sqr();
+            }
+        }
+
+        Ok(spectrogram)
+    }
 }
 
-fn apply_preemphasis(audio: &[f32], coefficient: f32) -> Vec<f32> {
-    let mut output = Vec::with_capacity(audio.len());
+fn apply_preemphasis_into(audio: &[f32], coefficient: f32, output: &mut Vec<f32>) {
+    output.clear();
+    if output.capacity() < audio.len() {
+        output.reserve(audio.len() - output.capacity());
+    }
     output.push(audio[0]);
     for index in 1..audio.len() {
         output.push(audio[index] - coefficient * audio[index - 1]);
     }
-    output
-}
-
-fn stft(
-    audio: &[f32],
-    n_fft: usize,
-    hop_length: usize,
-    win_length: usize,
-) -> Result<Array2<f32>, TranscriptionError> {
-    let pad_amount = n_fft / 2;
-    let mut padded = vec![0.0f32; pad_amount];
-    padded.extend_from_slice(audio);
-    padded.resize(padded.len() + pad_amount, 0.0);
-
-    let window = hann_window(win_length);
-    let num_frames = (padded.len() - n_fft) / hop_length + 1;
-    let freq_bins = n_fft / 2 + 1;
-    let mut spectrogram = Array2::<f32>::zeros((freq_bins, num_frames));
-
-    let mut planner = RealFftPlanner::<f32>::new();
-    let r2c = planner.plan_fft_forward(n_fft);
-    let mut input = vec![0.0f32; n_fft];
-    let mut output = r2c.make_output_vec();
-    let mut scratch = r2c.make_scratch_vec();
-
-    for frame_idx in 0..num_frames {
-        let start = frame_idx * hop_length;
-        input.fill(0.0);
-        for window_idx in 0..win_length.min(padded.len() - start) {
-            input[window_idx] = padded[start + window_idx] * window[window_idx];
-        }
-
-        r2c.process_with_scratch(&mut input, &mut output, &mut scratch)
-            .map_err(|error| {
-                TranscriptionError::InvalidModelOutput(format!("fft failed: {error}"))
-            })?;
-
-        for bin in 0..freq_bins {
-            spectrogram[[bin, frame_idx]] = output[bin].norm_sqr();
-        }
-    }
-
-    Ok(spectrogram)
 }
 
 fn hann_window(window_length: usize) -> Vec<f32> {
@@ -184,7 +244,7 @@ fn normalize_columns(features: &mut Array2<f32>) {
 mod tests {
     use approx::assert_abs_diff_eq;
 
-    use super::{ParakeetFeatureExtractor, TranscriptionConfig, stft};
+    use super::{ParakeetFeatureExtractor, TranscriptionConfig};
 
     fn sine_wave(frequency_hz: f32, sample_rate: usize, num_samples: usize) -> Vec<f32> {
         (0..num_samples)
@@ -198,7 +258,10 @@ mod tests {
     #[test]
     fn stft_concentrates_power_at_the_expected_bin() {
         let sample_rate = 16_000;
-        let spectrum = stft(&sine_wave(1000.0, sample_rate, sample_rate), 512, 160, 400).unwrap();
+        let extractor = ParakeetFeatureExtractor::new(&TranscriptionConfig::default());
+        let spectrum = extractor
+            .stft(&sine_wave(1000.0, sample_rate, sample_rate))
+            .unwrap();
         let expected_bin = 32;
         let mut correct_frames = 0;
         for frame in 2..spectrum.shape()[1].saturating_sub(2) {

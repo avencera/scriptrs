@@ -12,12 +12,13 @@
 
 Rust transcription with native CoreML Parakeet v2 inference.
 
-The base crate exposes a single-chunk `TranscriptionPipeline`. Long-audio chunking, VAD, and overlap fallback live behind the `long-form` feature via `LongFormTranscriptionPipeline`.
+The base crate exposes a single-chunk `TranscriptionPipeline`. Fast long-audio chunking lives behind the `long-form` feature via `LongFormTranscriptionPipeline`. VAD-backed speech region planning is an additional `long-form-vad` feature.
 
 ## Current scope
 
 - Base pipeline for short audio
-- Optional long-form pipeline with VAD-based region planning
+- Optional fast long-form pipeline with overlap chunking
+- Optional VAD-backed long-form region planning
 - Native CoreML inference on macOS
 - Hugging Face download support with optional local model loading
 
@@ -36,11 +37,18 @@ The base crate exposes a single-chunk `TranscriptionPipeline`. Long-audio chunki
 scriptrs = "0.1.0"
 ```
 
-For long-form transcription:
+For fast long-form transcription:
 
 ```toml
 [dependencies]
 scriptrs = { version = "0.1.0", features = ["long-form"] }
+```
+
+For VAD-backed long-form transcription:
+
+```toml
+[dependencies]
+scriptrs = { version = "0.1.0", features = ["long-form-vad"] }
 ```
 
 ## Model downloads
@@ -67,7 +75,7 @@ models/
     vocab.txt
 ```
 
-With `long-form`, add:
+With `long-form-vad`, add:
 
 ```text
 models/
@@ -123,7 +131,7 @@ fn load_mono_16khz_audio() -> Vec<f32> {
 
 ### Long audio
 
-Enable `long-form` if you want `scriptrs` to own VAD, chunking, and overlap fallback internally.
+Enable `long-form` if you want `scriptrs` to own long-audio chunking internally and you care most about speed on clean, dense speech.
 
 ```rust
 use scriptrs::LongFormTranscriptionPipeline;
@@ -132,6 +140,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let audio: Vec<f32> = load_mono_16khz_audio();
     let pipeline = LongFormTranscriptionPipeline::from_pretrained()?;
     let result = pipeline.run(&audio)?;
+
+    println!("{}", result.text);
+    Ok(())
+}
+
+fn load_mono_16khz_audio() -> Vec<f32> {
+    Vec::new()
+}
+```
+
+`LongFormConfig` defaults to the fast overlap-chunking path with `4` workers. You can tune the worker count when you want less or more parallelism:
+
+```rust
+use scriptrs::{LongFormConfig, LongFormTranscriptionPipeline};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let audio: Vec<f32> = load_mono_16khz_audio();
+    let pipeline = LongFormTranscriptionPipeline::from_pretrained()?;
+    let config = LongFormConfig {
+        worker_count: 2,
+        ..LongFormConfig::default()
+    };
+    let result = pipeline.run_with_config(&audio, &config)?;
+
+    println!("{}", result.text);
+    Ok(())
+}
+
+fn load_mono_16khz_audio() -> Vec<f32> {
+    Vec::new()
+}
+```
+
+Enable `long-form-vad` when you want VAD-backed speech region planning for sparse speech, long silences, or recordings with a lot of non-speech audio:
+
+```rust
+use scriptrs::{LongFormConfig, LongFormMode, LongFormTranscriptionPipeline};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let audio: Vec<f32> = load_mono_16khz_audio();
+    let pipeline = LongFormTranscriptionPipeline::from_pretrained()?;
+    let config = LongFormConfig {
+        mode: LongFormMode::Vad,
+        ..LongFormConfig::default()
+    };
+    let result = pipeline.run_with_config(&audio, &config)?;
 
     println!("{}", result.text);
     Ok(())
@@ -151,6 +205,8 @@ cargo run --example transcribe_wav -- --audio /path/to/file.wav --pretrained
 cargo run --example transcribe_wav -- --audio /path/to/file.wav --models-dir models
 cargo run --example transcribe_wav --features long-form -- --audio /path/to/file.wav --pretrained --long-form
 cargo run --example transcribe_wav --features long-form -- --audio /path/to/file.wav --models-dir models --long-form
+cargo run --example transcribe_wav --features long-form -- --audio /path/to/file.wav --pretrained --long-form --long-form-workers 2
+cargo run --example transcribe_wav --features long-form-vad -- --audio /path/to/file.wav --pretrained --long-form --vad-long-form
 ```
 
 The example expects mono 16kHz WAV input.
@@ -159,4 +215,5 @@ The example expects mono 16kHz WAV input.
 
 - The public API is still moving
 - `scriptrs` currently targets the exact file layout and model I/O shipped in `avencera/scriptrs-models`; if you swap in a different CoreML Parakeet export, you may need runtime code changes
-- Long-form is intentionally optional so callers with their own segmentation pipeline do not pay for the extra machinery
+- Use `long-form` for the fastest path on clean, dense speech
+- Add `long-form-vad` when you need better robustness on sparse-speech or non-speech-heavy recordings

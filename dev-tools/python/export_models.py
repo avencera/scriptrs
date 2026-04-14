@@ -82,6 +82,8 @@ def download_snapshot(repo_id: str, allow_patterns: list[str]) -> Path:
 
 def stage_parakeet(coreml_dir: Path, onnx_dir: Path, output_dir: Path) -> None:
     parakeet_dir = output_dir / "parakeet-v2"
+    if parakeet_dir.exists():
+        shutil.rmtree(parakeet_dir)
     copy_bundle(coreml_dir / "Encoder.mlmodelc", parakeet_dir / "encoder.mlmodelc")
     copy_bundle(coreml_dir / "Decoder.mlmodelc", parakeet_dir / "decoder.mlmodelc")
     copy_bundle(

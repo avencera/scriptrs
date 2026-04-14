@@ -8,6 +8,8 @@ use std::cell::RefCell;
 #[cfg(target_os = "macos")]
 use std::collections::HashMap;
 #[cfg(target_os = "macos")]
+use std::env;
+#[cfg(target_os = "macos")]
 use std::ffi::c_void;
 #[cfg(target_os = "macos")]
 use std::path::Path;
@@ -29,6 +31,8 @@ use objc2_foundation::{NSArray, NSMutableDictionary, NSNumber, NSString};
 
 #[cfg(target_os = "macos")]
 use crate::constants::{DECODER_HIDDEN_SIZE, DECODER_LAYERS, ENCODER_HIDDEN_SIZE};
+#[cfg(all(target_os = "macos", feature = "long-form-vad"))]
+use crate::constants::{VAD_CONTEXT_SAMPLES, VAD_STATE_SIZE, VAD_WINDOW_SAMPLES};
 #[cfg(target_os = "macos")]
 use crate::coreml::array::{contiguous_strides, extract_output, ns_number_array};
 #[cfg(target_os = "macos")]
@@ -40,6 +44,18 @@ pub(crate) struct ParakeetSplitCoreMlModel {
     encoder: CoreMlModel,
     decoder: DecoderCoreMlModel,
     joint_decision: JointDecisionCoreMlModel,
+}
+
+#[cfg(all(target_os = "macos", feature = "long-form-vad"))]
+#[derive(Debug, Clone)]
+pub(crate) struct SileroVadCoreMlModel {
+    model: CoreMlModel,
+    audio: CachedInputShape,
+    hidden_state: CachedInputShape,
+    cell_state: CachedInputShape,
+    probability_output: CachedOutputKey,
+    hidden_output: CachedOutputKey,
+    cell_output: CachedOutputKey,
 }
 
 #[cfg(target_os = "macos")]
@@ -58,22 +74,21 @@ impl ParakeetSplitCoreMlModel {
 
     pub(crate) fn run_encoder(
         &self,
-        mel: Array3<f32>,
-        lengths: Vec<i32>,
+        mel: &[f32],
+        feature_size: usize,
+        target_frames: usize,
+        lengths: &[i32],
     ) -> Result<(Array3<f32>, usize), TranscriptionError> {
+        let mel_shape = [1, feature_size, target_frames];
         let inputs = [
             CoreMlInput::F32 {
                 name: "mel",
-                values: mel.as_slice().ok_or_else(|| {
-                    TranscriptionError::InvalidModelOutput(
-                        "encoder input was not contiguous".to_owned(),
-                    )
-                })?,
-                shape: &[1, mel.shape()[1], mel.shape()[2]],
+                values: mel,
+                shape: &mel_shape,
             },
             CoreMlInput::I32 {
                 name: "mel_length",
-                values: &lengths,
+                values: lengths,
                 shape: &[1],
             },
         ];
@@ -166,6 +181,55 @@ impl ParakeetSplitCoreMlModel {
                     "joint decoder step was not contiguous".to_owned(),
                 )
             })?,
+        )
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "long-form-vad"))]
+impl SileroVadCoreMlModel {
+    pub(crate) fn new(path: &Path) -> Result<Self, TranscriptionError> {
+        Ok(Self {
+            model: CoreMlModel::new(path)?,
+            audio: CachedInputShape::new(
+                "audio",
+                &[1, 1, VAD_WINDOW_SAMPLES + VAD_CONTEXT_SAMPLES],
+            ),
+            hidden_state: CachedInputShape::new("h", &[1, 1, VAD_STATE_SIZE]),
+            cell_state: CachedInputShape::new("c", &[1, 1, VAD_STATE_SIZE]),
+            probability_output: CachedOutputKey::new("probability"),
+            hidden_output: CachedOutputKey::new("h_out"),
+            cell_output: CachedOutputKey::new("c_out"),
+        })
+    }
+
+    pub(crate) fn run(
+        &self,
+        audio: &[f32],
+        hidden_state: &[f32],
+        cell_state: &[f32],
+    ) -> Result<SileroVadOutput, TranscriptionError> {
+        self.model.predict_cached(
+            &[
+                CachedCoreMlInput::F32 {
+                    cached: &self.audio,
+                    values: audio,
+                },
+                CachedCoreMlInput::F32 {
+                    cached: &self.hidden_state,
+                    values: hidden_state,
+                },
+                CachedCoreMlInput::F32 {
+                    cached: &self.cell_state,
+                    values: cell_state,
+                },
+            ],
+            |output| {
+                Ok(SileroVadOutput {
+                    probability: scalar_f32(output, &self.probability_output)?,
+                    hidden_state: vector_f32(output, &self.hidden_output)?,
+                    cell_state: vector_f32(output, &self.cell_output)?,
+                })
+            },
         )
     }
 }
@@ -302,6 +366,14 @@ pub(crate) struct SplitDecoderCoreMlOutput {
     pub cell_state: Array3<f32>,
 }
 
+#[cfg(all(target_os = "macos", feature = "long-form-vad"))]
+#[derive(Debug, Clone)]
+pub(crate) struct SileroVadOutput {
+    pub probability: f32,
+    pub hidden_state: Vec<f32>,
+    pub cell_state: Vec<f32>,
+}
+
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct JointDecision {
@@ -339,7 +411,7 @@ impl Clone for CoreMlModel {
 impl CoreMlModel {
     pub(crate) fn new(path: &Path) -> Result<Self, TranscriptionError> {
         Ok(Self {
-            model: runtime::load_model(path, MLComputeUnits::CPUAndNeuralEngine)?,
+            model: runtime::load_model(path, configured_compute_units()?)?,
             noop_deallocator: RcBlock::new(|_: NonNull<c_void>| {}),
             input_dict: RefCell::new(NSMutableDictionary::new()),
         })
@@ -392,6 +464,28 @@ impl CoreMlModel {
             input_dict.removeAllObjects();
             f(&input_dict, &self.noop_deallocator)
         })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn configured_compute_units() -> Result<MLComputeUnits, TranscriptionError> {
+    let Some(value) = env::var_os("SCRIPTRS_COREML_COMPUTE_UNITS") else {
+        return Ok(MLComputeUnits::CPUAndNeuralEngine);
+    };
+
+    // allow benchmark tooling to sweep CoreML backends without changing the default runtime
+    let value = value.to_string_lossy();
+    let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
+    match normalized.as_str() {
+        "cpu_only" => Ok(MLComputeUnits::CPUOnly),
+        "cpu_and_gpu" => Ok(MLComputeUnits::CPUAndGPU),
+        "all" => Ok(MLComputeUnits::All),
+        "cpu_and_neural_engine" | "cpu_and_ane" | "default" => {
+            Ok(MLComputeUnits::CPUAndNeuralEngine)
+        }
+        _ => Err(TranscriptionError::CoreMl(format!(
+            "unsupported SCRIPTRS_COREML_COMPUTE_UNITS value `{value}` expected cpu_only, cpu_and_gpu, all, or cpu_and_neural_engine"
+        ))),
     }
 }
 
@@ -539,4 +633,14 @@ fn scalar_usize(
         )));
     }
     Ok(value as usize)
+}
+
+#[cfg(all(target_os = "macos", feature = "long-form-vad"))]
+fn vector_f32(
+    output: &ProtocolObject<dyn MLFeatureProvider>,
+    key: &CachedOutputKey,
+) -> Result<Vec<f32>, TranscriptionError> {
+    let array = runtime::output_multi_array(output, &key.key, key.name)?;
+    let (data, _) = extract_output(&array)?;
+    Ok(data)
 }

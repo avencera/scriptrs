@@ -7,7 +7,7 @@ use crate::model::ParakeetModel;
 use crate::models::ModelBundle;
 use crate::types::TranscriptionResult;
 use crate::vocab::Vocabulary;
-use ndarray::{Array2, s};
+use ndarray::Array2;
 
 /// Single-chunk Parakeet v2 transcription pipeline
 ///
@@ -42,7 +42,7 @@ impl TranscriptionPipeline {
         bundle.validate_base()?;
         let config = TranscriptionConfig::default();
         let vocab = Vocabulary::from_file(bundle.vocab_path())?;
-        let model = ParakeetModel::from_bundle(&bundle, &vocab)?;
+        let model = ParakeetModel::from_bundle(&bundle, &vocab, &config)?;
         Ok(Self {
             extractor: ParakeetFeatureExtractor::new(&config),
             decoder: ParakeetTdtDecoder::new(vocab),
@@ -114,6 +114,39 @@ impl TranscriptionPipeline {
         context_samples: usize,
         config: &TranscriptionConfig,
     ) -> Result<RawTranscription, TranscriptionError> {
+        let prepared = self.prepare_chunk(audio, config)?;
+        self.transcribe_prepared_raw(prepared, global_sample_offset, context_samples)
+    }
+
+    pub(crate) fn transcribe_prepared_raw(
+        &self,
+        prepared: PreparedChunk,
+        global_sample_offset: usize,
+        context_samples: usize,
+    ) -> Result<RawTranscription, TranscriptionError> {
+        let mut raw = self.model.transcribe(
+            &prepared.features,
+            prepared.feature_frames,
+            prepared.target_frames,
+        )?;
+        apply_time_offsets(
+            &mut raw,
+            global_sample_offset / SAMPLES_PER_ENCODER_FRAME,
+            context_samples / SAMPLES_PER_ENCODER_FRAME,
+        );
+        Ok(raw)
+    }
+
+    #[cfg(feature = "long-form")]
+    pub(crate) fn chunk_preparer(config: &TranscriptionConfig) -> ChunkPreparer {
+        ChunkPreparer::new(config)
+    }
+
+    fn prepare_chunk(
+        &self,
+        audio: &[f32],
+        config: &TranscriptionConfig,
+    ) -> Result<PreparedChunk, TranscriptionError> {
         if audio.is_empty() {
             return Err(TranscriptionError::EmptyAudio);
         }
@@ -124,29 +157,63 @@ impl TranscriptionPipeline {
             });
         }
 
-        let features = self.extractor.extract(audio)?;
-        let feature_frames = features.shape()[0];
-        let padded_features = pad_features(features, config.max_feature_frames());
-        let mut raw = self.model.transcribe(&padded_features, feature_frames)?;
-        apply_time_offsets(
-            &mut raw,
-            global_sample_offset / SAMPLES_PER_ENCODER_FRAME,
-            context_samples / SAMPLES_PER_ENCODER_FRAME,
-        );
-        Ok(raw)
+        Ok(PreparedChunk::new(
+            self.extractor.extract(audio)?,
+            config.max_feature_frames(),
+        ))
     }
 }
 
-fn pad_features(features: Array2<f32>, target_frames: usize) -> Array2<f32> {
-    let current_frames = features.shape()[0];
-    if current_frames >= target_frames {
-        return features;
+#[derive(Debug)]
+pub(crate) struct PreparedChunk {
+    features: Array2<f32>,
+    feature_frames: usize,
+    target_frames: usize,
+}
+
+impl PreparedChunk {
+    fn new(features: Array2<f32>, target_frames: usize) -> Self {
+        let feature_frames = features.shape()[0];
+        Self {
+            features,
+            feature_frames,
+            target_frames,
+        }
+    }
+}
+
+#[cfg(feature = "long-form")]
+#[derive(Debug)]
+pub(crate) struct ChunkPreparer {
+    config: TranscriptionConfig,
+    extractor: ParakeetFeatureExtractor,
+}
+
+#[cfg(feature = "long-form")]
+impl ChunkPreparer {
+    fn new(config: &TranscriptionConfig) -> Self {
+        Self {
+            config: config.clone(),
+            extractor: ParakeetFeatureExtractor::new(config),
+        }
     }
 
-    let feature_size = features.shape()[1];
-    let mut padded = Array2::<f32>::zeros((target_frames, feature_size));
-    padded.slice_mut(s![..current_frames, ..]).assign(&features);
-    padded
+    pub(crate) fn prepare(&self, audio: &[f32]) -> Result<PreparedChunk, TranscriptionError> {
+        if audio.is_empty() {
+            return Err(TranscriptionError::EmptyAudio);
+        }
+        if audio.len() > self.config.max_audio_samples {
+            return Err(TranscriptionError::AudioTooLong {
+                max_seconds: self.config.max_duration_seconds(),
+                actual_seconds: audio.len() as f64 / self.config.sample_rate as f64,
+            });
+        }
+
+        Ok(PreparedChunk::new(
+            self.extractor.extract(audio)?,
+            self.config.max_feature_frames(),
+        ))
+    }
 }
 
 fn apply_time_offsets(raw: &mut RawTranscription, frame_offset: usize, context_frames: usize) {

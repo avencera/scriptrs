@@ -3,11 +3,10 @@ use std::path::{Path, PathBuf};
 use crate::error::TranscriptionError;
 
 const ENCODER_DIR: &str = "parakeet-v2/encoder.mlmodelc";
-const DECODER_JOINT_DIR: &str = "parakeet-v2/decoder-joint.mlmodelc";
 const DECODER_DIR: &str = "parakeet-v2/decoder.mlmodelc";
 const JOINT_DECISION_DIR: &str = "parakeet-v2/joint-decision.mlmodelc";
 const VOCAB_FILE: &str = "parakeet-v2/vocab.txt";
-#[cfg(feature = "long-form")]
+#[cfg(feature = "long-form-vad")]
 const VAD_DIR: &str = "vad/silero-vad.mlmodelc";
 #[cfg(feature = "online")]
 const SCRIPTRS_MODELS_DIR_ENV: &str = "SCRIPTRS_MODELS_DIR";
@@ -22,11 +21,10 @@ const SCRIPTRS_MODELS_REPO_ENV: &str = "SCRIPTRS_MODELS_REPO";
 pub struct ModelBundle {
     root: PathBuf,
     encoder_dir: PathBuf,
-    decoder_joint_dir: Option<PathBuf>,
-    decoder_dir: Option<PathBuf>,
-    joint_decision_dir: Option<PathBuf>,
+    decoder_dir: PathBuf,
+    joint_decision_dir: PathBuf,
     vocab_path: PathBuf,
-    #[cfg(feature = "long-form")]
+    #[cfg(feature = "long-form-vad")]
     vad_dir: PathBuf,
 }
 
@@ -34,19 +32,15 @@ impl ModelBundle {
     /// Resolve the expected model layout from a local directory
     ///
     /// This only resolves paths. File existence is checked later by
-    /// [`Self::validate_base`] or [`Self::validate_long_form`].
+    /// [`Self::validate_base`].
     pub fn from_dir(models_dir: impl Into<PathBuf>) -> Self {
         let root = models_dir.into();
-        let decoder_joint_dir = root.join(DECODER_JOINT_DIR);
-        let decoder_dir = root.join(DECODER_DIR);
-        let joint_decision_dir = root.join(JOINT_DECISION_DIR);
         Self {
             encoder_dir: root.join(ENCODER_DIR),
-            decoder_joint_dir: decoder_joint_dir.exists().then_some(decoder_joint_dir),
-            decoder_dir: decoder_dir.exists().then_some(decoder_dir),
-            joint_decision_dir: joint_decision_dir.exists().then_some(joint_decision_dir),
+            decoder_dir: root.join(DECODER_DIR),
+            joint_decision_dir: root.join(JOINT_DECISION_DIR),
             vocab_path: root.join(VOCAB_FILE),
-            #[cfg(feature = "long-form")]
+            #[cfg(feature = "long-form-vad")]
             vad_dir: root.join(VAD_DIR),
             root,
         }
@@ -54,27 +48,12 @@ impl ModelBundle {
 
     /// Validate that the base Parakeet model assets are present
     pub fn validate_base(&self) -> Result<(), TranscriptionError> {
-        for path in [self.encoder_dir.as_path(), self.vocab_path.as_path()] {
-            if path.exists() {
-                continue;
-            }
-            return Err(TranscriptionError::MissingModelAsset {
-                path: path.to_path_buf(),
-            });
-        }
-
-        if let Some(path) = self.decoder_joint_dir()
-            && path.exists()
-        {
-            return Ok(());
-        }
-
-        for path in [self.decoder_dir(), self.joint_decision_dir()] {
-            let Some(path) = path else {
-                return Err(TranscriptionError::MissingModelAsset {
-                    path: self.root.join(DECODER_DIR),
-                });
-            };
+        for path in [
+            self.encoder_dir.as_path(),
+            self.decoder_dir.as_path(),
+            self.joint_decision_dir.as_path(),
+            self.vocab_path.as_path(),
+        ] {
             if path.exists() {
                 continue;
             }
@@ -86,7 +65,7 @@ impl ModelBundle {
         Ok(())
     }
 
-    #[cfg(feature = "long-form")]
+    #[cfg(feature = "long-form-vad")]
     /// Validate that the base Parakeet and VAD model assets are present
     pub fn validate_long_form(&self) -> Result<(), TranscriptionError> {
         self.validate_base()?;
@@ -102,23 +81,19 @@ impl ModelBundle {
         &self.encoder_dir
     }
 
-    pub(crate) fn decoder_joint_dir(&self) -> Option<&Path> {
-        self.decoder_joint_dir.as_deref()
+    pub(crate) fn decoder_dir(&self) -> &Path {
+        &self.decoder_dir
     }
 
-    pub(crate) fn decoder_dir(&self) -> Option<&Path> {
-        self.decoder_dir.as_deref()
-    }
-
-    pub(crate) fn joint_decision_dir(&self) -> Option<&Path> {
-        self.joint_decision_dir.as_deref()
+    pub(crate) fn joint_decision_dir(&self) -> &Path {
+        &self.joint_decision_dir
     }
 
     pub(crate) fn vocab_path(&self) -> &Path {
         &self.vocab_path
     }
 
-    #[cfg(feature = "long-form")]
+    #[cfg(feature = "long-form-vad")]
     pub(crate) fn vad_dir(&self) -> &Path {
         &self.vad_dir
     }
@@ -141,7 +116,7 @@ impl ModelBundle {
         ModelManager::new()?.ensure_base()
     }
 
-    #[cfg(all(feature = "online", feature = "long-form"))]
+    #[cfg(all(feature = "online", feature = "long-form-vad"))]
     /// Download the Parakeet and VAD model bundle from Hugging Face
     ///
     /// By default this resolves models from `avencera/scriptrs-models`. Set
@@ -197,7 +172,7 @@ impl ModelManager {
         self.ensure_unified(false)
     }
 
-    #[cfg(feature = "long-form")]
+    #[cfg(feature = "long-form-vad")]
     /// Ensure the Parakeet and VAD model bundle is cached locally
     ///
     /// The returned [`ModelBundle`] points at the resolved snapshot directory
@@ -210,19 +185,16 @@ impl ModelManager {
         &self,
         include_vad: bool,
     ) -> Result<ModelBundle, hf_hub::api::sync::ApiError> {
-        #[cfg(not(feature = "long-form"))]
-        let files = {
-            let _ = include_vad;
-            base_repo_files()
-        };
-        #[cfg(feature = "long-form")]
-        let files = {
-            let mut files = base_repo_files();
-            if include_vad {
-                files.extend(mlmodelc_files(VAD_DIR));
-            }
-            files
-        };
+        #[cfg(feature = "long-form-vad")]
+        let mut files = base_repo_files();
+        #[cfg(not(feature = "long-form-vad"))]
+        let files = base_repo_files();
+        #[cfg(feature = "long-form-vad")]
+        if include_vad {
+            files.extend(mlmodelc_files(VAD_DIR));
+        }
+        #[cfg(not(feature = "long-form-vad"))]
+        let _ = include_vad;
         let root = self.download_repo_layout(&self.repo, &files)?;
         Ok(ModelBundle::from_dir(root))
     }
@@ -278,8 +250,14 @@ fn snapshot_root_from_cached_file(cached_path: &Path, relative_path: &str) -> Pa
 
 #[cfg(all(test, feature = "online"))]
 mod tests {
-    use super::{ENCODER_DIR, VOCAB_FILE, base_repo_files, snapshot_root_from_cached_file};
+    use super::{
+        DECODER_DIR, ENCODER_DIR, JOINT_DECISION_DIR, ModelBundle, VOCAB_FILE, base_repo_files,
+        snapshot_root_from_cached_file,
+    };
+    use crate::error::TranscriptionError;
+    use std::fs;
     use std::path::Path;
+    use tempfile::tempdir;
 
     #[test]
     fn base_repo_files_include_required_assets() {
@@ -289,6 +267,21 @@ mod tests {
             files
                 .iter()
                 .any(|file| file == &format!("{ENCODER_DIR}/model.mil"))
+        );
+        assert!(
+            files
+                .iter()
+                .any(|file| file == &format!("{DECODER_DIR}/model.mil"))
+        );
+        assert!(
+            files
+                .iter()
+                .any(|file| file == &format!("{JOINT_DECISION_DIR}/model.mil"))
+        );
+        assert!(
+            !files
+                .iter()
+                .any(|file| file.contains("decoder-joint.mlmodelc"))
         );
     }
 
@@ -302,5 +295,46 @@ mod tests {
             root,
             Path::new("/tmp/hf/models--avencera--scriptrs-models/snapshots/abc")
         );
+    }
+
+    #[test]
+    fn validate_base_requires_split_bundles() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let root = temp_dir.path();
+        fs::create_dir_all(root.join(ENCODER_DIR)).expect("encoder dir should be created");
+        fs::create_dir_all(root.join(DECODER_DIR)).expect("decoder dir should be created");
+        fs::write(root.join(VOCAB_FILE), []).expect("vocab file should be created");
+
+        let bundle = ModelBundle::from_dir(root);
+        let error = bundle
+            .validate_base()
+            .expect_err("missing joint bundle should fail");
+        match error {
+            TranscriptionError::MissingModelAsset { path } => {
+                assert_eq!(path, root.join(JOINT_DECISION_DIR));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn validate_base_rejects_fused_only_bundle() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let root = temp_dir.path();
+        fs::create_dir_all(root.join(ENCODER_DIR)).expect("encoder dir should be created");
+        fs::create_dir_all(root.join("parakeet-v2/decoder-joint.mlmodelc"))
+            .expect("fused decoder dir should be created");
+        fs::write(root.join(VOCAB_FILE), []).expect("vocab file should be created");
+
+        let bundle = ModelBundle::from_dir(root);
+        let error = bundle
+            .validate_base()
+            .expect_err("fused-only bundle should fail");
+        match error {
+            TranscriptionError::MissingModelAsset { path } => {
+                assert_eq!(path, root.join(DECODER_DIR));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 }

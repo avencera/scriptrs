@@ -17,6 +17,7 @@ keywords = ["asr", "transcription", "speech", "coreml", "macos"]
 default = ["online"]
 online = ["dep:hf-hub", "hf-hub/ureq", "hf-hub/native-tls"]
 long-form = []
+long-form-vad = ["long-form"]
 
 [dependencies]
 hf-hub = { version = "0.5", optional = true, default-features = false }
@@ -29,12 +30,27 @@ tracing = "0.1.44"
 objc2 = "0.6"
 block2 = "0.6"
 objc2-core-ml = { version = "0.3", features = [
+    "MLAllComputeDevices",
+    "MLCPUComputeDevice",
+    "MLComputeDeviceProtocol",
+    "MLComputePlan",
+    "MLComputePlanDeviceUsage",
     "MLModel",
     "MLMultiArray",
     "MLModelConfiguration",
     "MLDictionaryFeatureProvider",
     "MLFeatureValue",
     "MLFeatureProvider",
+    "MLGPUComputeDevice",
+    "MLModelStructure",
+    "MLModelStructureNeuralNetwork",
+    "MLModelStructurePipeline",
+    "MLModelStructureProgram",
+    "MLModelStructureProgramBlock",
+    "MLModelStructureProgramFunction",
+    "MLModelStructureProgramOperation",
+    "MLModel_MLComputeDevice",
+    "MLNeuralEngineComputeDevice",
     "alloc",
     "block2",
 ] }
@@ -55,3 +71,4 @@ objc2-foundation = { version = "0.3", features = [
 approx = "0.5.1"
 eyre = "0.6.12"
 hound = "3.5.1"
+tempfile = "3.23.0"
