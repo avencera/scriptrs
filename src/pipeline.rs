@@ -7,7 +7,7 @@ use crate::model::ParakeetModel;
 use crate::models::ModelBundle;
 use crate::types::TranscriptionResult;
 use crate::vocab::Vocabulary;
-use ndarray::{Array2, s};
+use ndarray::Array2;
 
 /// Single-chunk Parakeet v2 transcription pipeline
 ///
@@ -175,7 +175,7 @@ impl PreparedChunk {
     fn new(features: Array2<f32>, target_frames: usize) -> Self {
         let feature_frames = features.shape()[0];
         Self {
-            features: pad_features(features, target_frames),
+            features,
             feature_frames,
             target_frames,
         }
@@ -214,18 +214,6 @@ impl ChunkPreparer {
             self.config.max_feature_frames(),
         ))
     }
-}
-
-fn pad_features(features: Array2<f32>, target_frames: usize) -> Array2<f32> {
-    let current_frames = features.shape()[0];
-    if current_frames >= target_frames {
-        return features;
-    }
-
-    let feature_size = features.shape()[1];
-    let mut padded = Array2::<f32>::zeros((target_frames, feature_size));
-    padded.slice_mut(s![..current_frames, ..]).assign(&features);
-    padded
 }
 
 fn apply_time_offsets(raw: &mut RawTranscription, frame_offset: usize, context_frames: usize) {
