@@ -107,14 +107,11 @@ impl ParakeetFeatureExtractor {
         }
 
         let spectrogram = self.stft(audio)?;
-        let mel_spectrogram = self.mel_filterbank.dot(&spectrogram);
+        let mut mel_spectrogram = self.mel_filterbank.dot(&spectrogram);
         let log_zero_guard = 2.0f32.powi(-24);
-        let mut features = mel_spectrogram
-            .mapv(|value| (value + log_zero_guard).ln())
-            .t()
-            .to_owned();
-        normalize_columns(&mut features);
-        Ok(features)
+        mel_spectrogram.mapv_inplace(|value| (value + log_zero_guard).ln());
+        normalize_rows(&mut mel_spectrogram);
+        Ok(mel_spectrogram.reversed_axes())
     }
 
     fn stft(&self, audio: &[f32]) -> Result<Array2<f32>, TranscriptionError> {
@@ -222,19 +219,16 @@ fn create_mel_filterbank(n_fft: usize, n_mels: usize, sample_rate: usize) -> Arr
     filterbank
 }
 
-fn normalize_columns(features: &mut Array2<f32>) {
-    let num_frames = features.shape()[0];
-    let num_features = features.shape()[1];
+fn normalize_rows(features: &mut Array2<f32>) {
+    let num_frames = features.shape()[1];
+    let num_features = features.shape()[0];
     for feature_idx in 0..num_features {
-        let mut column = features.column_mut(feature_idx);
-        let mean = column.iter().sum::<f32>() / num_frames as f32;
-        let variance = column
-            .iter()
-            .map(|value| (*value - mean).powi(2))
-            .sum::<f32>()
+        let mut row = features.row_mut(feature_idx);
+        let mean = row.iter().sum::<f32>() / num_frames as f32;
+        let variance = row.iter().map(|value| (*value - mean).powi(2)).sum::<f32>()
             / (num_frames as f32 - 1.0);
         let std = variance.sqrt() + 1e-5;
-        for value in &mut column {
+        for value in &mut row {
             *value = (*value - mean) / std;
         }
     }
