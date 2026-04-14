@@ -6,9 +6,11 @@ use std::time::Instant;
 use eyre::{Result, bail, eyre};
 use hound::WavReader;
 
-#[cfg(feature = "long-form")]
-use scriptrs::LongFormTranscriptionPipeline;
+#[cfg(feature = "long-form-vad")]
+use scriptrs::LongFormMode;
 use scriptrs::TranscriptionPipeline;
+#[cfg(feature = "long-form")]
+use scriptrs::{LongFormConfig, LongFormTranscriptionPipeline};
 
 fn main() -> ExitCode {
     match run() {
@@ -60,6 +62,8 @@ struct Args {
     models_dir: Option<PathBuf>,
     pretrained: bool,
     long_form: bool,
+    vad_long_form: bool,
+    long_form_workers: Option<usize>,
     warmup_runs: usize,
     benchmark_runs: usize,
     preview_chars: usize,
@@ -72,6 +76,8 @@ impl Args {
         let mut models_dir = None;
         let mut pretrained = false;
         let mut long_form = false;
+        let mut vad_long_form = false;
+        let mut long_form_workers = None;
         let mut warmup_runs = 1usize;
         let mut benchmark_runs = 0usize;
         let mut preview_chars = 800usize;
@@ -82,6 +88,13 @@ impl Args {
                 "--models-dir" => models_dir = Some(next_path(&mut args, "--models-dir")?),
                 "--pretrained" => pretrained = true,
                 "--long-form" => long_form = true,
+                "--vad-long-form" => vad_long_form = true,
+                "--long-form-workers" => {
+                    let worker_count = next_value(&mut args, "--long-form-workers")?
+                        .parse()
+                        .map_err(|error| eyre!("invalid --long-form-workers value: {error}"))?;
+                    long_form_workers = Some(worker_count);
+                }
                 "--warmup-runs" => {
                     warmup_runs = next_value(&mut args, "--warmup-runs")?
                         .parse()
@@ -120,12 +133,22 @@ impl Args {
         if benchmark_runs > 0 && warmup_runs == 0 {
             bail!("--warmup-runs must be at least 1 when benchmarking")
         }
+        if vad_long_form && !long_form {
+            bail!("--vad-long-form requires --long-form")
+        }
+        if let Some(worker_count) = long_form_workers
+            && worker_count == 0
+        {
+            bail!("--long-form-workers must be at least 1")
+        }
 
         Ok(Self {
             audio_path,
             models_dir,
             pretrained,
             long_form,
+            vad_long_form,
+            long_form_workers,
             warmup_runs,
             benchmark_runs,
             preview_chars,
@@ -144,6 +167,8 @@ Options:
   --models-dir <dir>         local scriptrs model bundle directory
   --pretrained               download models via the online feature
   --long-form                use LongFormTranscriptionPipeline
+  --vad-long-form            use VAD-backed region planning
+  --long-form-workers <n>    parallel long-form workers (default: 4)
   --warmup-runs <n>          warmup runs before timing (default: 1)
   --benchmark-runs <n>       timed runs after warmup on one loaded pipeline
   --preview-chars <n>        text preview limit"
@@ -196,23 +221,40 @@ fn run_long_form_pipeline(
     args: &Args,
     pipeline_elapsed: f64,
 ) -> Result<scriptrs::TranscriptionResult> {
+    let mut config = LongFormConfig::default();
+    if let Some(worker_count) = args.long_form_workers {
+        config.worker_count = worker_count;
+    }
+    #[cfg(feature = "long-form-vad")]
+    if args.vad_long_form {
+        config.mode = LongFormMode::Vad;
+    }
+    #[cfg(not(feature = "long-form-vad"))]
+    if args.vad_long_form {
+        bail!("rebuild with --features long-form-vad to use --vad-long-form")
+    }
+    #[cfg(feature = "long-form-vad")]
+    if !args.vad_long_form {
+        config.mode = LongFormMode::Fast;
+    }
+
     if args.benchmark_runs == 0 {
         let started_at = Instant::now();
-        let result = pipeline.run(audio)?;
+        let result = pipeline.run_with_config(audio, &config)?;
         println!("pipeline_load_seconds: {:.2}", pipeline_elapsed);
         println!("elapsed_seconds: {:.2}", started_at.elapsed().as_secs_f64());
         return Ok(result);
     }
 
     for _ in 0..args.warmup_runs {
-        let _ = pipeline.run(audio)?;
+        let _ = pipeline.run_with_config(audio, &config)?;
     }
 
     let mut total_seconds = 0.0;
     let mut result = None;
     for _ in 0..args.benchmark_runs {
         let started_at = Instant::now();
-        let run_result = pipeline.run(audio)?;
+        let run_result = pipeline.run_with_config(audio, &config)?;
         total_seconds += started_at.elapsed().as_secs_f64();
         result = Some(run_result);
     }

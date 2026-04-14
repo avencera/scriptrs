@@ -10,9 +10,10 @@
 //! - Parakeet TDT v2 only
 //! - mono 16kHz `&[f32]` input
 //!
-//! The base crate exposes a single-chunk [`TranscriptionPipeline`]. Long-audio
-//! chunking, VAD, and overlap merging are available behind the `long-form`
-//! feature via [`LongFormTranscriptionPipeline`].
+//! The base crate exposes a single-chunk [`TranscriptionPipeline`]. Fast
+//! long-audio chunking and overlap merging are available behind the
+//! `long-form` feature via [`LongFormTranscriptionPipeline`]. VAD-backed speech
+//! region planning is an additional `long-form-vad` feature.
 //!
 //! # Choosing a pipeline
 //!
@@ -20,8 +21,11 @@
 //! window. If the input is too long, it returns [`TranscriptionError::AudioTooLong`].
 //!
 //! Use [`LongFormTranscriptionPipeline`] with the `long-form` feature when you
-//! want `scriptrs` to own VAD, chunking, silence-based splitting, and overlap
-//! fallback internally.
+//! want `scriptrs` to own long-audio chunking internally. This default path is
+//! tuned for speed and works well on dense, mostly continuous speech.
+//!
+//! Add `long-form-vad` when you need VAD-backed speech region planning for
+//! sparse speech, long silences, or recordings with a lot of non-speech audio.
 //!
 //! # Model loading
 //!
@@ -41,7 +45,7 @@
 //!     vocab.txt
 //! ```
 //!
-//! With `long-form`, add:
+//! With `long-form-vad`, add:
 //!
 //! ```text
 //! models/
@@ -95,6 +99,29 @@
 //! # #[cfg(not(feature = "long-form"))]
 //! # fn main() {}
 //! ```
+//!
+//! VAD-backed long-form transcription:
+//!
+//! ```no_run
+//! # #[cfg(feature = "long-form-vad")]
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use scriptrs::{LongFormConfig, LongFormMode, LongFormTranscriptionPipeline};
+//!
+//! # fn load_audio() -> Vec<f32> { Vec::new() }
+//! let audio = load_audio();
+//! let pipeline = LongFormTranscriptionPipeline::from_pretrained()?;
+//! let config = LongFormConfig {
+//!     mode: LongFormMode::Vad,
+//!     ..LongFormConfig::default()
+//! };
+//! let result = pipeline.run_with_config(&audio, &config)?;
+//!
+//! println!("{}", result.text);
+//! # Ok(())
+//! # }
+//! # #[cfg(not(feature = "long-form-vad"))]
+//! # fn main() {}
+//! ```
 
 mod config;
 mod constants;
@@ -117,9 +144,10 @@ pub use config::TranscriptionConfig;
 pub use error::TranscriptionError;
 #[cfg(feature = "long-form")]
 pub use long_form::{
-    LongFormConfig, LongFormTranscriptionPipeline, OverlapChunkConfig, VadConfig,
-    VadSegmentationConfig,
+    LongFormConfig, LongFormMode, LongFormTranscriptionPipeline, OverlapChunkConfig,
 };
+#[cfg(feature = "long-form-vad")]
+pub use long_form::{VadConfig, VadSegmentationConfig};
 pub use models::ModelBundle;
 #[cfg(feature = "online")]
 pub use models::ModelManager;

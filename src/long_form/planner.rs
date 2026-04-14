@@ -1,6 +1,6 @@
-use crate::constants::{
-    MAX_MODEL_SAMPLES, SAMPLE_RATE, SAMPLES_PER_ENCODER_FRAME, VAD_WINDOW_SAMPLES,
-};
+#[cfg(feature = "long-form-vad")]
+use crate::constants::VAD_WINDOW_SAMPLES;
+use crate::constants::{MAX_MODEL_SAMPLES, SAMPLE_RATE, SAMPLES_PER_ENCODER_FRAME};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SampleRange {
@@ -8,6 +8,7 @@ pub(crate) struct SampleRange {
     pub end: usize,
 }
 
+#[cfg(feature = "long-form-vad")]
 /// Runtime threshold configuration for the VAD model
 #[derive(Debug, Clone)]
 pub struct VadConfig {
@@ -15,6 +16,7 @@ pub struct VadConfig {
     pub default_threshold: f32,
 }
 
+#[cfg(feature = "long-form-vad")]
 impl Default for VadConfig {
     fn default() -> Self {
         Self {
@@ -23,6 +25,7 @@ impl Default for VadConfig {
     }
 }
 
+#[cfg(feature = "long-form-vad")]
 /// Segmentation parameters for converting VAD probabilities into speech regions
 #[derive(Debug, Clone)]
 pub struct VadSegmentationConfig {
@@ -46,6 +49,7 @@ pub struct VadSegmentationConfig {
     pub use_max_possible_silence_at_max_speech: bool,
 }
 
+#[cfg(feature = "long-form-vad")]
 impl Default for VadSegmentationConfig {
     fn default() -> Self {
         Self {
@@ -62,6 +66,7 @@ impl Default for VadSegmentationConfig {
     }
 }
 
+#[cfg(feature = "long-form-vad")]
 impl VadSegmentationConfig {
     pub(crate) fn threshold(&self, default_threshold: f32) -> f32 {
         default_threshold
@@ -131,6 +136,7 @@ impl OverlapChunkConfig {
     }
 }
 
+#[cfg(feature = "long-form-vad")]
 pub(crate) fn detect_speech_regions(
     probabilities: &[f32],
     audio_length_samples: usize,
@@ -223,12 +229,14 @@ pub(crate) fn detect_speech_regions(
     adjusted
 }
 
+#[cfg(feature = "long-form-vad")]
 pub(crate) fn region_probability_slice(probabilities: &[f32], region: SampleRange) -> &[f32] {
     let frame_start = region.start / VAD_WINDOW_SAMPLES;
     let frame_end = region.end.div_ceil(VAD_WINDOW_SAMPLES);
     &probabilities[frame_start.min(probabilities.len())..frame_end.min(probabilities.len())]
 }
 
+#[cfg(feature = "long-form-vad")]
 pub(crate) fn plan_region_subsegments(
     region: SampleRange,
     region_probabilities: &[f32],
@@ -271,6 +279,7 @@ pub(crate) fn plan_region_subsegments(
     Some(segments)
 }
 
+#[cfg(feature = "long-form-vad")]
 fn silence_spans(
     region: SampleRange,
     region_probabilities: &[f32],
@@ -307,12 +316,13 @@ fn silence_spans(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        OverlapChunkConfig, SampleRange, VadSegmentationConfig, detect_speech_regions,
-        plan_region_subsegments,
-    };
+    use super::{OverlapChunkConfig, SampleRange};
+    #[cfg(feature = "long-form-vad")]
+    use super::{VadSegmentationConfig, detect_speech_regions, plan_region_subsegments};
+    #[cfg(feature = "long-form-vad")]
     use crate::constants::VAD_WINDOW_SAMPLES;
 
+    #[cfg(feature = "long-form-vad")]
     #[test]
     fn speech_regions_trim_short_silence() {
         let probabilities = vec![0.9, 0.9, 0.1, 0.9, 0.9];
@@ -325,6 +335,7 @@ mod tests {
         assert_eq!(regions.len(), 1);
     }
 
+    #[cfg(feature = "long-form-vad")]
     #[test]
     fn silence_split_prefers_internal_gap() {
         let probabilities = vec![0.9, 0.9, 0.9, 0.2, 0.2, 0.2, 0.2, 0.9, 0.9, 0.9];
@@ -343,6 +354,7 @@ mod tests {
         assert!(segments[0].end <= 5 * VAD_WINDOW_SAMPLES);
     }
 
+    #[cfg(feature = "long-form-vad")]
     #[test]
     fn no_silence_returns_none_for_overlap_fallback() {
         let probabilities = vec![0.9; 10];

@@ -6,7 +6,7 @@ const ENCODER_DIR: &str = "parakeet-v2/encoder.mlmodelc";
 const DECODER_DIR: &str = "parakeet-v2/decoder.mlmodelc";
 const JOINT_DECISION_DIR: &str = "parakeet-v2/joint-decision.mlmodelc";
 const VOCAB_FILE: &str = "parakeet-v2/vocab.txt";
-#[cfg(feature = "long-form")]
+#[cfg(feature = "long-form-vad")]
 const VAD_DIR: &str = "vad/silero-vad.mlmodelc";
 #[cfg(feature = "online")]
 const SCRIPTRS_MODELS_DIR_ENV: &str = "SCRIPTRS_MODELS_DIR";
@@ -24,7 +24,7 @@ pub struct ModelBundle {
     decoder_dir: PathBuf,
     joint_decision_dir: PathBuf,
     vocab_path: PathBuf,
-    #[cfg(feature = "long-form")]
+    #[cfg(feature = "long-form-vad")]
     vad_dir: PathBuf,
 }
 
@@ -32,7 +32,7 @@ impl ModelBundle {
     /// Resolve the expected model layout from a local directory
     ///
     /// This only resolves paths. File existence is checked later by
-    /// [`Self::validate_base`] or [`Self::validate_long_form`].
+    /// [`Self::validate_base`].
     pub fn from_dir(models_dir: impl Into<PathBuf>) -> Self {
         let root = models_dir.into();
         Self {
@@ -40,7 +40,7 @@ impl ModelBundle {
             decoder_dir: root.join(DECODER_DIR),
             joint_decision_dir: root.join(JOINT_DECISION_DIR),
             vocab_path: root.join(VOCAB_FILE),
-            #[cfg(feature = "long-form")]
+            #[cfg(feature = "long-form-vad")]
             vad_dir: root.join(VAD_DIR),
             root,
         }
@@ -65,7 +65,7 @@ impl ModelBundle {
         Ok(())
     }
 
-    #[cfg(feature = "long-form")]
+    #[cfg(feature = "long-form-vad")]
     /// Validate that the base Parakeet and VAD model assets are present
     pub fn validate_long_form(&self) -> Result<(), TranscriptionError> {
         self.validate_base()?;
@@ -93,7 +93,7 @@ impl ModelBundle {
         &self.vocab_path
     }
 
-    #[cfg(feature = "long-form")]
+    #[cfg(feature = "long-form-vad")]
     pub(crate) fn vad_dir(&self) -> &Path {
         &self.vad_dir
     }
@@ -116,7 +116,7 @@ impl ModelBundle {
         ModelManager::new()?.ensure_base()
     }
 
-    #[cfg(all(feature = "online", feature = "long-form"))]
+    #[cfg(all(feature = "online", feature = "long-form-vad"))]
     /// Download the Parakeet and VAD model bundle from Hugging Face
     ///
     /// By default this resolves models from `avencera/scriptrs-models`. Set
@@ -172,7 +172,7 @@ impl ModelManager {
         self.ensure_unified(false)
     }
 
-    #[cfg(feature = "long-form")]
+    #[cfg(feature = "long-form-vad")]
     /// Ensure the Parakeet and VAD model bundle is cached locally
     ///
     /// The returned [`ModelBundle`] points at the resolved snapshot directory
@@ -185,19 +185,16 @@ impl ModelManager {
         &self,
         include_vad: bool,
     ) -> Result<ModelBundle, hf_hub::api::sync::ApiError> {
-        #[cfg(not(feature = "long-form"))]
-        let files = {
-            let _ = include_vad;
-            base_repo_files()
-        };
-        #[cfg(feature = "long-form")]
-        let files = {
-            let mut files = base_repo_files();
-            if include_vad {
-                files.extend(mlmodelc_files(VAD_DIR));
-            }
-            files
-        };
+        #[cfg(feature = "long-form-vad")]
+        let mut files = base_repo_files();
+        #[cfg(not(feature = "long-form-vad"))]
+        let files = base_repo_files();
+        #[cfg(feature = "long-form-vad")]
+        if include_vad {
+            files.extend(mlmodelc_files(VAD_DIR));
+        }
+        #[cfg(not(feature = "long-form-vad"))]
+        let _ = include_vad;
         let root = self.download_repo_layout(&self.repo, &files)?;
         Ok(ModelBundle::from_dir(root))
     }

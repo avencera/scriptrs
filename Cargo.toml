@@ -17,6 +17,7 @@ keywords = ["asr", "transcription", "speech", "coreml", "macos"]
 default = ["online"]
 online = ["dep:hf-hub", "hf-hub/ureq", "hf-hub/native-tls"]
 long-form = []
+long-form-vad = ["long-form"]
 
 [dependencies]
 hf-hub = { version = "0.5", optional = true, default-features = false }

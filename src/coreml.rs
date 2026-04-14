@@ -31,7 +31,7 @@ use objc2_foundation::{NSArray, NSMutableDictionary, NSNumber, NSString};
 
 #[cfg(target_os = "macos")]
 use crate::constants::{DECODER_HIDDEN_SIZE, DECODER_LAYERS, ENCODER_HIDDEN_SIZE};
-#[cfg(all(target_os = "macos", feature = "long-form"))]
+#[cfg(all(target_os = "macos", feature = "long-form-vad"))]
 use crate::constants::{VAD_CONTEXT_SAMPLES, VAD_STATE_SIZE, VAD_WINDOW_SAMPLES};
 #[cfg(target_os = "macos")]
 use crate::coreml::array::{contiguous_strides, extract_output, ns_number_array};
@@ -46,7 +46,7 @@ pub(crate) struct ParakeetSplitCoreMlModel {
     joint_decision: JointDecisionCoreMlModel,
 }
 
-#[cfg(all(target_os = "macos", feature = "long-form"))]
+#[cfg(all(target_os = "macos", feature = "long-form-vad"))]
 #[derive(Debug, Clone)]
 pub(crate) struct SileroVadCoreMlModel {
     model: CoreMlModel,
@@ -185,7 +185,7 @@ impl ParakeetSplitCoreMlModel {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "long-form"))]
+#[cfg(all(target_os = "macos", feature = "long-form-vad"))]
 impl SileroVadCoreMlModel {
     pub(crate) fn new(path: &Path) -> Result<Self, TranscriptionError> {
         Ok(Self {
@@ -366,7 +366,7 @@ pub(crate) struct SplitDecoderCoreMlOutput {
     pub cell_state: Array3<f32>,
 }
 
-#[cfg(all(target_os = "macos", feature = "long-form"))]
+#[cfg(all(target_os = "macos", feature = "long-form-vad"))]
 #[derive(Debug, Clone)]
 pub(crate) struct SileroVadOutput {
     pub probability: f32,
@@ -635,7 +635,7 @@ fn scalar_usize(
     Ok(value as usize)
 }
 
-#[cfg(all(target_os = "macos", feature = "long-form"))]
+#[cfg(all(target_os = "macos", feature = "long-form-vad"))]
 fn vector_f32(
     output: &ProtocolObject<dyn MLFeatureProvider>,
     key: &CachedOutputKey,
