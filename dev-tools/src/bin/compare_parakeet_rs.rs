@@ -14,7 +14,6 @@ const DEFAULT_CHUNKS_PER_FILE: usize = 2;
 const DEFAULT_CHUNK_SECONDS: f64 = 15.0;
 const DEFAULT_BENCHMARK_WARMUP: usize = 1;
 const DEFAULT_BENCHMARK_RUNS: usize = 0;
-const COREML_RUNTIME_MODE_ENV: &str = "SCRIPTRS_COREML_RUNTIME_MODE";
 const DEV_TOOLS_DIR: &str = env!("CARGO_MANIFEST_DIR");
 
 fn main() -> ExitCode {
@@ -29,7 +28,6 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     let args = Args::parse(env::args().skip(1))?;
-    configure_runtime_mode(args.runtime_mode);
     let scriptrs_pipeline = TranscriptionPipeline::from_dir(&args.models_dir)?;
     let parakeet_dir = PreparedParakeetDir::new(&args.models_dir, &args.onnx_dir)?;
     let mut parakeet = ParakeetTDT::from_pretrained(parakeet_dir.path(), None)?;
@@ -71,36 +69,12 @@ struct Args {
     chunk_seconds: f64,
     benchmark_warmup: usize,
     benchmark_runs: usize,
-    runtime_mode: RuntimeMode,
 }
 
 #[derive(Debug, Clone)]
 enum InputMode {
     Audio(PathBuf),
     Dataset(PathBuf),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RuntimeMode {
-    Sync,
-    AsyncExperiment,
-}
-
-impl RuntimeMode {
-    fn parse(value: &str) -> Result<Self> {
-        match value {
-            "sync" => Ok(Self::Sync),
-            "async-experiment" => Ok(Self::AsyncExperiment),
-            _ => bail!("invalid --runtime-mode value: {value}"),
-        }
-    }
-
-    fn as_env_value(self) -> &'static str {
-        match self {
-            Self::Sync => "sync",
-            Self::AsyncExperiment => "async-experiment",
-        }
-    }
 }
 
 impl Args {
@@ -117,7 +91,6 @@ impl Args {
         let mut chunk_seconds = DEFAULT_CHUNK_SECONDS;
         let mut benchmark_warmup = DEFAULT_BENCHMARK_WARMUP;
         let mut benchmark_runs = DEFAULT_BENCHMARK_RUNS;
-        let mut runtime_mode = RuntimeMode::Sync;
 
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -159,9 +132,6 @@ impl Args {
                     benchmark_runs = next_value(&mut args, "--benchmark-runs")?
                         .parse()
                         .map_err(|error| eyre!("invalid --benchmark-runs value: {error}"))?;
-                }
-                "--runtime-mode" => {
-                    runtime_mode = RuntimeMode::parse(&next_value(&mut args, "--runtime-mode")?)?;
                 }
                 "--help" | "-h" => {
                     print_usage();
@@ -212,7 +182,6 @@ impl Args {
             chunk_seconds,
             benchmark_warmup,
             benchmark_runs,
-            runtime_mode,
         })
     }
 }
@@ -233,17 +202,9 @@ Options:
   --chunk-seconds <n>        chunk length in seconds (default: 15)
   --benchmark-warmup <n>     warmup passes before timing (default: 1)
   --benchmark-runs <n>       timed passes for scriptrs (default: 0)
-  --runtime-mode <mode>      sync or async-experiment (default: sync)
   --token-limit <n>          token preview rows (default: 12)
   --strict                   exit non-zero on mismatch"
     );
-}
-
-fn configure_runtime_mode(runtime_mode: RuntimeMode) {
-    // safe because this CLI mutates the process environment before starting worker threads
-    unsafe {
-        env::set_var(COREML_RUNTIME_MODE_ENV, runtime_mode.as_env_value());
-    }
 }
 
 fn resolve_speakrs_dataset_dir(dataset_id: &str) -> PathBuf {
@@ -315,7 +276,6 @@ struct DatasetReport {
 
 #[derive(Debug, Clone)]
 struct BenchmarkReport {
-    runtime_mode: RuntimeMode,
     warmup_runs: usize,
     timed_runs: usize,
     chunk_count: usize,
@@ -409,7 +369,6 @@ fn maybe_print_benchmark(
     let report = benchmark_scriptrs(
         scriptrs_pipeline,
         chunks,
-        args.runtime_mode,
         args.benchmark_warmup,
         args.benchmark_runs,
     )?;
@@ -420,7 +379,6 @@ fn maybe_print_benchmark(
 fn benchmark_scriptrs(
     scriptrs_pipeline: &TranscriptionPipeline,
     chunks: &[AudioChunk],
-    runtime_mode: RuntimeMode,
     warmup_runs: usize,
     timed_runs: usize,
 ) -> Result<BenchmarkReport> {
@@ -444,7 +402,6 @@ fn benchmark_scriptrs(
     let (p50_duration, p95_duration) = percentile_durations(&durations);
 
     Ok(BenchmarkReport {
-        runtime_mode,
         warmup_runs,
         timed_runs,
         chunk_count: benchmark_inputs.len(),
@@ -701,7 +658,6 @@ impl ComparisonSummary {
 fn print_single_report(args: &Args, comparison: &Comparison) {
     println!("models_dir: {}", args.models_dir.display());
     println!("onnx_dir: {}", args.onnx_dir.display());
-    println!("runtime_mode: {}", args.runtime_mode.as_env_value());
     println!("label: {}", comparison.label);
     println!(
         "original_duration: {:.3}s",
@@ -753,7 +709,6 @@ fn print_single_report(args: &Args, comparison: &Comparison) {
 fn print_dataset_report(args: &Args, dataset_dir: &Path, report: &DatasetReport) {
     println!("models_dir: {}", args.models_dir.display());
     println!("onnx_dir: {}", args.onnx_dir.display());
-    println!("runtime_mode: {}", args.runtime_mode.as_env_value());
     println!("dataset_dir: {}", dataset_dir.display());
     println!("files_sampled: {}", args.max_files);
     println!("chunks_per_file: {}", args.chunks_per_file);
@@ -802,10 +757,6 @@ fn print_dataset_report(args: &Args, dataset_dir: &Path, report: &DatasetReport)
 }
 
 fn print_benchmark_report(report: &BenchmarkReport) {
-    println!(
-        "benchmark_runtime_mode: {}",
-        report.runtime_mode.as_env_value()
-    );
     println!("benchmark_warmup_runs: {}", report.warmup_runs);
     println!("benchmark_timed_runs: {}", report.timed_runs);
     println!("benchmark_chunks_per_run: {}", report.chunk_count);
