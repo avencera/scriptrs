@@ -70,9 +70,11 @@ impl ParakeetModel {
 
         while state.frame_idx < time_steps {
             state.ensure_decoder_step(&self.inner)?;
-            let frame = reshape_encoder_frame(encoder_output, state.frame_idx)?;
+            state.copy_encoder_frame(encoder_output)?;
             let cached_decoder = state.cached_decoder()?;
-            let decision = self.inner.run_joint(&frame, &cached_decoder.decoder_step)?;
+            let decision = self
+                .inner
+                .run_joint(state.encoder_step(), &cached_decoder.decoder_step)?;
 
             if decision.token_id != self.blank_id {
                 let cached_decoder = state.take_cached_decoder()?;
@@ -96,6 +98,9 @@ impl ParakeetModel {
 struct GreedyDecodeState {
     hidden_state: Array3<f32>,
     cell_state: Array3<f32>,
+    decoder_targets: Array2<i32>,
+    decoder_target_length: Array1<i32>,
+    encoder_step: Array3<f32>,
     cached_decoder: Option<CachedDecoderStep>,
     raw: RawTranscription,
     frame_idx: usize,
@@ -108,6 +113,9 @@ impl GreedyDecodeState {
         Self {
             hidden_state: Array3::<f32>::zeros((DECODER_LAYERS, 1, DECODER_HIDDEN_SIZE)),
             cell_state: Array3::<f32>::zeros((DECODER_LAYERS, 1, DECODER_HIDDEN_SIZE)),
+            decoder_targets: Array2::<i32>::zeros((1, 1)),
+            decoder_target_length: Array1::from_elem(1, 1i32),
+            encoder_step: Array3::<f32>::zeros((1, ENCODER_HIDDEN_SIZE, 1)),
             cached_decoder: None,
             raw: RawTranscription::empty(),
             frame_idx: 0,
@@ -116,11 +124,23 @@ impl GreedyDecodeState {
         }
     }
 
-    fn decoder_inputs(&self) -> Result<(Array2<i32>, Array1<i32>), TranscriptionError> {
-        let targets = Array2::from_shape_vec((1, 1), vec![self.last_token]).map_err(|error| {
-            TranscriptionError::InvalidModelOutput(format!("failed to shape targets: {error}"))
-        })?;
-        Ok((targets, Array1::from_vec(vec![1i32])))
+    fn copy_encoder_frame(
+        &mut self,
+        encoder_output: &Array3<f32>,
+    ) -> Result<(), TranscriptionError> {
+        if self.frame_idx >= encoder_output.shape()[2] {
+            return Err(TranscriptionError::InvalidModelOutput(format!(
+                "encoder frame index {} exceeded time steps {}",
+                self.frame_idx,
+                encoder_output.shape()[2]
+            )));
+        }
+
+        for hidden_idx in 0..ENCODER_HIDDEN_SIZE {
+            self.encoder_step[[0, hidden_idx, 0]] = encoder_output[[0, hidden_idx, self.frame_idx]];
+        }
+
+        Ok(())
     }
 
     fn ensure_decoder_step(
@@ -131,10 +151,10 @@ impl GreedyDecodeState {
             return Ok(());
         }
 
-        let (targets, target_length) = self.decoder_inputs()?;
+        self.decoder_targets[[0, 0]] = self.last_token;
         self.cached_decoder = Some(model.run_decoder(
-            &targets,
-            &target_length,
+            &self.decoder_targets,
+            &self.decoder_target_length,
             &self.hidden_state,
             &self.cell_state,
         )?);
@@ -151,6 +171,10 @@ impl GreedyDecodeState {
         self.cached_decoder.take().ok_or_else(|| {
             TranscriptionError::InvalidModelOutput("decoder cache was not primed".to_owned())
         })
+    }
+
+    fn encoder_step(&self) -> &Array3<f32> {
+        &self.encoder_step
     }
 
     fn record_emission(
@@ -264,23 +288,6 @@ impl EncoderInputBuffer {
     fn target_frames(&self) -> usize {
         self.target_frames
     }
-}
-
-fn reshape_encoder_frame(
-    encoder_output: &Array3<f32>,
-    frame_idx: usize,
-) -> Result<Array3<f32>, TranscriptionError> {
-    let frame = encoder_output
-        .slice(ndarray::s![0, .., frame_idx])
-        .to_owned()
-        .to_shape((1, ENCODER_HIDDEN_SIZE, 1))
-        .map_err(|error| {
-            TranscriptionError::InvalidModelOutput(format!(
-                "failed to reshape encoder frame: {error}"
-            ))
-        })?
-        .to_owned();
-    Ok(frame)
 }
 
 #[derive(Debug, Clone)]
