@@ -1,6 +1,6 @@
 mod merge;
 mod planner;
-#[cfg(feature = "long-form-vad")]
+#[cfg(feature = "vad")]
 mod vad;
 
 use std::collections::BTreeMap;
@@ -18,14 +18,14 @@ use crate::pipeline::{ChunkPreparer, TranscriptionPipeline};
 use crate::types::{TimedToken, TranscriptChunk, TranscriptionResult};
 
 pub use planner::OverlapChunkConfig;
-#[cfg(feature = "long-form-vad")]
+#[cfg(feature = "vad")]
 pub use planner::{VadConfig, VadSegmentationConfig};
 
 use self::merge::merge_overlapping_windows;
 use self::planner::SampleRange;
-#[cfg(feature = "long-form-vad")]
+#[cfg(feature = "vad")]
 use self::planner::{detect_speech_regions, plan_region_subsegments, region_probability_slice};
-#[cfg(feature = "long-form-vad")]
+#[cfg(feature = "vad")]
 use self::vad::SileroVad;
 
 /// Long-form transcription pipeline with overlap chunking and optional VAD
@@ -37,14 +37,14 @@ use self::vad::SileroVad;
 /// With `long-form`, the default path chunks the full recording with overlap
 /// windows and runs up to 4 workers in parallel
 ///
-/// With `long-form-vad`, you can switch to VAD-based speech region detection
+/// With `vad`, you can switch to VAD-based speech region detection
 /// for recordings that contain long silences or a lot of non-speech content
 ///
 /// It expects the same mono 16kHz `&[f32]` input as the base pipeline.
 #[derive(Debug, Clone)]
 pub struct LongFormTranscriptionPipeline {
     inner: TranscriptionPipeline,
-    #[cfg(feature = "long-form-vad")]
+    #[cfg(feature = "vad")]
     vad: Option<SileroVad>,
     default_config: LongFormConfig,
 }
@@ -61,10 +61,10 @@ pub struct LongFormConfig {
     pub worker_count: usize,
     /// Single-chunk transcription settings
     pub transcription: TranscriptionConfig,
-    #[cfg(feature = "long-form-vad")]
+    #[cfg(feature = "vad")]
     /// VAD processing settings
     pub vad: VadConfig,
-    #[cfg(feature = "long-form-vad")]
+    #[cfg(feature = "vad")]
     /// VAD segmentation settings
     pub segmentation: VadSegmentationConfig,
     /// Overlap fallback settings
@@ -77,9 +77,9 @@ impl Default for LongFormConfig {
             mode: LongFormMode::default(),
             worker_count: 4,
             transcription: TranscriptionConfig::default(),
-            #[cfg(feature = "long-form-vad")]
+            #[cfg(feature = "vad")]
             vad: VadConfig::default(),
-            #[cfg(feature = "long-form-vad")]
+            #[cfg(feature = "vad")]
             segmentation: VadSegmentationConfig::default(),
             overlap: OverlapChunkConfig::default(),
         }
@@ -92,7 +92,7 @@ pub enum LongFormMode {
     /// Skip VAD and chunk the full recording with overlap windows
     #[default]
     Fast,
-    #[cfg(feature = "long-form-vad")]
+    #[cfg(feature = "vad")]
     /// Detect speech with VAD before chunk planning
     Vad,
 }
@@ -103,7 +103,7 @@ impl LongFormTranscriptionPipeline {
     /// The directory must contain the base Parakeet bundle expected by
     /// [`ModelBundle::validate_base`]
     ///
-    /// With `long-form-vad`, the VAD model is optional at construction time and
+    /// With `vad`, the VAD model is optional at construction time and
     /// only required when the VAD mode is used
     pub fn from_dir(models_dir: impl Into<std::path::PathBuf>) -> Result<Self, TranscriptionError> {
         let bundle = ModelBundle::from_dir(models_dir);
@@ -116,7 +116,7 @@ impl LongFormTranscriptionPipeline {
         let inner = TranscriptionPipeline::from_bundle(bundle.clone())?;
         Ok(Self {
             inner,
-            #[cfg(feature = "long-form-vad")]
+            #[cfg(feature = "vad")]
             vad: load_vad(bundle.vad_dir())?,
             default_config: LongFormConfig::default(),
         })
@@ -129,11 +129,11 @@ impl LongFormTranscriptionPipeline {
     /// `avencera/scriptrs-models` on Hugging Face. Set `SCRIPTRS_MODELS_DIR` to
     /// force a local bundle or `SCRIPTRS_MODELS_REPO` to override the repo.
     pub fn from_pretrained() -> Result<Self, TranscriptionError> {
-        #[cfg(feature = "long-form-vad")]
+        #[cfg(feature = "vad")]
         let bundle = ModelBundle::from_pretrained_long_form().map_err(|error| {
             TranscriptionError::CoreMl(format!("model download failed: {error}"))
         })?;
-        #[cfg(not(feature = "long-form-vad"))]
+        #[cfg(not(feature = "vad"))]
         let bundle = ModelBundle::from_pretrained().map_err(|error| {
             TranscriptionError::CoreMl(format!("model download failed: {error}"))
         })?;
@@ -144,7 +144,7 @@ impl LongFormTranscriptionPipeline {
     ///
     /// Short clips still go through the base single-chunk path. Longer clips use
     /// overlap chunking by default, with optional VAD planning when
-    /// `long-form-vad` is enabled
+    /// `vad` is enabled
     pub fn run(&self, audio: &[f32]) -> Result<TranscriptionResult, TranscriptionError> {
         self.run_with_config(audio, &self.default_config)
     }
@@ -180,12 +180,12 @@ impl LongFormTranscriptionPipeline {
     ) -> Result<TranscriptionResult, TranscriptionError> {
         match config.mode {
             LongFormMode::Fast => self.run_fast_long_form(audio, config),
-            #[cfg(feature = "long-form-vad")]
+            #[cfg(feature = "vad")]
             LongFormMode::Vad => self.run_vad_long_form(audio, config),
         }
     }
 
-    #[cfg(feature = "long-form-vad")]
+    #[cfg(feature = "vad")]
     fn run_vad_long_form(
         &self,
         audio: &[f32],
@@ -348,14 +348,14 @@ impl LongFormTranscriptionPipeline {
         regions: Vec<RegionTask>,
         mut raw_tasks: Vec<Option<RawTranscription>>,
     ) -> Result<TranscriptionResult, TranscriptionError> {
-        #[cfg(not(feature = "long-form-vad"))]
+        #[cfg(not(feature = "vad"))]
         let _ = tasks;
         let mut tokens = Vec::new();
         let mut chunks = Vec::new();
 
         for region in regions {
             let region_tokens = match region.kind {
-                #[cfg(feature = "long-form-vad")]
+                #[cfg(feature = "vad")]
                 RegionTaskKind::Segments => {
                     self.decode_segment_tasks(tasks, &region.task_indices, &mut raw_tasks)?
                 }
@@ -373,7 +373,7 @@ impl LongFormTranscriptionPipeline {
         Ok(build_result(audio_len, chunks, tokens))
     }
 
-    #[cfg(feature = "long-form-vad")]
+    #[cfg(feature = "vad")]
     fn decode_segment_tasks(
         &self,
         tasks: &[ChunkTask],
@@ -418,7 +418,7 @@ impl LongFormTranscriptionPipeline {
             .tokens)
     }
 
-    #[cfg(feature = "long-form-vad")]
+    #[cfg(feature = "vad")]
     fn build_execution_plan(
         &self,
         regions: &[SampleRange],
@@ -471,14 +471,14 @@ struct ChunkTask {
     audio_end: usize,
     global_sample_offset: usize,
     context_samples: usize,
-    #[cfg(feature = "long-form-vad")]
+    #[cfg(feature = "vad")]
     kind: ChunkTaskKind,
 }
 
-#[cfg(feature = "long-form-vad")]
+#[cfg(feature = "vad")]
 #[derive(Debug, Clone, Copy)]
 enum ChunkTaskKind {
-    #[cfg(feature = "long-form-vad")]
+    #[cfg(feature = "vad")]
     Segment {
         sample_offset: usize,
         duration_samples: usize,
@@ -494,7 +494,7 @@ struct RegionTask {
 
 #[derive(Debug, Clone, Copy)]
 enum RegionTaskKind {
-    #[cfg(feature = "long-form-vad")]
+    #[cfg(feature = "vad")]
     Segments,
     Overlap,
 }
@@ -505,7 +505,7 @@ struct CompletedTask {
     raw: RawTranscription,
 }
 
-#[cfg(feature = "long-form-vad")]
+#[cfg(feature = "vad")]
 fn build_region_plan(
     region: SampleRange,
     probabilities: &[f32],
@@ -546,7 +546,7 @@ fn build_region_plan(
     }
 }
 
-#[cfg(feature = "long-form-vad")]
+#[cfg(feature = "vad")]
 fn push_segment_task(tasks: &mut Vec<ChunkTask>, segment: SampleRange) -> usize {
     let task_idx = tasks.len();
     tasks.push(ChunkTask {
@@ -554,7 +554,7 @@ fn push_segment_task(tasks: &mut Vec<ChunkTask>, segment: SampleRange) -> usize 
         audio_end: segment.end,
         global_sample_offset: 0,
         context_samples: 0,
-        #[cfg(feature = "long-form-vad")]
+        #[cfg(feature = "vad")]
         kind: ChunkTaskKind::Segment {
             sample_offset: segment.start,
             duration_samples: segment.end.saturating_sub(segment.start),
@@ -575,7 +575,7 @@ fn push_overlap_task(
         audio_end: chunk.end,
         global_sample_offset: chunk.start,
         context_samples: chunk.start - context_start,
-        #[cfg(feature = "long-form-vad")]
+        #[cfg(feature = "vad")]
         kind: ChunkTaskKind::Overlap,
     });
     task_idx
@@ -646,14 +646,14 @@ fn build_result(
     }
 }
 
-#[cfg(feature = "long-form-vad")]
+#[cfg(feature = "vad")]
 fn offset_tokens(tokens: &mut [TimedToken], sample_offset: usize) {
     for token in tokens {
         offset_token(token, sample_offset);
     }
 }
 
-#[cfg(feature = "long-form-vad")]
+#[cfg(feature = "vad")]
 fn offset_token(token: &mut TimedToken, sample_offset: usize) {
     let seconds = sample_offset as f64 / SAMPLE_RATE as f64;
     token.start += seconds;
@@ -664,7 +664,7 @@ fn duration_seconds(sample_count: usize) -> f64 {
     sample_count as f64 / SAMPLE_RATE as f64
 }
 
-#[cfg(feature = "long-form-vad")]
+#[cfg(feature = "vad")]
 fn load_vad(model_path: &std::path::Path) -> Result<Option<SileroVad>, TranscriptionError> {
     if !model_path.exists() {
         return Ok(None);
@@ -675,11 +675,11 @@ fn load_vad(model_path: &std::path::Path) -> Result<Option<SileroVad>, Transcrip
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "long-form-vad")]
+    #[cfg(feature = "vad")]
     use super::{ChunkTaskKind, SampleRange, build_region_plan};
     use super::{LongFormConfig, LongFormMode, RegionTaskKind, parallel_worker_count};
 
-    #[cfg(feature = "long-form-vad")]
+    #[cfg(feature = "vad")]
     #[test]
     fn short_region_stays_as_a_single_segment_task() {
         let config = LongFormConfig::default();
@@ -703,7 +703,7 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "long-form-vad")]
+    #[cfg(feature = "vad")]
     #[test]
     fn overlap_plan_keeps_window_order_and_context_offsets() {
         let mut config = LongFormConfig::default();

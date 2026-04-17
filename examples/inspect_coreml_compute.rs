@@ -19,7 +19,7 @@ use scriptrs::ModelBundle;
 const ENCODER_DIR: &str = "parakeet-v2/encoder.mlmodelc";
 const DECODER_DIR: &str = "parakeet-v2/decoder.mlmodelc";
 const JOINT_DECISION_DIR: &str = "parakeet-v2/joint-decision.mlmodelc";
-#[cfg(feature = "long-form-vad")]
+#[cfg(feature = "vad")]
 const VAD_DIR: &str = "vad/silero-vad.mlmodelc";
 
 fn main() -> ExitCode {
@@ -69,7 +69,7 @@ fn run() -> Result<()> {
             args.show_ops,
         )?;
 
-        #[cfg(feature = "long-form-vad")]
+        #[cfg(feature = "vad")]
         if args.long_form {
             inspect_model(
                 "vad",
@@ -79,9 +79,9 @@ fn run() -> Result<()> {
             )?;
         }
 
-        #[cfg(not(feature = "long-form-vad"))]
+        #[cfg(not(feature = "vad"))]
         if args.long_form {
-            bail!("rebuild with --features long-form-vad to inspect the VAD model")
+            bail!("rebuild with --features vad to inspect the VAD model")
         }
 
         Ok(())
@@ -153,7 +153,7 @@ fn print_usage() {
         "Usage:
   cargo run --example inspect_coreml_compute -- --models-dir <dir>
   cargo run --example inspect_coreml_compute -- --pretrained
-  cargo run --example inspect_coreml_compute --features long-form-vad -- --pretrained --long-form
+  cargo run --example inspect_coreml_compute --features vad -- --pretrained --long-form
 
 Options:
   --models-dir <dir>         local scriptrs model bundle directory
@@ -172,11 +172,11 @@ fn resolve_bundle(args: &Args) -> Result<ModelBundle> {
     #[cfg(feature = "online")]
     {
         if args.long_form {
-            #[cfg(feature = "long-form-vad")]
+            #[cfg(feature = "vad")]
             return Ok(ModelBundle::from_pretrained_long_form()?);
 
-            #[cfg(not(feature = "long-form-vad"))]
-            bail!("rebuild with --features long-form-vad to inspect the VAD model")
+            #[cfg(not(feature = "vad"))]
+            bail!("rebuild with --features vad to inspect the VAD model")
         }
 
         let _ = args.pretrained;

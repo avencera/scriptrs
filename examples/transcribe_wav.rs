@@ -6,7 +6,7 @@ use std::time::Instant;
 use eyre::{Result, bail, eyre};
 use hound::WavReader;
 
-#[cfg(feature = "long-form-vad")]
+#[cfg(feature = "vad")]
 use scriptrs::LongFormMode;
 use scriptrs::TranscriptionPipeline;
 #[cfg(feature = "long-form")]
@@ -162,6 +162,7 @@ fn print_usage() {
   cargo run --example transcribe_wav -- --audio <path.wav>
   cargo run --example transcribe_wav -- --audio <path.wav> --pretrained
   cargo run --example transcribe_wav --features long-form -- --audio <path.wav> --pretrained --long-form
+  cargo run --example transcribe_wav --features vad -- --audio <path.wav> --pretrained --long-form --vad-long-form
 
 Options:
   --models-dir <dir>         local scriptrs model bundle directory
@@ -225,15 +226,15 @@ fn run_long_form_pipeline(
     if let Some(worker_count) = args.long_form_workers {
         config.worker_count = worker_count;
     }
-    #[cfg(feature = "long-form-vad")]
+    #[cfg(feature = "vad")]
     if args.vad_long_form {
         config.mode = LongFormMode::Vad;
     }
-    #[cfg(not(feature = "long-form-vad"))]
+    #[cfg(not(feature = "vad"))]
     if args.vad_long_form {
-        bail!("rebuild with --features long-form-vad to use --vad-long-form")
+        bail!("rebuild with --features vad to use --vad-long-form")
     }
-    #[cfg(feature = "long-form-vad")]
+    #[cfg(feature = "vad")]
     if !args.vad_long_form {
         config.mode = LongFormMode::Fast;
     }

@@ -12,7 +12,7 @@
 
 Rust transcription with native CoreML Parakeet v2 inference.
 
-The base crate exposes a single-chunk `TranscriptionPipeline`. Fast long-audio chunking lives behind the `long-form` feature via `LongFormTranscriptionPipeline`. VAD-backed speech region planning is an additional `long-form-vad` feature.
+The base crate exposes a single-chunk `TranscriptionPipeline`. Fast long-audio chunking lives behind the `long-form` feature via `LongFormTranscriptionPipeline`. VAD-backed speech region planning lives behind the `vad` feature, which also enables `long-form`.
 
 ## Current scope
 
@@ -48,7 +48,7 @@ For VAD-backed long-form transcription:
 
 ```toml
 [dependencies]
-scriptrs = { version = "0.1.0", features = ["long-form-vad"] }
+scriptrs = { version = "0.1.0", features = ["vad"] }
 ```
 
 ## Model downloads
@@ -75,7 +75,7 @@ models/
     vocab.txt
 ```
 
-With `long-form-vad`, add:
+With `vad`, add:
 
 ```text
 models/
@@ -173,7 +173,7 @@ fn load_mono_16khz_audio() -> Vec<f32> {
 }
 ```
 
-Enable `long-form-vad` when you want VAD-backed speech region planning for sparse speech, long silences, or recordings with a lot of non-speech audio:
+Enable `vad` when you want VAD-backed speech region planning for sparse speech, long silences, or recordings with a lot of non-speech audio:
 
 ```rust
 use scriptrs::{LongFormConfig, LongFormMode, LongFormTranscriptionPipeline};
@@ -206,7 +206,7 @@ cargo run --example transcribe_wav -- --audio /path/to/file.wav --models-dir mod
 cargo run --example transcribe_wav --features long-form -- --audio /path/to/file.wav --pretrained --long-form
 cargo run --example transcribe_wav --features long-form -- --audio /path/to/file.wav --models-dir models --long-form
 cargo run --example transcribe_wav --features long-form -- --audio /path/to/file.wav --pretrained --long-form --long-form-workers 2
-cargo run --example transcribe_wav --features long-form-vad -- --audio /path/to/file.wav --pretrained --long-form --vad-long-form
+cargo run --example transcribe_wav --features vad -- --audio /path/to/file.wav --pretrained --long-form --vad-long-form
 ```
 
 The example expects mono 16kHz WAV input.
@@ -216,4 +216,4 @@ The example expects mono 16kHz WAV input.
 - The public API is still moving
 - `scriptrs` currently targets the exact file layout and model I/O shipped in `avencera/scriptrs-models`; if you swap in a different CoreML Parakeet export, you may need runtime code changes
 - Use `long-form` for the fastest path on clean, dense speech
-- Add `long-form-vad` when you need better robustness on sparse-speech or non-speech-heavy recordings
+- Add `vad` when you need better robustness on sparse-speech or non-speech-heavy recordings

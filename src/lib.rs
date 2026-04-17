@@ -13,7 +13,8 @@
 //! The base crate exposes a single-chunk [`TranscriptionPipeline`]. Fast
 //! long-audio chunking and overlap merging are available behind the
 //! `long-form` feature via [`LongFormTranscriptionPipeline`]. VAD-backed speech
-//! region planning is an additional `long-form-vad` feature.
+//! region planning is available behind the `vad` feature, which also enables
+//! `long-form`.
 //!
 //! # Choosing a pipeline
 //!
@@ -24,7 +25,7 @@
 //! want `scriptrs` to own long-audio chunking internally. This default path is
 //! tuned for speed and works well on dense, mostly continuous speech.
 //!
-//! Add `long-form-vad` when you need VAD-backed speech region planning for
+//! Add `vad` when you need VAD-backed speech region planning for
 //! sparse speech, long silences, or recordings with a lot of non-speech audio.
 //!
 //! # Model loading
@@ -45,7 +46,7 @@
 //!     vocab.txt
 //! ```
 //!
-//! With `long-form-vad`, add:
+//! With `vad`, add:
 //!
 //! ```text
 //! models/
@@ -103,7 +104,7 @@
 //! VAD-backed long-form transcription:
 //!
 //! ```no_run
-//! # #[cfg(feature = "long-form-vad")]
+//! # #[cfg(feature = "vad")]
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! use scriptrs::{LongFormConfig, LongFormMode, LongFormTranscriptionPipeline};
 //!
@@ -119,7 +120,7 @@
 //! println!("{}", result.text);
 //! # Ok(())
 //! # }
-//! # #[cfg(not(feature = "long-form-vad"))]
+//! # #[cfg(not(feature = "vad"))]
 //! # fn main() {}
 //! ```
 
@@ -146,7 +147,7 @@ pub use error::TranscriptionError;
 pub use long_form::{
     LongFormConfig, LongFormMode, LongFormTranscriptionPipeline, OverlapChunkConfig,
 };
-#[cfg(feature = "long-form-vad")]
+#[cfg(feature = "vad")]
 pub use long_form::{VadConfig, VadSegmentationConfig};
 pub use models::ModelBundle;
 #[cfg(feature = "online")]
