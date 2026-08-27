@@ -12,6 +12,7 @@ use std::thread;
 use crate::config::TranscriptionConfig;
 use crate::constants::SAMPLE_RATE;
 use crate::decode::RawTranscription;
+use crate::deployment::ParakeetDeployment;
 use crate::error::TranscriptionError;
 use crate::models::ModelBundle;
 use crate::pipeline::{ChunkPreparer, TranscriptionPipeline};
@@ -73,15 +74,22 @@ pub struct LongFormConfig {
 
 impl Default for LongFormConfig {
     fn default() -> Self {
+        Self::from_deployment(&ParakeetDeployment::v2())
+    }
+}
+
+impl LongFormConfig {
+    /// Build long-form settings from a deployment hard maximum
+    pub fn from_deployment(deployment: &ParakeetDeployment) -> Self {
         Self {
             mode: LongFormMode::default(),
             worker_count: 4,
-            transcription: TranscriptionConfig::default(),
+            transcription: TranscriptionConfig::from_deployment(deployment),
             #[cfg(feature = "vad")]
             vad: VadConfig::default(),
             #[cfg(feature = "vad")]
             segmentation: VadSegmentationConfig::default(),
-            overlap: OverlapChunkConfig::default(),
+            overlap: OverlapChunkConfig::from_deployment(deployment),
         }
     }
 }
@@ -106,19 +114,28 @@ impl LongFormTranscriptionPipeline {
     /// With `vad`, the VAD model is optional at construction time and
     /// only required when the VAD mode is used
     pub fn from_dir(models_dir: impl Into<std::path::PathBuf>) -> Result<Self, TranscriptionError> {
-        let bundle = ModelBundle::from_dir(models_dir);
+        Self::from_dir_with_deployment(models_dir, ParakeetDeployment::v2())
+    }
+
+    /// Build a long-form pipeline for an explicit deployment
+    pub fn from_dir_with_deployment(
+        models_dir: impl Into<std::path::PathBuf>,
+        deployment: ParakeetDeployment,
+    ) -> Result<Self, TranscriptionError> {
+        let bundle = ModelBundle::from_dir_with_deployment(models_dir, deployment);
         Self::from_bundle(bundle)
     }
 
     /// Build a long-form pipeline from a resolved model bundle
     pub fn from_bundle(bundle: ModelBundle) -> Result<Self, TranscriptionError> {
         bundle.validate_base()?;
+        let default_config = LongFormConfig::from_deployment(bundle.deployment());
         let inner = TranscriptionPipeline::from_bundle(bundle.clone())?;
         Ok(Self {
             inner,
             #[cfg(feature = "vad")]
             vad: load_vad(bundle.vad_dir())?,
-            default_config: LongFormConfig::default(),
+            default_config,
         })
     }
 
@@ -513,7 +530,8 @@ fn build_region_plan(
     tasks: &mut Vec<ChunkTask>,
 ) -> RegionTask {
     let region_len = region.end.saturating_sub(region.start);
-    if region_len <= config.transcription.max_audio_samples {
+    let max_chunk_samples = config.overlap.max_model_samples;
+    if region_len <= max_chunk_samples {
         return RegionTask {
             task_indices: vec![push_segment_task(tasks, region)],
             kind: RegionTaskKind::Segments,
@@ -524,7 +542,7 @@ fn build_region_plan(
         region,
         region_probability_slice(probabilities, region),
         &config.segmentation,
-        config.transcription.max_audio_samples,
+        max_chunk_samples,
     ) {
         return RegionTask {
             task_indices: subsegments
@@ -707,10 +725,8 @@ mod tests {
     #[test]
     fn overlap_plan_keeps_window_order_and_context_offsets() {
         let mut config = LongFormConfig::default();
-        config.transcription.max_audio_samples = 48_000;
-        config.segmentation.max_speech_duration = 1.0;
+        config.overlap.max_model_samples = 48_000;
         config.segmentation.min_silence_at_max_speech = 10.0;
-        config.segmentation.use_max_possible_silence_at_max_speech = false;
 
         let mut tasks = Vec::new();
         let region = SampleRange {

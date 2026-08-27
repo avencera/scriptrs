@@ -1,6 +1,7 @@
 #[cfg(feature = "vad")]
 use crate::constants::VAD_WINDOW_SAMPLES;
-use crate::constants::{MAX_MODEL_SAMPLES, SAMPLE_RATE, SAMPLES_PER_ENCODER_FRAME};
+use crate::constants::{SAMPLE_RATE, SAMPLES_PER_ENCODER_FRAME};
+use crate::deployment::ParakeetDeployment;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SampleRange {
@@ -27,14 +28,15 @@ impl Default for VadConfig {
 
 #[cfg(feature = "vad")]
 /// Segmentation parameters for converting VAD probabilities into speech regions
+///
+/// The model hard sample maximum is not stored here. Pass
+/// [`ParakeetDeployment::hard_sample_max`] into the planner.
 #[derive(Debug, Clone)]
 pub struct VadSegmentationConfig {
     /// Minimum speech span kept in the output
     pub min_speech_duration: f64,
     /// Minimum silence span required to end a speech region
     pub min_silence_duration: f64,
-    /// Soft maximum speech duration before the planner looks for an internal split
-    pub max_speech_duration: f64,
     /// Padding added around speech regions
     pub speech_padding: f64,
     /// Maximum probability considered a valid silence split candidate
@@ -45,8 +47,6 @@ pub struct VadSegmentationConfig {
     pub negative_threshold_offset: f32,
     /// Minimum silence duration considered valid when splitting long speech
     pub min_silence_at_max_speech: f64,
-    /// Whether to use the best available silence even if it does not cross the main split threshold
-    pub use_max_possible_silence_at_max_speech: bool,
 }
 
 #[cfg(feature = "vad")]
@@ -55,13 +55,11 @@ impl Default for VadSegmentationConfig {
         Self {
             min_speech_duration: 0.15,
             min_silence_duration: 0.75,
-            max_speech_duration: 14.0,
             speech_padding: 0.1,
             silence_threshold_for_split: 0.3,
             negative_threshold: None,
             negative_threshold_offset: 0.15,
             min_silence_at_max_speech: 0.098,
-            use_max_possible_silence_at_max_speech: true,
         }
     }
 }
@@ -93,15 +91,20 @@ pub struct OverlapChunkConfig {
 
 impl Default for OverlapChunkConfig {
     fn default() -> Self {
-        Self {
-            overlap_seconds: 2.0,
-            context_samples: SAMPLES_PER_ENCODER_FRAME,
-            max_model_samples: MAX_MODEL_SAMPLES,
-        }
+        Self::from_deployment(&ParakeetDeployment::v2())
     }
 }
 
 impl OverlapChunkConfig {
+    /// Build overlap settings from a deployment hard sample maximum
+    pub fn from_deployment(deployment: &ParakeetDeployment) -> Self {
+        Self {
+            overlap_seconds: 2.0,
+            context_samples: deployment.frontend().samples_per_encoder_frame(),
+            max_model_samples: deployment.hard_sample_max(),
+        }
+    }
+
     pub(crate) fn chunk_samples(&self) -> usize {
         let max_actual_chunk = self.max_model_samples.saturating_sub(self.context_samples);
         let raw = max_actual_chunk
@@ -318,9 +321,21 @@ fn silence_spans(
 mod tests {
     use super::{OverlapChunkConfig, SampleRange};
     #[cfg(feature = "vad")]
-    use super::{VadSegmentationConfig, detect_speech_regions, plan_region_subsegments};
+    use super::{VadConfig, VadSegmentationConfig, detect_speech_regions, plan_region_subsegments};
     #[cfg(feature = "vad")]
     use crate::constants::VAD_WINDOW_SAMPLES;
+    use crate::deployment::ParakeetDeployment;
+
+    #[cfg(feature = "vad")]
+    #[test]
+    fn vad_defaults_lock_threshold_and_segmentation() {
+        let vad = VadConfig::default();
+        let segmentation = VadSegmentationConfig::default();
+        assert_eq!(vad.default_threshold, 0.85);
+        assert_eq!(segmentation.min_speech_duration, 0.15);
+        assert_eq!(segmentation.min_silence_duration, 0.75);
+        assert_eq!(segmentation.speech_padding, 0.10);
+    }
 
     #[cfg(feature = "vad")]
     #[test]
@@ -333,6 +348,53 @@ mod tests {
             &VadSegmentationConfig::default(),
         );
         assert_eq!(regions.len(), 1);
+    }
+
+    #[cfg(feature = "vad")]
+    #[test]
+    fn min_speech_duration_drops_short_regions() {
+        let probabilities = vec![0.9, 0.9, 0.9, 0.9];
+        let audio_len = probabilities.len() * VAD_WINDOW_SAMPLES;
+        assert!(audio_len as f64 / 16_000.0 < 0.15);
+        let regions = detect_speech_regions(
+            &probabilities,
+            audio_len,
+            0.85,
+            &VadSegmentationConfig::default(),
+        );
+        assert!(regions.is_empty());
+    }
+
+    #[cfg(feature = "vad")]
+    #[test]
+    fn end_silence_of_point_75_seconds_closes_a_region() {
+        let mut probabilities = vec![0.9; 8];
+        probabilities.extend(std::iter::repeat_n(0.1, 25));
+        probabilities.extend(std::iter::repeat_n(0.9, 8));
+        let regions = detect_speech_regions(
+            &probabilities,
+            probabilities.len() * VAD_WINDOW_SAMPLES,
+            0.85,
+            &VadSegmentationConfig::default(),
+        );
+        assert_eq!(regions.len(), 2);
+    }
+
+    #[cfg(feature = "vad")]
+    #[test]
+    fn speech_padding_is_one_tenth_of_a_second() {
+        let mut probabilities = vec![0.9; 16];
+        probabilities.extend(std::iter::repeat_n(0.1, 25));
+        let audio_len = probabilities.len() * VAD_WINDOW_SAMPLES;
+        let regions = detect_speech_regions(
+            &probabilities,
+            audio_len,
+            0.85,
+            &VadSegmentationConfig::default(),
+        );
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].start, 0);
+        assert_eq!(regions[0].end, 16 * VAD_WINDOW_SAMPLES + 1_600);
     }
 
     #[cfg(feature = "vad")]
@@ -370,6 +432,33 @@ mod tests {
                 4 * VAD_WINDOW_SAMPLES
             )
             .is_none()
+        );
+    }
+
+    #[cfg(feature = "vad")]
+    #[test]
+    fn exact_hard_max_region_is_one_accepted_segment() {
+        let hard_max = ParakeetDeployment::v3().hard_sample_max();
+        let region = SampleRange {
+            start: 0,
+            end: hard_max,
+        };
+        let segments =
+            plan_region_subsegments(region, &[], &VadSegmentationConfig::default(), hard_max)
+                .unwrap();
+        assert_eq!(segments, vec![region]);
+    }
+
+    #[test]
+    fn overlap_fallback_uses_two_seconds() {
+        let v2 = OverlapChunkConfig::from_deployment(&ParakeetDeployment::v2());
+        let v3 = OverlapChunkConfig::from_deployment(&ParakeetDeployment::v3());
+        assert_eq!(v2.overlap_seconds, 2.0);
+        assert_eq!(v3.overlap_seconds, 2.0);
+        assert_eq!(v2.overlap_samples(), 32_000);
+        assert_eq!(
+            v3.max_model_samples,
+            ParakeetDeployment::v3().hard_sample_max()
         );
     }
 

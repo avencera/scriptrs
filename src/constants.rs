@@ -1,8 +1,9 @@
 pub(crate) const SAMPLE_RATE: usize = 16_000;
-pub(crate) const MAX_MODEL_SAMPLES: usize = 240_000;
+pub(crate) const DEFAULT_HARD_SAMPLE_MAX: usize = 240_000;
 pub(crate) const MEL_HOP_SAMPLES: usize = 160;
 pub(crate) const ENCODER_SUBSAMPLING: usize = 8;
 pub(crate) const SAMPLES_PER_ENCODER_FRAME: usize = MEL_HOP_SAMPLES * ENCODER_SUBSAMPLING;
+pub(crate) const DURATION_BINS: [usize; 5] = [0, 1, 2, 3, 4];
 #[cfg(feature = "vad")]
 pub(crate) const VAD_WINDOW_SAMPLES: usize = 512;
 #[cfg(feature = "vad")]

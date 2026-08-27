@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 exclude = ["fixtures/", "dev-tools/"]
 authors = ["Praveen Perera"]
-description = "Rust transcription with native CoreML Parakeet v2 inference"
+description = "Rust transcription with native CoreML Parakeet v2 and v3 inference"
 license = "Apache-2.0"
 repository = "https://github.com/avencera/scriptrs"
 homepage = "https://github.com/avencera/scriptrs"
@@ -23,6 +23,7 @@ vad = ["long-form"]
 hf-hub = { version = "0.5", optional = true, default-features = false }
 ndarray = "0.17.2"
 realfft = "3.5.0"
+serde_json = "1"
 thiserror = "2.0.18"
 tracing = "0.1.44"
 

@@ -6,11 +6,11 @@
 
 - macOS only
 - Apple CoreML only
-- Parakeet TDT v2 only
+- Parakeet TDT v2 and v3
 - no CUDA
 - no non-macOS backend yet
 
-Rust transcription with native CoreML Parakeet v2 inference.
+Rust transcription with native CoreML Parakeet v2 and v3 inference.
 
 The base crate exposes a single-chunk `TranscriptionPipeline`. Fast long-audio chunking lives behind the `long-form` feature via `LongFormTranscriptionPipeline`. VAD-backed speech region planning lives behind the `vad` feature, which also enables `long-form`.
 
@@ -73,7 +73,14 @@ models/
     decoder.mlmodelc/
     joint-decision.mlmodelc/
     vocab.txt
+  parakeet-v3/
+    encoder.mlmodelc/
+    decoder.mlmodelc/
+    joint-decision.mlmodelc/
+    parakeet_vocab.json
 ```
+
+Use `ParakeetDeployment::v2()` or `ParakeetDeployment::v3()` to select a layout. v2 remains the default for `from_dir` and `from_pretrained`.
 
 With `vad`, add:
 

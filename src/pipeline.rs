@@ -1,6 +1,7 @@
 use crate::config::TranscriptionConfig;
 use crate::constants::SAMPLES_PER_ENCODER_FRAME;
 use crate::decode::{ParakeetTdtDecoder, RawTranscription};
+use crate::deployment::ParakeetDeployment;
 use crate::error::TranscriptionError;
 use crate::frontend::ParakeetFeatureExtractor;
 use crate::model::ParakeetModel;
@@ -9,7 +10,7 @@ use crate::types::TranscriptionResult;
 use crate::vocab::Vocabulary;
 use ndarray::Array2;
 
-/// Single-chunk Parakeet v2 transcription pipeline
+/// Single-chunk Parakeet transcription pipeline
 ///
 /// This is the base `scriptrs` entry point for audio that already fits inside a
 /// single Parakeet window. It expects mono 16kHz audio samples as `&[f32]`.
@@ -28,20 +29,28 @@ pub struct TranscriptionPipeline {
 }
 
 impl TranscriptionPipeline {
-    /// Build a transcription pipeline from a local model directory
+    /// Build a v2 transcription pipeline from a local model directory
     ///
     /// The directory must contain the Parakeet runtime bundle expected by
     /// [`ModelBundle::from_dir`].
     pub fn from_dir(models_dir: impl Into<std::path::PathBuf>) -> Result<Self, TranscriptionError> {
-        let bundle = ModelBundle::from_dir(models_dir);
+        Self::from_dir_with_deployment(models_dir, ParakeetDeployment::v2())
+    }
+
+    /// Build a transcription pipeline for an explicit deployment
+    pub fn from_dir_with_deployment(
+        models_dir: impl Into<std::path::PathBuf>,
+        deployment: ParakeetDeployment,
+    ) -> Result<Self, TranscriptionError> {
+        let bundle = ModelBundle::from_dir_with_deployment(models_dir, deployment);
         Self::from_bundle(bundle)
     }
 
     /// Build a transcription pipeline from a resolved model bundle
     pub fn from_bundle(bundle: ModelBundle) -> Result<Self, TranscriptionError> {
         bundle.validate_base()?;
-        let config = TranscriptionConfig::default();
-        let vocab = Vocabulary::from_file(bundle.vocab_path())?;
+        let config = TranscriptionConfig::from_deployment(bundle.deployment());
+        let vocab = Vocabulary::load(bundle.vocab_path(), bundle.deployment().vocab_kind())?;
         let model = ParakeetModel::from_bundle(&bundle, &vocab, &config)?;
         Ok(Self {
             extractor: ParakeetFeatureExtractor::new(&config),
@@ -96,6 +105,11 @@ impl TranscriptionPipeline {
     /// Return the resolved model bundle
     pub fn bundle(&self) -> &ModelBundle {
         &self.bundle
+    }
+
+    /// Return the deployment that owns this pipeline
+    pub fn deployment(&self) -> &ParakeetDeployment {
+        self.bundle.deployment()
     }
 
     #[cfg(feature = "long-form")]

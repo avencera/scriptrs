@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use crate::deployment::ParakeetVersion;
+
 /// Errors returned by `scriptrs`
 #[derive(Debug, thiserror::Error)]
 pub enum TranscriptionError {
@@ -21,6 +23,30 @@ pub enum TranscriptionError {
     MissingModelAsset {
         /// Missing path
         path: PathBuf,
+    },
+    /// The directory layout did not match the requested Parakeet version
+    #[error("model layout did not match {expected:?}: found {found:?}")]
+    LayoutMismatch {
+        /// Requested deployment version
+        expected: ParakeetVersion,
+        /// Layout that was present on disk
+        found: ParakeetVersion,
+    },
+    /// A language is not in the deployment allowlist
+    #[error("language `{language}` is not supported by {version:?}")]
+    UnsupportedLanguage {
+        /// Requested language code
+        language: String,
+        /// Deployment that rejected the language
+        version: ParakeetVersion,
+    },
+    /// A duration bin was outside the deployment mapping
+    #[error("duration bin {bin} is outside the deployment mapping of length {len}")]
+    InvalidDurationBin {
+        /// Duration bin index from the joint head
+        bin: usize,
+        /// Number of bins owned by the deployment
+        len: usize,
     },
     /// File system I/O failed
     #[error(transparent)]

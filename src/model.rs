@@ -3,11 +3,12 @@ use std::cell::RefCell;
 use ndarray::{Array1, Array2, Array3};
 
 use crate::config::TranscriptionConfig;
-use crate::constants::{
-    DECODER_HIDDEN_SIZE, DECODER_LAYERS, ENCODER_HIDDEN_SIZE, MAX_TOKENS_PER_STEP,
-};
+use crate::constants::MAX_TOKENS_PER_STEP;
 use crate::decode::RawTranscription;
+use crate::deployment::{DecoderDimensions, ParakeetDeployment};
 use crate::error::TranscriptionError;
+use crate::language::LanguageSelection;
+use crate::model_io::{JointOutputs, decode_joint_outputs};
 use crate::models::ModelBundle;
 use crate::vocab::Vocabulary;
 
@@ -15,6 +16,10 @@ use crate::vocab::Vocabulary;
 pub(crate) struct ParakeetModel {
     inner: ParakeetModelInner,
     blank_id: usize,
+    dims: DecoderDimensions,
+    deployment: ParakeetDeployment,
+    vocabulary: Vocabulary,
+    language: LanguageSelection,
     encoder_input: RefCell<EncoderInputBuffer>,
 }
 
@@ -24,13 +29,19 @@ impl ParakeetModel {
         vocab: &Vocabulary,
         config: &TranscriptionConfig,
     ) -> Result<Self, TranscriptionError> {
+        let deployment = bundle.deployment().clone();
+        let language = deployment.select_language(config.language)?;
         Ok(Self {
             inner: ParakeetModelInner::from_bundle(bundle)?,
             blank_id: vocab.blank_id(),
+            dims: deployment.decoder_dimensions(),
+            language,
+            vocabulary: vocab.clone(),
             encoder_input: RefCell::new(EncoderInputBuffer::new(
                 config.feature_size,
                 config.max_feature_frames(),
             )),
+            deployment,
         })
     }
 
@@ -66,28 +77,34 @@ impl ParakeetModel {
         encoder_output: &Array3<f32>,
         time_steps: usize,
     ) -> Result<RawTranscription, TranscriptionError> {
-        let mut state = GreedyDecodeState::new(self.blank_id);
+        let mut state = GreedyDecodeState::new(self.blank_id, self.dims);
 
         while state.frame_idx < time_steps {
             state.ensure_decoder_step(&self.inner)?;
-            state.copy_encoder_frame(encoder_output)?;
+            state.copy_encoder_frame(encoder_output, self.dims.encoder_hidden())?;
             let cached_decoder = state.cached_decoder()?;
-            let decision = self
+            let raw_decision = self
                 .inner
                 .run_joint(state.encoder_step(), &cached_decoder.decoder_step)?;
+            let decision = decode_joint_outputs(
+                &raw_decision,
+                &self.deployment,
+                &self.vocabulary,
+                self.language,
+            )?;
 
             if decision.token_id != self.blank_id {
                 let cached_decoder = state.take_cached_decoder()?;
                 state.record_emission(
                     decision.token_id,
-                    decision.duration_step,
+                    decision.duration_frames,
                     decision.confidence,
                     cached_decoder.hidden_state,
                     cached_decoder.cell_state,
                 );
             }
 
-            state.advance(decision.token_id, decision.duration_step, self.blank_id);
+            state.advance(decision.token_id, decision.duration_frames, self.blank_id);
         }
 
         Ok(state.into_raw())
@@ -109,13 +126,13 @@ struct GreedyDecodeState {
 }
 
 impl GreedyDecodeState {
-    fn new(blank_id: usize) -> Self {
+    fn new(blank_id: usize, dims: DecoderDimensions) -> Self {
         Self {
-            hidden_state: Array3::<f32>::zeros((DECODER_LAYERS, 1, DECODER_HIDDEN_SIZE)),
-            cell_state: Array3::<f32>::zeros((DECODER_LAYERS, 1, DECODER_HIDDEN_SIZE)),
+            hidden_state: Array3::<f32>::zeros((dims.decoder_layers(), 1, dims.decoder_hidden())),
+            cell_state: Array3::<f32>::zeros((dims.decoder_layers(), 1, dims.decoder_hidden())),
             decoder_targets: Array2::<i32>::zeros((1, 1)),
             decoder_target_length: Array1::from_elem(1, 1i32),
-            encoder_step: Array3::<f32>::zeros((1, ENCODER_HIDDEN_SIZE, 1)),
+            encoder_step: Array3::<f32>::zeros((1, dims.encoder_hidden(), 1)),
             cached_decoder: None,
             raw: RawTranscription::empty(),
             frame_idx: 0,
@@ -127,6 +144,7 @@ impl GreedyDecodeState {
     fn copy_encoder_frame(
         &mut self,
         encoder_output: &Array3<f32>,
+        encoder_hidden: usize,
     ) -> Result<(), TranscriptionError> {
         if self.frame_idx >= encoder_output.shape()[2] {
             return Err(TranscriptionError::InvalidModelOutput(format!(
@@ -136,7 +154,7 @@ impl GreedyDecodeState {
             )));
         }
 
-        for hidden_idx in 0..ENCODER_HIDDEN_SIZE {
+        for hidden_idx in 0..encoder_hidden {
             self.encoder_step[[0, hidden_idx, 0]] = encoder_output[[0, hidden_idx, self.frame_idx]];
         }
 
@@ -291,13 +309,6 @@ impl EncoderInputBuffer {
 }
 
 #[derive(Debug, Clone)]
-struct JointDecision {
-    token_id: usize,
-    duration_step: usize,
-    confidence: f32,
-}
-
-#[derive(Debug, Clone)]
 enum ParakeetModelInner {
     #[cfg(target_os = "macos")]
     SplitCoreMl(crate::coreml::ParakeetSplitCoreMlModel),
@@ -314,6 +325,8 @@ impl ParakeetModelInner {
                     bundle.encoder_dir(),
                     bundle.decoder_dir(),
                     bundle.joint_decision_dir(),
+                    bundle.deployment().model_io(),
+                    bundle.deployment().decoder_dimensions(),
                 )?,
             ))
         }
@@ -367,19 +380,61 @@ impl ParakeetModelInner {
         &self,
         encoder_step: &Array3<f32>,
         decoder_step: &Array3<f32>,
-    ) -> Result<JointDecision, TranscriptionError> {
+    ) -> Result<JointOutputs, TranscriptionError> {
         match self {
             #[cfg(target_os = "macos")]
-            Self::SplitCoreMl(model) => {
-                let output = model.run_joint(encoder_step, decoder_step)?;
-                Ok(JointDecision {
-                    token_id: output.token_id,
-                    duration_step: output.duration_step,
-                    confidence: output.token_prob,
-                })
-            }
+            Self::SplitCoreMl(model) => model.run_joint(encoder_step, decoder_step),
             #[cfg(not(target_os = "macos"))]
             Self::Unsupported => Err(TranscriptionError::UnsupportedPlatform),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GreedyDecodeState;
+    use crate::constants::MAX_TOKENS_PER_STEP;
+    use crate::deployment::ParakeetDeployment;
+    use crate::language::{LanguageSelection, ParakeetLanguage};
+    use crate::model_io::{JointOutputs, decode_joint_outputs};
+    use crate::vocab::Vocabulary;
+
+    #[test]
+    fn greedy_state_advances_by_mapped_duration() {
+        let dims = ParakeetDeployment::v3().decoder_dimensions();
+        let mut state = GreedyDecodeState::new(4, dims);
+        state.advance(1, 3, 4);
+        assert_eq!(state.frame_idx, 3);
+    }
+
+    #[test]
+    fn greedy_state_force_advances_after_max_tokens() {
+        let dims = ParakeetDeployment::v3().decoder_dimensions();
+        let mut state = GreedyDecodeState::new(4, dims);
+        state.emitted_tokens = MAX_TOKENS_PER_STEP;
+        state.advance(1, 0, 4);
+        assert_eq!(state.frame_idx, 1);
+    }
+
+    #[test]
+    fn fixture_joint_path_does_not_need_coreml() {
+        let deployment = ParakeetDeployment::v3();
+        let vocab = Vocabulary::from_tokens(&["<unk>", "cat", "кот", "<blk>"]);
+        let outputs = JointOutputs {
+            token_id: 2,
+            token_prob: 0.8,
+            duration_bin: 2,
+            top_k_ids: Some(vec![2, 1]),
+            top_k_logits: Some(vec![5.0, 1.0]),
+        };
+        let decoded = decode_joint_outputs(
+            &outputs,
+            &deployment,
+            &vocab,
+            LanguageSelection::Language(ParakeetLanguage::Polish),
+        )
+        .unwrap();
+        assert_eq!(decoded.token_id, 1);
+        assert_eq!(decoded.duration_frames, 2);
     }
 }

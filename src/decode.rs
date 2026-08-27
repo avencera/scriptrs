@@ -58,12 +58,8 @@ impl ParakeetTdtDecoder {
 
             let frame = raw.frame_indices[index];
             let start = frame_to_seconds(frame);
-            let end = raw
-                .frame_indices
-                .get(index + 1)
-                .copied()
-                .map(frame_to_seconds)
-                .unwrap_or_else(|| (start + SECONDS_PER_ENCODER_FRAME).min(duration_seconds));
+            let duration_frames = raw.durations.get(index).copied().unwrap_or(1);
+            let end = token_end_seconds(start, duration_frames, duration_seconds);
 
             let mut display_text = token_text.replace('▁', " ");
             if needs_digit_spacing(&text, &display_text) {
@@ -107,6 +103,15 @@ fn frame_to_seconds(frame: usize) -> f64 {
     (frame * MEL_HOP_SAMPLES * 8) as f64 / SAMPLE_RATE as f64
 }
 
+fn token_end_seconds(start: f64, duration_frames: usize, duration_seconds: f64) -> f64 {
+    let span = if duration_frames == 0 {
+        SECONDS_PER_ENCODER_FRAME
+    } else {
+        duration_frames as f64 * SECONDS_PER_ENCODER_FRAME
+    };
+    (start + span).min(duration_seconds).max(start)
+}
+
 fn is_special_token(token: &str) -> bool {
     token.starts_with('<') && token.ends_with('>') && token != "<unk>"
 }
@@ -137,15 +142,11 @@ fn needs_digit_spacing(existing_text: &str, display_text: &str) -> bool {
 mod tests {
     use crate::types::TimedToken;
 
-    use super::{ParakeetTdtDecoder, RawTranscription};
+    use super::{ParakeetTdtDecoder, RawTranscription, SECONDS_PER_ENCODER_FRAME};
     use crate::vocab::Vocabulary;
 
     fn decoder(tokens: &[&str]) -> ParakeetTdtDecoder {
-        let vocab = Vocabulary {
-            id_to_token: tokens.iter().map(|token| token.to_string()).collect(),
-            blank_id: tokens.len().saturating_sub(1),
-        };
-        ParakeetTdtDecoder::new(vocab)
+        ParakeetTdtDecoder::new(Vocabulary::from_tokens(tokens))
     }
 
     #[test]
@@ -176,6 +177,25 @@ mod tests {
         assert_eq!(chunk.text, "hello world");
         assert_eq!(chunk.start, 0.0);
         assert!(chunk.end > chunk.start);
+    }
+
+    #[test]
+    fn duration_decode_fixture_uses_raw_durations() {
+        let decoder = decoder(&["▁hello", "▁world", "<blk>"]);
+        let raw = RawTranscription {
+            token_ids: vec![0, 1],
+            frame_indices: vec![0, 2],
+            durations: vec![2, 3],
+            confidences: vec![0.8, 0.7],
+        };
+        let result = decoder.decode(&raw, 2.0);
+        assert_eq!(result.tokens[0].start, 0.0);
+        assert_eq!(result.tokens[0].end, 2.0 * SECONDS_PER_ENCODER_FRAME);
+        assert_eq!(result.tokens[1].start, 2.0 * SECONDS_PER_ENCODER_FRAME);
+        assert_eq!(
+            result.tokens[1].end,
+            2.0 * SECONDS_PER_ENCODER_FRAME + 3.0 * SECONDS_PER_ENCODER_FRAME
+        );
     }
 
     #[test]

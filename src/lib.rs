@@ -1,13 +1,13 @@
 #![warn(missing_docs)]
 #![warn(clippy::undocumented_unsafe_blocks)]
 
-//! Rust transcription with native CoreML Parakeet v2 inference
+//! Rust transcription with native CoreML Parakeet v2 and v3 inference
 //!
 //! `scriptrs` is currently a narrow macOS-first transcription crate:
 //!
 //! - macOS only
 //! - CoreML only
-//! - Parakeet TDT v2 only
+//! - Parakeet TDT v2 and v3
 //! - mono 16kHz `&[f32]` input
 //!
 //! The base crate exposes a single-chunk [`TranscriptionPipeline`]. Fast
@@ -44,7 +44,14 @@
 //!     decoder.mlmodelc/
 //!     joint-decision.mlmodelc/
 //!     vocab.txt
+//!   parakeet-v3/
+//!     encoder.mlmodelc/
+//!     decoder.mlmodelc/
+//!     joint-decision.mlmodelc/
+//!     parakeet_vocab.json
 //! ```
+//!
+//! Select a version with [`ParakeetDeployment::v2`] or [`ParakeetDeployment::v3`].
 //!
 //! With `vad`, add:
 //!
@@ -127,9 +134,12 @@
 mod config;
 mod constants;
 mod decode;
+mod deployment;
 mod error;
 mod frontend;
+mod language;
 mod model;
+mod model_io;
 mod models;
 mod pipeline;
 mod types;
@@ -142,15 +152,25 @@ mod coreml;
 mod long_form;
 
 pub use config::TranscriptionConfig;
+pub use deployment::{
+    DecoderDimensions, DecoderIo, EncoderIo, FrontendSpec, JointIo, ModelIo, ModelLayout,
+    ParakeetDeployment, ParakeetVersion, VocabKind,
+};
 pub use error::TranscriptionError;
+pub use language::{
+    FilteredToken, LanguageSelection, ParakeetLanguage, Script, V3_LANGUAGES,
+    detect_language_from_tokens, filter_top_k_language, select_language_from_logits,
+};
 #[cfg(feature = "long-form")]
 pub use long_form::{
     LongFormConfig, LongFormMode, LongFormTranscriptionPipeline, OverlapChunkConfig,
 };
 #[cfg(feature = "vad")]
 pub use long_form::{VadConfig, VadSegmentationConfig};
+pub use model_io::{DecodedJointStep, EncoderOutputs, JointOutputs, decode_joint_outputs};
 pub use models::ModelBundle;
 #[cfg(feature = "online")]
 pub use models::ModelManager;
 pub use pipeline::TranscriptionPipeline;
 pub use types::{TimedToken, TranscriptChunk, TranscriptionResult};
+pub use vocab::Vocabulary;

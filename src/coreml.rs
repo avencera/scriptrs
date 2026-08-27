@@ -29,14 +29,16 @@ use objc2_core_ml::{MLComputeUnits, MLFeatureProvider, MLModel};
 #[cfg(target_os = "macos")]
 use objc2_foundation::{NSArray, NSMutableDictionary, NSNumber, NSString};
 
-#[cfg(target_os = "macos")]
-use crate::constants::{DECODER_HIDDEN_SIZE, DECODER_LAYERS, ENCODER_HIDDEN_SIZE};
 #[cfg(all(target_os = "macos", feature = "vad"))]
 use crate::constants::{VAD_CONTEXT_SAMPLES, VAD_STATE_SIZE, VAD_WINDOW_SAMPLES};
 #[cfg(target_os = "macos")]
 use crate::coreml::array::{contiguous_strides, extract_output, ns_number_array};
 #[cfg(target_os = "macos")]
+use crate::deployment::{DecoderDimensions, ModelIo};
+#[cfg(target_os = "macos")]
 use crate::error::TranscriptionError;
+#[cfg(target_os = "macos")]
+use crate::model_io::JointOutputs;
 
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone)]
@@ -44,6 +46,8 @@ pub(crate) struct ParakeetSplitCoreMlModel {
     encoder: CoreMlModel,
     decoder: DecoderCoreMlModel,
     joint_decision: JointDecisionCoreMlModel,
+    io: ModelIo,
+    dims: DecoderDimensions,
 }
 
 #[cfg(all(target_os = "macos", feature = "vad"))]
@@ -64,11 +68,15 @@ impl ParakeetSplitCoreMlModel {
         encoder_path: &Path,
         decoder_path: &Path,
         joint_decision_path: &Path,
+        io: ModelIo,
+        dims: DecoderDimensions,
     ) -> Result<Self, TranscriptionError> {
         Ok(Self {
             encoder: CoreMlModel::new(encoder_path)?,
-            decoder: DecoderCoreMlModel::new(decoder_path)?,
-            joint_decision: JointDecisionCoreMlModel::new(joint_decision_path)?,
+            decoder: DecoderCoreMlModel::new(decoder_path, io, dims)?,
+            joint_decision: JointDecisionCoreMlModel::new(joint_decision_path, io, dims)?,
+            io,
+            dims,
         })
     }
 
@@ -79,24 +87,29 @@ impl ParakeetSplitCoreMlModel {
         target_frames: usize,
         lengths: &[i32],
     ) -> Result<(Array3<f32>, usize), TranscriptionError> {
+        let encoder_io = self.io.encoder();
         let mel_shape = [1, feature_size, target_frames];
         let inputs = [
             CoreMlInput::F32 {
-                name: "mel",
+                name: encoder_io.input_mel,
                 values: mel,
                 shape: &mel_shape,
             },
             CoreMlInput::I32 {
-                name: "mel_length",
+                name: encoder_io.input_length,
                 values: lengths,
                 shape: &[1],
             },
         ];
-        let outputs = self
-            .encoder
-            .predict(&inputs, &["encoder", "encoder_length"])?;
-        let tensor = outputs.get("encoder").ok_or_else(|| {
-            TranscriptionError::InvalidModelOutput("encoder output `encoder` missing".to_owned())
+        let outputs = self.encoder.predict(
+            &inputs,
+            &[encoder_io.output_encoder, encoder_io.output_length],
+        )?;
+        let tensor = outputs.get(encoder_io.output_encoder).ok_or_else(|| {
+            TranscriptionError::InvalidModelOutput(format!(
+                "encoder output `{}` missing",
+                encoder_io.output_encoder
+            ))
         })?;
         let shape = tensor.shape.as_slice();
         if shape.len() != 3 {
@@ -105,11 +118,12 @@ impl ParakeetSplitCoreMlModel {
             )));
         }
 
+        let encoder_hidden = self.dims.encoder_hidden();
         let encoder = match shape {
-            [1, hidden, time] if *hidden == ENCODER_HIDDEN_SIZE => {
+            [1, hidden, time] if *hidden == encoder_hidden => {
                 array3_from_parts(tensor.data.clone(), shape, "encoder output")?
             }
-            [1, time, hidden] if *hidden == ENCODER_HIDDEN_SIZE => {
+            [1, time, hidden] if *hidden == encoder_hidden => {
                 Array3::from_shape_vec((1, *time, *hidden), tensor.data.clone())
                     .map_err(|error| {
                         TranscriptionError::InvalidModelOutput(format!(
@@ -125,7 +139,7 @@ impl ParakeetSplitCoreMlModel {
             }
         };
         let time_steps = outputs
-            .get("encoder_length")
+            .get(encoder_io.output_length)
             .and_then(|tensor| tensor.data.first())
             .copied()
             .map(|value| value as usize)
@@ -169,7 +183,7 @@ impl ParakeetSplitCoreMlModel {
         &self,
         encoder_step: &Array3<f32>,
         decoder_step: &Array3<f32>,
-    ) -> Result<JointDecision, TranscriptionError> {
+    ) -> Result<JointOutputs, TranscriptionError> {
         self.joint_decision.run(
             encoder_step.as_slice().ok_or_else(|| {
                 TranscriptionError::InvalidModelOutput(
@@ -249,16 +263,23 @@ struct DecoderCoreMlModel {
 
 #[cfg(target_os = "macos")]
 impl DecoderCoreMlModel {
-    fn new(path: &Path) -> Result<Self, TranscriptionError> {
+    fn new(path: &Path, io: ModelIo, dims: DecoderDimensions) -> Result<Self, TranscriptionError> {
+        let decoder_io = io.decoder();
         Ok(Self {
             model: CoreMlModel::new(path)?,
-            targets: CachedInputShape::new("targets", &[1, 1]),
-            target_length: CachedInputShape::new("target_length", &[1]),
-            hidden_state: CachedInputShape::new("h_in", &[DECODER_LAYERS, 1, DECODER_HIDDEN_SIZE]),
-            cell_state: CachedInputShape::new("c_in", &[DECODER_LAYERS, 1, DECODER_HIDDEN_SIZE]),
-            decoder_output: CachedOutputKey::new("decoder"),
-            hidden_output: CachedOutputKey::new("h_out"),
-            cell_output: CachedOutputKey::new("c_out"),
+            targets: CachedInputShape::new(decoder_io.targets, &[1, 1]),
+            target_length: CachedInputShape::new(decoder_io.target_length, &[1]),
+            hidden_state: CachedInputShape::new(
+                decoder_io.hidden_in,
+                &[dims.decoder_layers(), 1, dims.decoder_hidden()],
+            ),
+            cell_state: CachedInputShape::new(
+                decoder_io.cell_in,
+                &[dims.decoder_layers(), 1, dims.decoder_hidden()],
+            ),
+            decoder_output: CachedOutputKey::new(decoder_io.decoder),
+            hidden_output: CachedOutputKey::new(decoder_io.hidden_out),
+            cell_output: CachedOutputKey::new(decoder_io.cell_out),
         })
     }
 
@@ -316,18 +337,29 @@ struct JointDecisionCoreMlModel {
     token_id_output: CachedOutputKey,
     token_prob_output: CachedOutputKey,
     duration_output: CachedOutputKey,
+    top_k_ids_output: Option<CachedOutputKey>,
+    top_k_logits_output: Option<CachedOutputKey>,
 }
 
 #[cfg(target_os = "macos")]
 impl JointDecisionCoreMlModel {
-    fn new(path: &Path) -> Result<Self, TranscriptionError> {
+    fn new(path: &Path, io: ModelIo, dims: DecoderDimensions) -> Result<Self, TranscriptionError> {
+        let joint_io = io.joint();
         Ok(Self {
             model: CoreMlModel::new(path)?,
-            encoder_step: CachedInputShape::new("encoder_step", &[1, ENCODER_HIDDEN_SIZE, 1]),
-            decoder_step: CachedInputShape::new("decoder_step", &[1, DECODER_HIDDEN_SIZE, 1]),
-            token_id_output: CachedOutputKey::new("token_id"),
-            token_prob_output: CachedOutputKey::new("token_prob"),
-            duration_output: CachedOutputKey::new("duration"),
+            encoder_step: CachedInputShape::new(
+                joint_io.encoder_step,
+                &[1, dims.encoder_hidden(), 1],
+            ),
+            decoder_step: CachedInputShape::new(
+                joint_io.decoder_step,
+                &[1, dims.decoder_hidden(), 1],
+            ),
+            token_id_output: CachedOutputKey::new(joint_io.token_id),
+            token_prob_output: CachedOutputKey::new(joint_io.token_prob),
+            duration_output: CachedOutputKey::new(joint_io.duration),
+            top_k_ids_output: joint_io.top_k_ids.map(CachedOutputKey::new),
+            top_k_logits_output: joint_io.top_k_logits.map(CachedOutputKey::new),
         })
     }
 
@@ -335,7 +367,7 @@ impl JointDecisionCoreMlModel {
         &self,
         encoder_step: &[f32],
         decoder_step: &[f32],
-    ) -> Result<JointDecision, TranscriptionError> {
+    ) -> Result<JointOutputs, TranscriptionError> {
         self.model.predict_cached(
             &[
                 CachedCoreMlInput::F32 {
@@ -348,10 +380,22 @@ impl JointDecisionCoreMlModel {
                 },
             ],
             |output| {
-                Ok(JointDecision {
+                let top_k_ids = self
+                    .top_k_ids_output
+                    .as_ref()
+                    .map(|key| vector_usize(output, key))
+                    .transpose()?;
+                let top_k_logits = self
+                    .top_k_logits_output
+                    .as_ref()
+                    .map(|key| vector_f32(output, key))
+                    .transpose()?;
+                Ok(JointOutputs {
                     token_id: scalar_usize(output, &self.token_id_output)?,
                     token_prob: scalar_f32(output, &self.token_prob_output)?,
-                    duration_step: scalar_usize(output, &self.duration_output)?,
+                    duration_bin: scalar_usize(output, &self.duration_output)?,
+                    top_k_ids,
+                    top_k_logits,
                 })
             },
         )
@@ -372,14 +416,6 @@ pub(crate) struct SileroVadOutput {
     pub probability: f32,
     pub hidden_state: Vec<f32>,
     pub cell_state: Vec<f32>,
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct JointDecision {
-    pub token_id: usize,
-    pub token_prob: f32,
-    pub duration_step: usize,
 }
 
 #[cfg(target_os = "macos")]
@@ -635,7 +671,7 @@ fn scalar_usize(
     Ok(value as usize)
 }
 
-#[cfg(all(target_os = "macos", feature = "vad"))]
+#[cfg(target_os = "macos")]
 fn vector_f32(
     output: &ProtocolObject<dyn MLFeatureProvider>,
     key: &CachedOutputKey,
@@ -643,4 +679,15 @@ fn vector_f32(
     let array = runtime::output_multi_array(output, &key.key, key.name)?;
     let (data, _) = extract_output(&array)?;
     Ok(data)
+}
+
+#[cfg(target_os = "macos")]
+fn vector_usize(
+    output: &ProtocolObject<dyn MLFeatureProvider>,
+    key: &CachedOutputKey,
+) -> Result<Vec<usize>, TranscriptionError> {
+    Ok(vector_f32(output, key)?
+        .into_iter()
+        .map(|value| value as usize)
+        .collect())
 }
