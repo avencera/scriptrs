@@ -22,8 +22,7 @@ impl Vocabulary {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, TranscriptionError> {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
-        let mut id_to_token = Vec::new();
-        let mut blank_id = None;
+        let mut entries = Vec::new();
 
         for line in reader.lines() {
             let line = line?;
@@ -37,13 +36,10 @@ impl Vocabulary {
             let id: usize = id.parse().map_err(|error| {
                 TranscriptionError::InvalidVocabulary(format!("invalid token id `{id}`: {error}"))
             })?;
-            write_token(&mut id_to_token, id, token);
-            if is_blank_token(token) {
-                blank_id = Some(id);
-            }
+            entries.push((id, token.to_owned()));
         }
 
-        finish(id_to_token, blank_id, MissingBlank::LastToken)
+        finish_entries(entries, MissingBlank::LastToken)
     }
 
     /// Parse a Parakeet JSON tokenizer such as `parakeet_vocab.json`
@@ -144,9 +140,7 @@ fn parse_json_object(
     map: serde_json::Map<String, serde_json::Value>,
 ) -> Result<Vocabulary, TranscriptionError> {
     let keys_are_ids = map.keys().any(|key| key.parse::<usize>().is_ok());
-    let mut id_to_token = Vec::new();
-    let mut blank_id = None;
-
+    let mut entries = Vec::with_capacity(map.len());
     if keys_are_ids {
         for (key, value) in map {
             let id: usize = key.parse().map_err(|error| {
@@ -159,10 +153,7 @@ fn parse_json_object(
                     "tokenizer value for id {id} was not a string"
                 )));
             };
-            write_token(&mut id_to_token, id, token);
-            if is_blank_token(token) {
-                blank_id = Some(id);
-            }
+            entries.push((id, token.to_owned()));
         }
     } else {
         for (token, value) in map {
@@ -170,22 +161,40 @@ fn parse_json_object(
                 TranscriptionError::InvalidVocabulary(format!(
                     "tokenizer id for `{token}` was not an integer"
                 ))
-            })? as usize;
-            write_token(&mut id_to_token, id, &token);
-            if is_blank_token(&token) {
-                blank_id = Some(id);
-            }
+            })?;
+            let id = usize::try_from(id).map_err(|_| {
+                TranscriptionError::InvalidVocabulary(format!(
+                    "tokenizer id for `{token}` was outside the platform range"
+                ))
+            })?;
+            entries.push((id, token));
         }
     }
 
-    finish(id_to_token, blank_id, MissingBlank::VocabSize)
+    finish_entries(entries, MissingBlank::VocabSize)
 }
 
-fn write_token(id_to_token: &mut Vec<String>, id: usize, token: &str) {
-    if id >= id_to_token.len() {
-        id_to_token.resize(id + 1, String::new());
+fn finish_entries(
+    mut entries: Vec<(usize, String)>,
+    missing_blank: MissingBlank,
+) -> Result<Vocabulary, TranscriptionError> {
+    entries.sort_unstable_by_key(|(id, _)| *id);
+
+    let mut id_to_token = Vec::with_capacity(entries.len());
+    let mut blank_id = None;
+    for (expected_id, (id, token)) in entries.into_iter().enumerate() {
+        if id != expected_id {
+            return Err(TranscriptionError::InvalidVocabulary(format!(
+                "tokenizer ids must be contiguous from 0: expected {expected_id}, found {id}"
+            )));
+        }
+        if is_blank_token(&token) {
+            blank_id = Some(id);
+        }
+        id_to_token.push(token);
     }
-    id_to_token[id] = token.to_owned();
+
+    finish(id_to_token, blank_id, missing_blank)
 }
 
 fn finish(
@@ -287,12 +296,22 @@ mod tests {
     }
 
     #[test]
-    fn published_v3_json_shape_blank_is_8192() {
-        let vocab = Vocabulary::from_json_str(r#"{"0":"<unk>","8191":"Œ"}"#)
-            .expect("published v3 tokenizer shape should parse");
-        assert_eq!(vocab.len(), 8192);
-        assert_eq!(vocab.blank_id(), 8192);
-        assert_eq!(vocab.token(8191), Some("Œ"));
-        assert_eq!(vocab.token(8192), None);
+    fn sparse_json_ids_are_rejected_without_placeholder_tokens() {
+        let error = Vocabulary::from_json_str(r#"{"0":"<unk>","8191":"Œ"}"#)
+            .expect_err("sparse tokenizer ids must not create empty placeholders");
+        assert!(matches!(
+            error,
+            crate::error::TranscriptionError::InvalidVocabulary(_)
+        ));
+    }
+
+    #[test]
+    fn sparse_token_to_id_maps_are_rejected() {
+        let error = Vocabulary::from_json_str(r#"{"<unk>":0,"Œ":8191}"#)
+            .expect_err("sparse token-to-id maps must be rejected at the parser boundary");
+        assert!(matches!(
+            error,
+            crate::error::TranscriptionError::InvalidVocabulary(_)
+        ));
     }
 }

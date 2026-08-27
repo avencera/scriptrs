@@ -48,6 +48,17 @@ pub enum TranscriptionError {
         /// Number of bins owned by the deployment
         len: usize,
     },
+    /// A transcription or long-form setting did not match its deployment
+    #[error("invalid transcription configuration: {0}")]
+    InvalidConfiguration(String),
+    /// A language candidate logit was not finite
+    #[error("language candidate logit at index {index} was not finite: {value}")]
+    InvalidLanguageLogit {
+        /// Candidate index
+        index: usize,
+        /// Invalid candidate value
+        value: f32,
+    },
     /// File system I/O failed
     #[error(transparent)]
     Io(#[from] std::io::Error),

@@ -237,11 +237,13 @@ impl LanguageSelection {
 ///
 /// `languages` and `logits` are parallel. Entries whose language is not in the
 /// allowlist are ignored, so automatic detection cannot leave the typed set.
+/// Non-finite logits are rejected.
 pub fn select_language_from_logits(
     languages: &[ParakeetLanguage],
     logits: &[f32],
     allowlist: &[ParakeetLanguage],
-) -> Option<ParakeetLanguage> {
+) -> Result<Option<ParakeetLanguage>, TranscriptionError> {
+    validate_candidate_logits(logits)?;
     let count = languages.len().min(logits.len());
     let mut best_language = None;
     let mut best_logit = f32::NEG_INFINITY;
@@ -251,15 +253,12 @@ pub fn select_language_from_logits(
             continue;
         }
         let logit = logits[index];
-        if !logit.is_finite() {
-            continue;
-        }
         if best_language.is_none() || logit > best_logit {
             best_logit = logit;
             best_language = Some(language);
         }
     }
-    best_language
+    Ok(best_language)
 }
 
 /// Detect a language token inside decoded ids, limited to `allowlist`
@@ -285,17 +284,19 @@ pub fn detect_language_from_tokens(
 /// Pick the highest-logit top-K token whose script matches `language`
 ///
 /// Blank tokens are never replaced. Returned probability is softmax over the
-/// supplied top-K logits only, not the full vocabulary.
+/// supplied top-K logits only, not the full vocabulary. Non-finite logits are
+/// rejected.
 pub fn filter_top_k_language(
     top_k_ids: &[usize],
     top_k_logits: &[f32],
     vocabulary: &Vocabulary,
     language: ParakeetLanguage,
     blank_id: usize,
-) -> Option<FilteredToken> {
+) -> Result<Option<FilteredToken>, TranscriptionError> {
+    validate_candidate_logits(top_k_logits)?;
     let count = top_k_ids.len().min(top_k_logits.len());
     if count == 0 {
-        return None;
+        return Ok(None);
     }
 
     let preferred_script = language.script();
@@ -318,7 +319,9 @@ pub fn filter_top_k_language(
             best_idx = Some(index);
         }
     }
-    let best_idx = best_idx?;
+    let Some(best_idx) = best_idx else {
+        return Ok(None);
+    };
 
     let mut max_logit = f32::NEG_INFINITY;
     for logit in top_k_logits.iter().copied().take(count) {
@@ -327,10 +330,10 @@ pub fn filter_top_k_language(
         }
     }
     if !max_logit.is_finite() {
-        return Some(FilteredToken {
+        return Ok(Some(FilteredToken {
             token_id: top_k_ids[best_idx],
             probability: 0.0,
-        });
+        }));
     }
 
     let mut sum_exp = 0.0f32;
@@ -338,17 +341,26 @@ pub fn filter_top_k_language(
         sum_exp += (logit - max_logit).exp();
     }
     if sum_exp <= 0.0 {
-        return Some(FilteredToken {
+        return Ok(Some(FilteredToken {
             token_id: top_k_ids[best_idx],
             probability: 0.0,
-        });
+        }));
     }
 
     let probability = ((top_k_logits[best_idx] - max_logit).exp() / sum_exp).clamp(0.0, 1.0);
-    Some(FilteredToken {
+    Ok(Some(FilteredToken {
         token_id: top_k_ids[best_idx],
         probability,
-    })
+    }))
+}
+
+pub(crate) fn validate_candidate_logits(logits: &[f32]) -> Result<(), TranscriptionError> {
+    for (index, value) in logits.iter().copied().enumerate() {
+        if !value.is_finite() {
+            return Err(TranscriptionError::InvalidLanguageLogit { index, value });
+        }
+    }
+    Ok(())
 }
 
 fn token_matches_script(token: &str, script: Script) -> bool {
@@ -460,8 +472,33 @@ mod tests {
             &languages,
             &logits,
             &[ParakeetLanguage::English, ParakeetLanguage::Polish],
-        );
+        )
+        .unwrap();
         assert_eq!(selected, Some(ParakeetLanguage::Polish));
+    }
+
+    #[test]
+    fn non_finite_language_logits_are_rejected() {
+        let languages = [ParakeetLanguage::English];
+        let logits = [f32::NAN];
+        assert!(matches!(
+            select_language_from_logits(&languages, &logits, &languages),
+            Err(TranscriptionError::InvalidLanguageLogit { index: 0, value })
+                if value.is_nan()
+        ));
+
+        let vocabulary = vocab(&["<unk>", "cat", "<blk>"]);
+        assert!(matches!(
+            filter_top_k_language(
+                &[1],
+                &[f32::INFINITY],
+                &vocabulary,
+                ParakeetLanguage::English,
+                2,
+            ),
+            Err(TranscriptionError::InvalidLanguageLogit { index: 0, value })
+                if value.is_infinite()
+        ));
     }
 
     #[test]
@@ -474,6 +511,7 @@ mod tests {
             ParakeetLanguage::Polish,
             5,
         )
+        .unwrap()
         .unwrap();
         assert_eq!(filtered.token_id, 3);
     }
@@ -488,6 +526,7 @@ mod tests {
             ParakeetLanguage::Russian,
             3,
         )
+        .unwrap()
         .unwrap();
         assert_eq!(filtered.token_id, 2);
     }

@@ -92,6 +92,12 @@ impl LongFormConfig {
             overlap: OverlapChunkConfig::from_deployment(deployment),
         }
     }
+
+    /// Validate all settings against the deployment that owns the pipeline
+    pub fn validate_for(&self, deployment: &ParakeetDeployment) -> Result<(), TranscriptionError> {
+        self.transcription.validate_for(deployment)?;
+        self.overlap.validate_for(deployment)
+    }
 }
 
 /// Long-form planning mode
@@ -172,6 +178,7 @@ impl LongFormTranscriptionPipeline {
         audio: &[f32],
         config: &LongFormConfig,
     ) -> Result<TranscriptionResult, TranscriptionError> {
+        config.validate_for(self.inner.deployment())?;
         if audio.is_empty() {
             return Err(TranscriptionError::EmptyAudio);
         }
@@ -316,8 +323,14 @@ impl LongFormTranscriptionPipeline {
                             break;
                         }
 
-                        let result = transcribe_task(&pipeline, &preparer, audio, &tasks[task_idx])
-                            .map(|raw| CompletedTask { task_idx, raw });
+                        let result = transcribe_task(
+                            &pipeline,
+                            &preparer,
+                            audio,
+                            &tasks[task_idx],
+                            transcription.language,
+                        )
+                        .map(|raw| CompletedTask { task_idx, raw });
                         if sender.send(result).is_err() {
                             break;
                         }
@@ -604,9 +617,15 @@ fn transcribe_task(
     preparer: &ChunkPreparer,
     audio: &[f32],
     task: &ChunkTask,
+    language: crate::language::LanguageSelection,
 ) -> Result<RawTranscription, TranscriptionError> {
     let prepared = preparer.prepare(&audio[task.audio_start..task.audio_end])?;
-    pipeline.transcribe_prepared_raw(prepared, task.global_sample_offset, task.context_samples)
+    pipeline.transcribe_prepared_raw(
+        prepared,
+        task.global_sample_offset,
+        task.context_samples,
+        language,
+    )
 }
 
 fn parallel_worker_count(task_count: usize, requested_workers: usize) -> usize {
@@ -696,6 +715,7 @@ mod tests {
     #[cfg(feature = "vad")]
     use super::{ChunkTaskKind, SampleRange, build_region_plan};
     use super::{LongFormConfig, LongFormMode, RegionTaskKind, parallel_worker_count};
+    use crate::deployment::ParakeetDeployment;
 
     #[cfg(feature = "vad")]
     #[test]
@@ -782,5 +802,14 @@ mod tests {
         assert!(matches!(plan.regions[0].kind, RegionTaskKind::Overlap));
         assert_eq!(plan.regions[0].task_indices.len(), plan.tasks.len());
         assert!(!plan.tasks.is_empty());
+    }
+
+    #[test]
+    fn long_form_config_rejects_overlap_above_deployment_limit() {
+        let deployment = ParakeetDeployment::v3();
+        let mut config = LongFormConfig::from_deployment(&deployment);
+        config.overlap.max_model_samples = deployment.hard_sample_max() + 1;
+
+        assert!(config.validate_for(&deployment).is_err());
     }
 }

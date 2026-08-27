@@ -2,6 +2,7 @@
 use crate::constants::VAD_WINDOW_SAMPLES;
 use crate::constants::{SAMPLE_RATE, SAMPLES_PER_ENCODER_FRAME};
 use crate::deployment::ParakeetDeployment;
+use crate::error::TranscriptionError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SampleRange {
@@ -103,6 +104,41 @@ impl OverlapChunkConfig {
             context_samples: deployment.frontend().samples_per_encoder_frame(),
             max_model_samples: deployment.hard_sample_max(),
         }
+    }
+
+    /// Validate overlap settings against the deployment hard maximum
+    pub fn validate_for(&self, deployment: &ParakeetDeployment) -> Result<(), TranscriptionError> {
+        if self.max_model_samples > deployment.hard_sample_max() {
+            return Err(TranscriptionError::InvalidConfiguration(format!(
+                "overlap max_model_samples={} exceeds deployment hard sample maximum {}",
+                self.max_model_samples,
+                deployment.hard_sample_max()
+            )));
+        }
+        if self.context_samples > deployment.hard_sample_max() {
+            return Err(TranscriptionError::InvalidConfiguration(format!(
+                "overlap context_samples={} exceeds deployment hard sample maximum {}",
+                self.context_samples,
+                deployment.hard_sample_max()
+            )));
+        }
+        if !self.overlap_seconds.is_finite() || self.overlap_seconds < 0.0 {
+            return Err(TranscriptionError::InvalidConfiguration(format!(
+                "overlap overlap_seconds={} must be finite and non-negative",
+                self.overlap_seconds
+            )));
+        }
+
+        let max_overlap_seconds =
+            deployment.hard_sample_max() as f64 / deployment.frontend().sample_rate() as f64;
+        if self.overlap_seconds > max_overlap_seconds {
+            return Err(TranscriptionError::InvalidConfiguration(format!(
+                "overlap overlap_seconds={} exceeds deployment hard duration {max_overlap_seconds}",
+                self.overlap_seconds
+            )));
+        }
+
+        Ok(())
     }
 
     pub(crate) fn chunk_samples(&self) -> usize {
@@ -471,5 +507,29 @@ mod tests {
         });
         assert!(chunks.len() > 1);
         assert!(chunks[1].start < chunks[0].end);
+    }
+
+    #[test]
+    fn overlap_rejects_a_maximum_above_the_deployment_hard_limit() {
+        let deployment = ParakeetDeployment::v3();
+        let mut config = OverlapChunkConfig::from_deployment(&deployment);
+        config.max_model_samples = deployment.hard_sample_max() + 1;
+
+        let error = config
+            .validate_for(&deployment)
+            .expect_err("overlap must not exceed the deployment hard maximum");
+        assert!(matches!(
+            error,
+            crate::error::TranscriptionError::InvalidConfiguration(_)
+        ));
+    }
+
+    #[test]
+    fn overlap_rejects_a_duration_above_the_deployment_hard_limit() {
+        let deployment = ParakeetDeployment::v3();
+        let mut config = OverlapChunkConfig::from_deployment(&deployment);
+        config.overlap_seconds = 16.0;
+
+        assert!(config.validate_for(&deployment).is_err());
     }
 }

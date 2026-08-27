@@ -138,13 +138,17 @@ impl ParakeetSplitCoreMlModel {
                 )));
             }
         };
-        let time_steps = outputs
+        let time_steps = match outputs
             .get(encoder_io.output_length)
             .and_then(|tensor| tensor.data.first())
             .copied()
-            .map(|value| value as usize)
-            .filter(|value| *value > 0)
-            .unwrap_or_else(|| encoder.shape()[2]);
+        {
+            Some(value) => {
+                let value = f32_to_usize(value, encoder_io.output_length)?;
+                if value > 0 { value } else { encoder.shape()[2] }
+            }
+            None => encoder.shape()[2],
+        };
         Ok((encoder, time_steps))
     }
 
@@ -662,13 +666,7 @@ fn scalar_usize(
     key: &CachedOutputKey,
 ) -> Result<usize, TranscriptionError> {
     let value = scalar_f32(output, key)?;
-    if value < 0.0 {
-        return Err(TranscriptionError::InvalidModelOutput(format!(
-            "scalar `{}` was negative: {value}",
-            key.name
-        )));
-    }
-    Ok(value as usize)
+    f32_to_usize(value, key.name)
 }
 
 #[cfg(target_os = "macos")]
@@ -686,8 +684,48 @@ fn vector_usize(
     output: &ProtocolObject<dyn MLFeatureProvider>,
     key: &CachedOutputKey,
 ) -> Result<Vec<usize>, TranscriptionError> {
-    Ok(vector_f32(output, key)?
+    vector_f32(output, key)?
         .into_iter()
-        .map(|value| value as usize)
-        .collect())
+        .map(|value| f32_to_usize(value, key.name))
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn f32_to_usize(value: f32, name: &str) -> Result<usize, TranscriptionError> {
+    if !value.is_finite() {
+        return Err(TranscriptionError::InvalidModelOutput(format!(
+            "CoreML value `{name}` was not finite: {value}"
+        )));
+    }
+    if value < 0.0 {
+        return Err(TranscriptionError::InvalidModelOutput(format!(
+            "CoreML value `{name}` was negative: {value}"
+        )));
+    }
+    if value.fract() != 0.0 {
+        return Err(TranscriptionError::InvalidModelOutput(format!(
+            "CoreML value `{name}` was not integral: {value}"
+        )));
+    }
+    if value >= usize::MAX as f32 {
+        return Err(TranscriptionError::InvalidModelOutput(format!(
+            "CoreML value `{name}` was outside the usize range: {value}"
+        )));
+    }
+
+    Ok(value as usize)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::f32_to_usize;
+
+    #[test]
+    fn float_to_usize_rejects_non_finite_non_integral_and_out_of_range_values() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1.0, 1.5] {
+            assert!(f32_to_usize(value, "test").is_err(), "value={value}");
+        }
+        assert!(f32_to_usize(usize::MAX as f32, "test").is_err());
+        assert_eq!(f32_to_usize(42.0, "test").unwrap(), 42);
+    }
 }

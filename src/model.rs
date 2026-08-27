@@ -19,7 +19,6 @@ pub(crate) struct ParakeetModel {
     dims: DecoderDimensions,
     deployment: ParakeetDeployment,
     vocabulary: Vocabulary,
-    language: LanguageSelection,
     encoder_input: RefCell<EncoderInputBuffer>,
 }
 
@@ -30,12 +29,11 @@ impl ParakeetModel {
         config: &TranscriptionConfig,
     ) -> Result<Self, TranscriptionError> {
         let deployment = bundle.deployment().clone();
-        let language = deployment.select_language(config.language)?;
+        config.validate_for(&deployment)?;
         Ok(Self {
             inner: ParakeetModelInner::from_bundle(bundle)?,
             blank_id: vocab.blank_id(),
             dims: deployment.decoder_dimensions(),
-            language,
             vocabulary: vocab.clone(),
             encoder_input: RefCell::new(EncoderInputBuffer::new(
                 config.feature_size,
@@ -50,10 +48,12 @@ impl ParakeetModel {
         features: &Array2<f32>,
         feature_frames: usize,
         target_frames: usize,
+        language: LanguageSelection,
     ) -> Result<RawTranscription, TranscriptionError> {
+        let language = self.deployment.select_language(language)?;
         let (encoder_output, time_steps) =
             self.run_encoder(features, feature_frames, target_frames)?;
-        self.greedy_decode(&encoder_output, time_steps)
+        self.greedy_decode(&encoder_output, time_steps, language)
     }
 
     fn run_encoder(
@@ -76,6 +76,7 @@ impl ParakeetModel {
         &self,
         encoder_output: &Array3<f32>,
         time_steps: usize,
+        language: LanguageSelection,
     ) -> Result<RawTranscription, TranscriptionError> {
         let mut state = GreedyDecodeState::new(self.blank_id, self.dims);
 
@@ -86,12 +87,8 @@ impl ParakeetModel {
             let raw_decision = self
                 .inner
                 .run_joint(state.encoder_step(), &cached_decoder.decoder_step)?;
-            let decision = decode_joint_outputs(
-                &raw_decision,
-                &self.deployment,
-                &self.vocabulary,
-                self.language,
-            )?;
+            let decision =
+                decode_joint_outputs(&raw_decision, &self.deployment, &self.vocabulary, language)?;
 
             if decision.token_id != self.blank_id {
                 let cached_decoder = state.take_cached_decoder()?;

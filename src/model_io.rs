@@ -1,6 +1,6 @@
 use crate::deployment::ParakeetDeployment;
 use crate::error::TranscriptionError;
-use crate::language::{LanguageSelection, filter_top_k_language};
+use crate::language::{LanguageSelection, filter_top_k_language, validate_candidate_logits};
 use crate::vocab::Vocabulary;
 
 /// Encoder hidden states that tests can inject without Core ML
@@ -66,6 +66,10 @@ pub fn decode_joint_outputs(
     let mut confidence = outputs.token_prob.clamp(0.0, 1.0);
     let blank_id = vocabulary.blank_id();
 
+    if let Some(top_k_logits) = outputs.top_k_logits.as_deref() {
+        validate_candidate_logits(top_k_logits)?;
+    }
+
     if token_id != blank_id
         && let Some(selected) = language.explicit()
         && let (Some(top_k_ids), Some(top_k_logits)) = (
@@ -73,7 +77,7 @@ pub fn decode_joint_outputs(
             outputs.top_k_logits.as_deref(),
         )
         && let Some(filtered) =
-            filter_top_k_language(top_k_ids, top_k_logits, vocabulary, selected, blank_id)
+            filter_top_k_language(top_k_ids, top_k_logits, vocabulary, selected, blank_id)?
     {
         token_id = filtered.token_id;
         confidence = filtered.probability;
@@ -90,6 +94,7 @@ pub fn decode_joint_outputs(
 mod tests {
     use super::{JointOutputs, decode_joint_outputs};
     use crate::deployment::ParakeetDeployment;
+    use crate::error::TranscriptionError;
     use crate::language::{LanguageSelection, ParakeetLanguage};
     use crate::vocab::Vocabulary;
 
@@ -135,5 +140,46 @@ mod tests {
         .unwrap();
         assert_eq!(decoded.token_id, 1);
         assert_eq!(decoded.duration_frames, 1);
+    }
+
+    #[test]
+    fn joint_decode_rejects_non_finite_language_logits() {
+        let outputs = JointOutputs {
+            token_id: 2,
+            token_prob: 0.95,
+            duration_bin: 1,
+            top_k_ids: Some(vec![2, 1]),
+            top_k_logits: Some(vec![f32::NAN, 3.0]),
+        };
+        let error = decode_joint_outputs(
+            &outputs,
+            &ParakeetDeployment::v3(),
+            &vocab(),
+            LanguageSelection::Language(ParakeetLanguage::Polish),
+        )
+        .expect_err("non-finite top-k logits must not reach softmax");
+        assert!(matches!(
+            error,
+            TranscriptionError::InvalidLanguageLogit { index: 0, value }
+                if value.is_nan()
+        ));
+
+        let outputs = JointOutputs {
+            token_id: 2,
+            token_prob: 0.95,
+            duration_bin: 1,
+            top_k_ids: Some(vec![2, 1]),
+            top_k_logits: Some(vec![3.0, f32::INFINITY]),
+        };
+        assert!(matches!(
+            decode_joint_outputs(
+                &outputs,
+                &ParakeetDeployment::v3(),
+                &vocab(),
+                LanguageSelection::Auto,
+            ),
+            Err(TranscriptionError::InvalidLanguageLogit { index: 1, value })
+                if value.is_infinite()
+        ));
     }
 }

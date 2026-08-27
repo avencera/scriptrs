@@ -85,13 +85,15 @@ impl TranscriptionPipeline {
 
     /// Transcribe a single chunk of audio with an explicit config
     ///
-    /// This is mainly useful if you want to reuse the same pipeline with a
-    /// tweaked [`TranscriptionConfig`] instead of the default frontend settings.
+    /// The configuration must use the same deployment-owned frontend settings
+    /// as this pipeline. Use its language field to select a deployment-supported
+    /// language for this run.
     pub fn run_with_config(
         &self,
         audio: &[f32],
         config: &TranscriptionConfig,
     ) -> Result<TranscriptionResult, TranscriptionError> {
+        config.validate_for(self.deployment())?;
         let raw = self.transcribe_raw(audio, 0, 0, config)?;
         let duration_seconds = audio.len() as f64 / config.sample_rate as f64;
         Ok(self.decoder.decode(&raw, duration_seconds))
@@ -129,7 +131,12 @@ impl TranscriptionPipeline {
         config: &TranscriptionConfig,
     ) -> Result<RawTranscription, TranscriptionError> {
         let prepared = self.prepare_chunk(audio, config)?;
-        self.transcribe_prepared_raw(prepared, global_sample_offset, context_samples)
+        self.transcribe_prepared_raw(
+            prepared,
+            global_sample_offset,
+            context_samples,
+            config.language,
+        )
     }
 
     pub(crate) fn transcribe_prepared_raw(
@@ -137,11 +144,13 @@ impl TranscriptionPipeline {
         prepared: PreparedChunk,
         global_sample_offset: usize,
         context_samples: usize,
+        language: crate::language::LanguageSelection,
     ) -> Result<RawTranscription, TranscriptionError> {
         let mut raw = self.model.transcribe(
             &prepared.features,
             prepared.feature_frames,
             prepared.target_frames,
+            language,
         )?;
         apply_time_offsets(
             &mut raw,
