@@ -170,20 +170,7 @@ impl TranscriptionPipeline {
         audio: &[f32],
         config: &TranscriptionConfig,
     ) -> Result<PreparedChunk, TranscriptionError> {
-        if audio.is_empty() {
-            return Err(TranscriptionError::EmptyAudio);
-        }
-        if audio.len() > config.max_audio_samples {
-            return Err(TranscriptionError::AudioTooLong {
-                max_seconds: config.max_duration_seconds(),
-                actual_seconds: audio.len() as f64 / config.sample_rate as f64,
-            });
-        }
-
-        Ok(PreparedChunk::new(
-            self.extractor.extract(audio)?,
-            config.max_feature_frames(),
-        ))
+        PreparedChunk::from_audio(audio, config, &self.extractor)
     }
 }
 
@@ -195,6 +182,27 @@ pub(crate) struct PreparedChunk {
 }
 
 impl PreparedChunk {
+    fn from_audio(
+        audio: &[f32],
+        config: &TranscriptionConfig,
+        extractor: &ParakeetFeatureExtractor,
+    ) -> Result<Self, TranscriptionError> {
+        if audio.is_empty() {
+            return Err(TranscriptionError::EmptyAudio);
+        }
+        if audio.len() > config.max_audio_samples {
+            return Err(TranscriptionError::AudioTooLong {
+                max_seconds: config.max_duration_seconds(),
+                actual_seconds: audio.len() as f64 / config.sample_rate as f64,
+            });
+        }
+
+        Ok(Self::new(
+            extractor.extract(audio)?,
+            config.max_feature_frames(),
+        ))
+    }
+
     fn new(features: Array2<f32>, target_frames: usize) -> Self {
         let feature_frames = features.shape()[0];
         Self {
@@ -222,20 +230,7 @@ impl ChunkPreparer {
     }
 
     pub(crate) fn prepare(&self, audio: &[f32]) -> Result<PreparedChunk, TranscriptionError> {
-        if audio.is_empty() {
-            return Err(TranscriptionError::EmptyAudio);
-        }
-        if audio.len() > self.config.max_audio_samples {
-            return Err(TranscriptionError::AudioTooLong {
-                max_seconds: self.config.max_duration_seconds(),
-                actual_seconds: audio.len() as f64 / self.config.sample_rate as f64,
-            });
-        }
-
-        Ok(PreparedChunk::new(
-            self.extractor.extract(audio)?,
-            self.config.max_feature_frames(),
-        ))
+        PreparedChunk::from_audio(audio, &self.config, &self.extractor)
     }
 }
 
