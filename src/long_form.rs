@@ -96,7 +96,15 @@ impl LongFormConfig {
     /// Validate all settings against the deployment that owns the pipeline
     pub fn validate_for(&self, deployment: &ParakeetDeployment) -> Result<(), TranscriptionError> {
         self.transcription.validate_for(deployment)?;
-        self.overlap.validate_for(deployment)
+        self.overlap.validate_for(deployment)?;
+
+        #[cfg(feature = "vad")]
+        {
+            self.vad.validate()?;
+            self.segmentation.validate_for(self.vad.default_threshold)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -809,6 +817,35 @@ mod tests {
         let deployment = ParakeetDeployment::v3();
         let mut config = LongFormConfig::from_deployment(&deployment);
         config.overlap.max_model_samples = deployment.hard_sample_max() + 1;
+
+        assert!(config.validate_for(&deployment).is_err());
+    }
+
+    #[cfg(feature = "vad")]
+    #[test]
+    fn long_form_config_rejects_invalid_vad_threshold() {
+        let deployment = ParakeetDeployment::v3();
+        let mut config = LongFormConfig::from_deployment(&deployment);
+        config.vad.default_threshold = f32::NAN;
+
+        assert!(config.validate_for(&deployment).is_err());
+    }
+
+    #[cfg(feature = "vad")]
+    #[test]
+    fn long_form_config_rejects_non_positive_vad_duration() {
+        let deployment = ParakeetDeployment::v3();
+        let mut config = LongFormConfig::from_deployment(&deployment);
+        config.segmentation.min_speech_duration = 0.0;
+
+        assert!(config.validate_for(&deployment).is_err());
+    }
+
+    #[test]
+    fn long_form_config_rejects_zero_model_maximum() {
+        let deployment = ParakeetDeployment::v3();
+        let mut config = LongFormConfig::from_deployment(&deployment);
+        config.overlap.max_model_samples = 0;
 
         assert!(config.validate_for(&deployment).is_err());
     }

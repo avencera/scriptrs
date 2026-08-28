@@ -43,6 +43,23 @@ pub struct JointOutputs {
     pub top_k_logits: Option<Vec<f32>>,
 }
 
+impl JointOutputs {
+    fn validate(&self) -> Result<(), TranscriptionError> {
+        if let (Some(top_k_ids), Some(top_k_logits)) =
+            (self.top_k_ids.as_deref(), self.top_k_logits.as_deref())
+            && top_k_ids.len() != top_k_logits.len()
+        {
+            return Err(TranscriptionError::InvalidModelOutput(format!(
+                "joint top-k id/logit length mismatch: ids={} logits={}",
+                top_k_ids.len(),
+                top_k_logits.len()
+            )));
+        }
+
+        Ok(())
+    }
+}
+
 /// Joint step after duration mapping and optional language filtering
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DecodedJointStep {
@@ -61,6 +78,8 @@ pub fn decode_joint_outputs(
     vocabulary: &Vocabulary,
     language: LanguageSelection,
 ) -> Result<DecodedJointStep, TranscriptionError> {
+    outputs.validate()?;
+
     let duration_frames = deployment.map_duration_bin(outputs.duration_bin)?;
     let mut token_id = outputs.token_id;
     let mut confidence = outputs.token_prob.clamp(0.0, 1.0);
@@ -180,6 +199,31 @@ mod tests {
             ),
             Err(TranscriptionError::InvalidLanguageLogit { index: 1, value })
                 if value.is_infinite()
+        ));
+    }
+
+    #[test]
+    fn joint_decode_rejects_mismatched_top_k_lengths() {
+        let outputs = JointOutputs {
+            token_id: 2,
+            token_prob: 0.95,
+            duration_bin: 1,
+            top_k_ids: Some(vec![2, 1]),
+            top_k_logits: Some(vec![3.0]),
+        };
+
+        let error = decode_joint_outputs(
+            &outputs,
+            &ParakeetDeployment::v3(),
+            &vocab(),
+            LanguageSelection::Language(ParakeetLanguage::Polish),
+        )
+        .expect_err("parallel top-k tensors must have the same length");
+
+        assert!(matches!(
+            error,
+            TranscriptionError::InvalidModelOutput(message)
+                if message.contains("top-k id/logit length mismatch")
         ));
     }
 }

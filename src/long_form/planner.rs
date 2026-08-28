@@ -28,6 +28,13 @@ impl Default for VadConfig {
 }
 
 #[cfg(feature = "vad")]
+impl VadConfig {
+    pub(crate) fn validate(&self) -> Result<(), TranscriptionError> {
+        validate_probability("vad.default_threshold", self.default_threshold)
+    }
+}
+
+#[cfg(feature = "vad")]
 /// Segmentation parameters for converting VAD probabilities into speech regions
 ///
 /// The model hard sample maximum is not stored here. Pass
@@ -67,6 +74,36 @@ impl Default for VadSegmentationConfig {
 
 #[cfg(feature = "vad")]
 impl VadSegmentationConfig {
+    pub(crate) fn validate_for(&self, default_threshold: f32) -> Result<(), TranscriptionError> {
+        validate_probability("vad.default_threshold", default_threshold)?;
+        validate_positive_duration("vad.min_speech_duration", self.min_speech_duration)?;
+        validate_positive_duration("vad.min_silence_duration", self.min_silence_duration)?;
+        validate_positive_duration("vad.speech_padding", self.speech_padding)?;
+        validate_probability(
+            "vad.silence_threshold_for_split",
+            self.silence_threshold_for_split,
+        )?;
+        validate_probability(
+            "vad.negative_threshold_offset",
+            self.negative_threshold_offset,
+        )?;
+        validate_positive_duration(
+            "vad.min_silence_at_max_speech",
+            self.min_silence_at_max_speech,
+        )?;
+
+        if let Some(negative_threshold) = self.negative_threshold {
+            validate_probability("vad.negative_threshold", negative_threshold)?;
+            if negative_threshold > default_threshold {
+                return Err(TranscriptionError::InvalidConfiguration(format!(
+                    "vad.negative_threshold={negative_threshold} exceeds vad.default_threshold={default_threshold}"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn threshold(&self, default_threshold: f32) -> f32 {
         default_threshold
     }
@@ -108,6 +145,11 @@ impl OverlapChunkConfig {
 
     /// Validate overlap settings against the deployment hard maximum
     pub fn validate_for(&self, deployment: &ParakeetDeployment) -> Result<(), TranscriptionError> {
+        if self.max_model_samples == 0 {
+            return Err(TranscriptionError::InvalidConfiguration(
+                "overlap max_model_samples must be positive".to_owned(),
+            ));
+        }
         if self.max_model_samples > deployment.hard_sample_max() {
             return Err(TranscriptionError::InvalidConfiguration(format!(
                 "overlap max_model_samples={} exceeds deployment hard sample maximum {}",
@@ -173,6 +215,28 @@ impl OverlapChunkConfig {
         }
         chunks
     }
+}
+
+#[cfg(feature = "vad")]
+fn validate_probability(field: &str, value: f32) -> Result<(), TranscriptionError> {
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        return Ok(());
+    }
+
+    Err(TranscriptionError::InvalidConfiguration(format!(
+        "{field}={value} must be finite and in the range 0..=1"
+    )))
+}
+
+#[cfg(feature = "vad")]
+fn validate_positive_duration(field: &str, value: f64) -> Result<(), TranscriptionError> {
+    if value.is_finite() && value > 0.0 {
+        return Ok(());
+    }
+
+    Err(TranscriptionError::InvalidConfiguration(format!(
+        "{field}={value} must be finite and positive"
+    )))
 }
 
 #[cfg(feature = "vad")]
@@ -371,6 +435,68 @@ mod tests {
         assert_eq!(segmentation.min_speech_duration, 0.15);
         assert_eq!(segmentation.min_silence_duration, 0.75);
         assert_eq!(segmentation.speech_padding, 0.10);
+    }
+
+    #[cfg(feature = "vad")]
+    #[test]
+    fn vad_rejects_non_finite_or_out_of_range_probabilities() {
+        for threshold in [f32::NAN, -0.01, 1.01] {
+            assert!(
+                VadConfig {
+                    default_threshold: threshold,
+                }
+                .validate()
+                .is_err()
+            );
+        }
+
+        let segmentation = VadSegmentationConfig {
+            silence_threshold_for_split: 1.01,
+            ..VadSegmentationConfig::default()
+        };
+        assert!(segmentation.validate_for(0.85).is_err());
+
+        let segmentation = VadSegmentationConfig {
+            negative_threshold: Some(f32::NAN),
+            ..VadSegmentationConfig::default()
+        };
+        assert!(segmentation.validate_for(0.85).is_err());
+
+        let segmentation = VadSegmentationConfig {
+            negative_threshold_offset: -0.01,
+            ..VadSegmentationConfig::default()
+        };
+        assert!(segmentation.validate_for(0.85).is_err());
+    }
+
+    #[cfg(feature = "vad")]
+    #[test]
+    fn vad_rejects_non_positive_or_non_finite_durations() {
+        for duration in [0.0, -0.1, f64::NAN, f64::INFINITY] {
+            let segmentation = VadSegmentationConfig {
+                min_speech_duration: duration,
+                ..VadSegmentationConfig::default()
+            };
+            assert!(segmentation.validate_for(0.85).is_err());
+
+            let segmentation = VadSegmentationConfig {
+                min_silence_duration: duration,
+                ..VadSegmentationConfig::default()
+            };
+            assert!(segmentation.validate_for(0.85).is_err());
+
+            let segmentation = VadSegmentationConfig {
+                speech_padding: duration,
+                ..VadSegmentationConfig::default()
+            };
+            assert!(segmentation.validate_for(0.85).is_err());
+
+            let segmentation = VadSegmentationConfig {
+                min_silence_at_max_speech: duration,
+                ..VadSegmentationConfig::default()
+            };
+            assert!(segmentation.validate_for(0.85).is_err());
+        }
     }
 
     #[cfg(feature = "vad")]
