@@ -4,6 +4,7 @@ use crate::constants::{
 };
 use crate::error::TranscriptionError;
 use crate::language::{LanguageSelection, ParakeetLanguage, V3_LANGUAGES};
+use crate::vocab::Vocabulary;
 
 const V2_ENCODER: &str = "parakeet-v2/encoder.mlmodelc";
 const V2_DECODER: &str = "parakeet-v2/decoder.mlmodelc";
@@ -14,6 +15,12 @@ const V3_ENCODER: &str = "parakeet-v3/encoder.mlmodelc";
 const V3_DECODER: &str = "parakeet-v3/decoder.mlmodelc";
 const V3_JOINT: &str = "parakeet-v3/joint-decision.mlmodelc";
 const V3_VOCAB: &str = "parakeet-v3/parakeet_vocab.json";
+
+pub(crate) const V2_BLANK_ID: usize = 1_024;
+pub(crate) const V2_VOCAB_TOKEN_COUNT: usize = V2_BLANK_ID + 1;
+pub(crate) const V3_BLANK_ID: usize = 8_192;
+pub(crate) const V3_VOCAB_TOKEN_COUNT: usize = V3_BLANK_ID;
+pub(crate) const V3_LAST_VOCAB_TOKEN: &str = "Œ";
 
 /// Parakeet TDT runtime version
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -294,6 +301,7 @@ pub struct ParakeetDeployment {
     frontend: FrontendSpec,
     decoder: DecoderDimensions,
     languages: &'static [ParakeetLanguage],
+    blank_id: usize,
     hard_sample_max: usize,
     duration_bins: &'static [usize],
     model_io: ModelIo,
@@ -314,6 +322,7 @@ impl ParakeetDeployment {
             frontend: FrontendSpec::parakeet_defaults(),
             decoder: DecoderDimensions::tdt_0_6b(),
             languages: &[ParakeetLanguage::English],
+            blank_id: V2_BLANK_ID,
             hard_sample_max: DEFAULT_HARD_SAMPLE_MAX,
             duration_bins: &DURATION_BINS,
             model_io: ModelIo::v2(),
@@ -334,6 +343,7 @@ impl ParakeetDeployment {
             frontend: FrontendSpec::parakeet_defaults(),
             decoder: DecoderDimensions::tdt_0_6b(),
             languages: V3_LANGUAGES,
+            blank_id: V3_BLANK_ID,
             hard_sample_max: DEFAULT_HARD_SAMPLE_MAX,
             duration_bins: &DURATION_BINS,
             model_io: ModelIo::v3(),
@@ -363,6 +373,63 @@ impl ParakeetDeployment {
     /// Languages this deployment may emit or detect
     pub const fn languages(&self) -> &'static [ParakeetLanguage] {
         self.languages
+    }
+
+    /// RNNT blank token ID emitted by this deployment's joint model
+    pub const fn blank_id(&self) -> usize {
+        self.blank_id
+    }
+
+    /// Validate that a vocabulary matches this deployment's tokenizer contract
+    pub fn validate_vocabulary(&self, vocabulary: &Vocabulary) -> Result<(), TranscriptionError> {
+        if vocabulary.blank_id() != self.blank_id {
+            return Err(TranscriptionError::InvalidVocabulary(format!(
+                "{version:?} deployment requires RNNT blank id {expected}, found {found}",
+                version = self.version,
+                expected = self.blank_id,
+                found = vocabulary.blank_id(),
+            )));
+        }
+
+        let expected_token_count = match self.version {
+            ParakeetVersion::V2 => V2_VOCAB_TOKEN_COUNT,
+            ParakeetVersion::V3 => V3_VOCAB_TOKEN_COUNT,
+        };
+        if vocabulary.len() != expected_token_count {
+            return Err(TranscriptionError::InvalidVocabulary(format!(
+                "{version:?} deployment requires {expected} vocabulary tokens, found {found}",
+                version = self.version,
+                expected = expected_token_count,
+                found = vocabulary.len(),
+            )));
+        }
+
+        match self.version {
+            ParakeetVersion::V2 => {
+                if !matches!(vocabulary.token(self.blank_id), Some("<blk>" | "<blank>")) {
+                    return Err(TranscriptionError::InvalidVocabulary(format!(
+                        "v2 vocabulary must contain `<blk>` or `<blank>` at blank id {}",
+                        self.blank_id
+                    )));
+                }
+            }
+            ParakeetVersion::V3 => {
+                if vocabulary.token(self.blank_id).is_some() {
+                    return Err(TranscriptionError::InvalidVocabulary(format!(
+                        "v3 blank id {} must be one past the tokenizer table",
+                        self.blank_id
+                    )));
+                }
+                if vocabulary.token(self.blank_id - 1) != Some(V3_LAST_VOCAB_TOKEN) {
+                    return Err(TranscriptionError::InvalidVocabulary(format!(
+                        "v3 vocabulary token {} must be `{V3_LAST_VOCAB_TOKEN}`",
+                        self.blank_id - 1
+                    )));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Hard sample maximum owned by this deployment
@@ -440,6 +507,7 @@ mod tests {
     fn v2_layout_keeps_existing_fixture_paths() {
         let deployment = ParakeetDeployment::v2();
         assert_eq!(deployment.version(), ParakeetVersion::V2);
+        assert_eq!(deployment.blank_id(), 1_024);
         assert_eq!(
             deployment.layout().encoder(),
             "parakeet-v2/encoder.mlmodelc"
@@ -466,6 +534,7 @@ mod tests {
     fn v3_layout_uses_json_tokenizer_and_language_set() {
         let deployment = ParakeetDeployment::v3();
         assert_eq!(deployment.version(), ParakeetVersion::V3);
+        assert_eq!(deployment.blank_id(), 8_192);
         assert_eq!(
             deployment.layout().encoder(),
             "parakeet-v3/encoder.mlmodelc"

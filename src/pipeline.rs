@@ -50,7 +50,7 @@ impl TranscriptionPipeline {
     pub fn from_bundle(bundle: ModelBundle) -> Result<Self, TranscriptionError> {
         bundle.validate_base()?;
         let config = TranscriptionConfig::from_deployment(bundle.deployment());
-        let vocab = Vocabulary::load(bundle.vocab_path(), bundle.deployment().vocab_kind())?;
+        let vocab = Vocabulary::load_for_deployment(bundle.vocab_path(), bundle.deployment())?;
         let model = ParakeetModel::from_bundle(&bundle, &vocab, &config)?;
         Ok(Self {
             extractor: ParakeetFeatureExtractor::new(&config),
