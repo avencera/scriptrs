@@ -57,10 +57,12 @@ With the default `online` feature, `scriptrs` can resolve models automatically:
 
 - it downloads the runtime bundle from `avencera/scriptrs-models`
 
-You can override either side of that:
+You can force a local bundle when needed:
 
 - `SCRIPTRS_MODELS_DIR=/path/to/models` forces a local bundle
-- `SCRIPTRS_MODELS_REPO=owner/repo` forces a specific Hugging Face model repo layout
+
+Online downloads use the immutable `5fbef649fc28117307a967e509be696c77b6e521`
+snapshot of `avencera/scriptrs-models`.
 
 ## Local model layout
 

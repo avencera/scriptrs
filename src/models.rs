@@ -3,12 +3,13 @@ use std::path::{Path, PathBuf};
 use crate::deployment::ParakeetDeployment;
 use crate::error::TranscriptionError;
 
+#[cfg(feature = "online")]
+use hf_hub::{Repo, RepoType};
+
 #[cfg(feature = "vad")]
 const VAD_DIR: &str = "vad/silero-vad.mlmodelc";
 #[cfg(feature = "online")]
 const SCRIPTRS_MODELS_DIR_ENV: &str = "SCRIPTRS_MODELS_DIR";
-#[cfg(feature = "online")]
-const SCRIPTRS_MODELS_REPO_ENV: &str = "SCRIPTRS_MODELS_REPO";
 
 /// Resolved model paths for `scriptrs`
 ///
@@ -125,9 +126,8 @@ impl ModelBundle {
     #[cfg(feature = "online")]
     /// Download the v2 Parakeet model bundle from Hugging Face
     ///
-    /// By default this resolves models from `avencera/scriptrs-models`. Set
-    /// `SCRIPTRS_MODELS_DIR` to force a local bundle or `SCRIPTRS_MODELS_REPO`
-    /// to override the Hugging Face repo.
+    /// By default this resolves models from the pinned `avencera/scriptrs-models`
+    /// snapshot. Set `SCRIPTRS_MODELS_DIR` to force a local bundle.
     pub fn from_pretrained() -> Result<Self, hf_hub::api::sync::ApiError> {
         Self::from_pretrained_with_deployment(ParakeetDeployment::v2())
     }
@@ -146,9 +146,8 @@ impl ModelBundle {
     #[cfg(all(feature = "online", feature = "vad"))]
     /// Download the Parakeet and VAD model bundle from Hugging Face
     ///
-    /// By default this resolves models from `avencera/scriptrs-models`. Set
-    /// `SCRIPTRS_MODELS_DIR` to force a local bundle or `SCRIPTRS_MODELS_REPO`
-    /// to override the Hugging Face repo.
+    /// By default this resolves models from the pinned `avencera/scriptrs-models`
+    /// snapshot. Set `SCRIPTRS_MODELS_DIR` to force a local bundle.
     pub fn from_pretrained_long_form() -> Result<Self, hf_hub::api::sync::ApiError> {
         Self::from_pretrained_long_form_with_deployment(ParakeetDeployment::v2())
     }
@@ -166,7 +165,43 @@ impl ModelBundle {
 }
 
 #[cfg(feature = "online")]
-const HF_REPO: &str = "avencera/scriptrs-models";
+const HF_REPO: HuggingFaceRepository = HuggingFaceRepository("avencera/scriptrs-models");
+#[cfg(feature = "online")]
+const HF_REVISION: HuggingFaceRevision =
+    HuggingFaceRevision("5fbef649fc28117307a967e509be696c77b6e521");
+
+#[cfg(feature = "online")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HuggingFaceRepository(&'static str);
+
+#[cfg(feature = "online")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HuggingFaceRevision(&'static str);
+
+#[cfg(feature = "online")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HuggingFaceModelSource {
+    repository: HuggingFaceRepository,
+    revision: HuggingFaceRevision,
+}
+
+#[cfg(feature = "online")]
+impl HuggingFaceModelSource {
+    const fn runtime() -> Self {
+        Self {
+            repository: HF_REPO,
+            revision: HF_REVISION,
+        }
+    }
+
+    fn api_repo(self, api: &hf_hub::api::sync::Api) -> hf_hub::api::sync::ApiRepo {
+        api.repo(Repo::with_revision(
+            self.repository.0.to_owned(),
+            RepoType::Model,
+            self.revision.0.to_owned(),
+        ))
+    }
+}
 
 /// Downloads and caches model bundles from Hugging Face
 ///
@@ -193,9 +228,8 @@ impl ModelManager {
     }
 
     fn from_api(api: hf_hub::api::sync::Api) -> Self {
-        let repo_id = std::env::var(SCRIPTRS_MODELS_REPO_ENV).unwrap_or_else(|_| HF_REPO.into());
         Self {
-            repo: api.model(repo_id),
+            repo: HuggingFaceModelSource::runtime().api_repo(&api),
         }
     }
 
@@ -407,7 +441,10 @@ mod tests {
 
 #[cfg(all(test, feature = "online"))]
 mod online_tests {
-    use super::{ModelBundle, repo_files, snapshot_root_from_cached_file};
+    use super::{
+        HF_REPO, HF_REVISION, HuggingFaceModelSource, ModelBundle, ModelManager, repo_files,
+        snapshot_root_from_cached_file,
+    };
     use crate::deployment::ParakeetDeployment;
     use std::path::Path;
 
@@ -471,6 +508,26 @@ mod online_tests {
         assert_eq!(
             ModelBundle::from_dir("/tmp").deployment().version(),
             crate::deployment::ParakeetVersion::V2
+        );
+    }
+
+    #[test]
+    fn runtime_source_uses_the_published_immutable_revision() {
+        let source = HuggingFaceModelSource::runtime();
+        let api =
+            hf_hub::api::sync::ApiBuilder::from_cache(hf_hub::Cache::new(std::env::temp_dir()))
+                .build()
+                .expect("Hugging Face API should build without credentials");
+        let manager = ModelManager::from_api(api);
+
+        assert_eq!(source.repository, HF_REPO);
+        assert_eq!(source.revision, HF_REVISION);
+        assert_eq!(
+            manager.repo.url("parakeet-v3/parakeet_vocab.json"),
+            format!(
+                "https://huggingface.co/{}/resolve/{}/parakeet-v3/parakeet_vocab.json",
+                HF_REPO.0, HF_REVISION.0
+            )
         );
     }
 }

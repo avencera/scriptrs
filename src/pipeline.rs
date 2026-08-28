@@ -64,9 +64,9 @@ impl TranscriptionPipeline {
     #[cfg(feature = "online")]
     /// Download models and build a transcription pipeline
     ///
-    /// With the default configuration this resolves models from
-    /// `avencera/scriptrs-models` on Hugging Face. Set `SCRIPTRS_MODELS_DIR` to
-    /// force a local bundle or `SCRIPTRS_MODELS_REPO` to override the repo.
+    /// With the default configuration this resolves models from the pinned
+    /// `avencera/scriptrs-models` snapshot on Hugging Face. Set
+    /// `SCRIPTRS_MODELS_DIR` to force a local bundle.
     pub fn from_pretrained() -> Result<Self, TranscriptionError> {
         let bundle = ModelBundle::from_pretrained().map_err(|error| {
             TranscriptionError::CoreMl(format!("model download failed: {error}"))

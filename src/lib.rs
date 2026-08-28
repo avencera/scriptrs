@@ -32,7 +32,7 @@
 //!
 //! With the default `online` feature, [`TranscriptionPipeline::from_pretrained`]
 //! and [`LongFormTranscriptionPipeline::from_pretrained`] download the runtime
-//! bundle from `avencera/scriptrs-models` on Hugging Face.
+//! bundle from a pinned snapshot of `avencera/scriptrs-models` on Hugging Face.
 //!
 //! If you already manage models yourself, use [`TranscriptionPipeline::from_dir`]
 //! or [`LongFormTranscriptionPipeline::from_dir`] with a local bundle layout:
@@ -61,10 +61,9 @@
 //!     silero-vad.mlmodelc/
 //! ```
 //!
-//! You can also override model resolution with environment variables:
+//! You can force local model resolution with an environment variable:
 //!
 //! - `SCRIPTRS_MODELS_DIR=/path/to/models`
-//! - `SCRIPTRS_MODELS_REPO=owner/repo`
 //!
 //! # Input requirements
 //!

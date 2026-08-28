@@ -156,9 +156,9 @@ impl LongFormTranscriptionPipeline {
     #[cfg(feature = "online")]
     /// Download models and build a long-form pipeline
     ///
-    /// With the default configuration this resolves models from
-    /// `avencera/scriptrs-models` on Hugging Face. Set `SCRIPTRS_MODELS_DIR` to
-    /// force a local bundle or `SCRIPTRS_MODELS_REPO` to override the repo.
+    /// With the default configuration this resolves models from the pinned
+    /// `avencera/scriptrs-models` snapshot on Hugging Face. Set
+    /// `SCRIPTRS_MODELS_DIR` to force a local bundle.
     pub fn from_pretrained() -> Result<Self, TranscriptionError> {
         #[cfg(feature = "vad")]
         let bundle = ModelBundle::from_pretrained_long_form().map_err(|error| {
