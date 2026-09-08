@@ -1,29 +1,33 @@
-use std::path::Path;
-
 use crate::constants::{VAD_CONTEXT_SAMPLES, VAD_STATE_SIZE, VAD_WINDOW_SAMPLES};
 #[cfg(target_os = "macos")]
 use crate::coreml::SileroVadCoreMlModel;
 use crate::error::TranscriptionError;
 use crate::long_form::planner::VadConfig;
+use crate::models::{ModelBundle, RuntimeBundle};
+#[cfg(feature = "onnx-cuda")]
+use crate::onnx::SileroOnnxModel;
 
+/// Silero VAD owner: window chunking, context carry-over, tail padding, and
+/// per-recording recurrent state reset
+///
+/// Runtimes only classify one prepared window and advance the opaque state.
 #[derive(Debug, Clone)]
 pub(crate) struct SileroVad {
     model: VadModelInner,
 }
 
 impl SileroVad {
-    pub(crate) fn new(model_path: &Path) -> Result<Self, TranscriptionError> {
-        Ok(Self {
-            model: VadModelInner::new(model_path)?,
-        })
+    /// Load the VAD model a bundle provides, if it provides one
+    pub(crate) fn from_bundle(bundle: &ModelBundle) -> Result<Option<Self>, TranscriptionError> {
+        VadModelInner::from_bundle(bundle).map(|model| model.map(|model| Self { model }))
     }
 
     pub(crate) fn process(
         &self,
         audio: &[f32],
-        config: &VadConfig,
+        _config: &VadConfig,
     ) -> Result<Vec<f32>, TranscriptionError> {
-        self.model.process(audio, config)
+        self.model.process(audio)
     }
 }
 
@@ -31,45 +35,73 @@ impl SileroVad {
 enum VadModelInner {
     #[cfg(target_os = "macos")]
     CoreMl(SileroVadCoreMlModel),
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(feature = "onnx-cuda")]
+    Onnx(SileroOnnxModel),
+    #[cfg(not(any(target_os = "macos", feature = "onnx-cuda")))]
     Unsupported,
 }
 
 impl VadModelInner {
-    fn new(model_path: &Path) -> Result<Self, TranscriptionError> {
-        #[cfg(target_os = "macos")]
-        {
-            Ok(Self::CoreMl(SileroVadCoreMlModel::new(model_path)?))
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = model_path;
-            Err(TranscriptionError::UnsupportedPlatform)
+    fn from_bundle(bundle: &ModelBundle) -> Result<Option<Self>, TranscriptionError> {
+        match bundle.runtime() {
+            RuntimeBundle::CoreMl(layout) => {
+                if !layout.vad_dir().exists() {
+                    return Ok(None);
+                }
+
+                #[cfg(target_os = "macos")]
+                {
+                    Ok(Some(Self::CoreMl(SileroVadCoreMlModel::new(
+                        layout.vad_dir(),
+                    )?)))
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    Err(TranscriptionError::UnsupportedPlatform)
+                }
+            }
+            #[cfg(feature = "onnx-cuda")]
+            RuntimeBundle::OnnxCuda(onnx) => Ok(onnx.vad_model().map(Self::Onnx)),
         }
     }
 
-    fn process(&self, audio: &[f32], _config: &VadConfig) -> Result<Vec<f32>, TranscriptionError> {
+    fn process(&self, audio: &[f32]) -> Result<Vec<f32>, TranscriptionError> {
         match self {
             #[cfg(target_os = "macos")]
-            Self::CoreMl(model) => process_coreml_vad(model, audio),
-            #[cfg(not(target_os = "macos"))]
-            Self::Unsupported => Err(TranscriptionError::UnsupportedPlatform),
+            Self::CoreMl(model) => process_windows(audio, |window, state| {
+                let (hidden_state, cell_state) = state.split_at_mut(VAD_STATE_SIZE);
+                let outputs = model.run(window, hidden_state, cell_state)?;
+                copy_state_vec(&outputs.hidden_state, hidden_state)?;
+                copy_state_vec(&outputs.cell_state, cell_state)?;
+                Ok(outputs.probability)
+            }),
+            #[cfg(feature = "onnx-cuda")]
+            Self::Onnx(model) => process_windows(audio, |window, state| model.run(window, state)),
+            #[cfg(not(any(target_os = "macos", feature = "onnx-cuda")))]
+            Self::Unsupported => {
+                let _ = audio;
+                Err(TranscriptionError::UnsupportedPlatform)
+            }
         }
     }
 }
 
-#[cfg(target_os = "macos")]
-fn process_coreml_vad(
-    model: &SileroVadCoreMlModel,
+/// Run one classifier over every window of a recording
+///
+/// The recurrent state starts at zero for each recording. Each window is
+/// `VAD_CONTEXT_SAMPLES` from the previous chunk followed by one chunk of
+/// `VAD_WINDOW_SAMPLES`; a short final chunk is padded with its last sample.
+#[cfg(any(target_os = "macos", feature = "onnx-cuda"))]
+fn process_windows(
     audio: &[f32],
+    mut classify: impl FnMut(&[f32], &mut [f32]) -> Result<f32, TranscriptionError>,
 ) -> Result<Vec<f32>, TranscriptionError> {
     if audio.is_empty() {
         return Ok(Vec::new());
     }
 
     let mut probabilities = Vec::with_capacity(audio.len().div_ceil(VAD_WINDOW_SAMPLES));
-    let mut hidden_state = vec![0.0f32; VAD_STATE_SIZE];
-    let mut cell_state = vec![0.0f32; VAD_STATE_SIZE];
+    let mut state = vec![0.0f32; 2 * VAD_STATE_SIZE];
     let mut context = vec![0.0f32; VAD_CONTEXT_SAMPLES];
     let mut chunk = vec![0.0f32; VAD_WINDOW_SAMPLES];
     let mut model_input = vec![0.0f32; VAD_WINDOW_SAMPLES + VAD_CONTEXT_SAMPLES];
@@ -87,10 +119,7 @@ fn process_coreml_vad(
         model_input[..VAD_CONTEXT_SAMPLES].copy_from_slice(&context);
         model_input[VAD_CONTEXT_SAMPLES..].copy_from_slice(&chunk);
 
-        let outputs = model.run(&model_input, &hidden_state, &cell_state)?;
-        copy_state_vec(&outputs.hidden_state, &mut hidden_state)?;
-        copy_state_vec(&outputs.cell_state, &mut cell_state)?;
-        probabilities.push(outputs.probability);
+        probabilities.push(classify(&model_input, &mut state)?);
         context.copy_from_slice(&chunk[VAD_WINDOW_SAMPLES - VAD_CONTEXT_SAMPLES..]);
     }
 
@@ -109,12 +138,48 @@ fn copy_state_vec(values: &[f32], state: &mut [f32]) -> Result<(), Transcription
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", feature = "onnx-cuda")))]
 mod tests {
-    use crate::constants::SAMPLE_RATE;
+    use super::process_windows;
+    use crate::constants::{VAD_CONTEXT_SAMPLES, VAD_STATE_SIZE, VAD_WINDOW_SAMPLES};
 
     #[test]
-    fn sample_rate_constant_matches_expected_value() {
-        assert_eq!(SAMPLE_RATE, 16_000);
+    fn windows_carry_context_pad_the_tail_and_start_from_zero_state() {
+        let mut audio = vec![0.0f32; VAD_WINDOW_SAMPLES + 10];
+        audio[VAD_WINDOW_SAMPLES - 1] = 0.5;
+        audio[VAD_WINDOW_SAMPLES + 9] = 0.25;
+
+        let mut seen = Vec::new();
+        let probabilities = process_windows(&audio, |window, state| {
+            seen.push((window.to_vec(), state.to_vec()));
+            state[0] += 1.0;
+            Ok(state[0] / 10.0)
+        })
+        .unwrap();
+
+        assert_eq!(probabilities, vec![0.1, 0.2]);
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].1, vec![0.0; 2 * VAD_STATE_SIZE]);
+        assert_eq!(seen[1].1[0], 1.0);
+
+        // first window has zero context followed by the first chunk
+        assert!(seen[0].0[..VAD_CONTEXT_SAMPLES].iter().all(|v| *v == 0.0));
+        assert_eq!(seen[0].0[VAD_CONTEXT_SAMPLES + VAD_WINDOW_SAMPLES - 1], 0.5);
+
+        // second window starts with the last context samples of the first chunk
+        assert_eq!(seen[1].0[VAD_CONTEXT_SAMPLES - 1], 0.5);
+
+        // short tail is padded with its own last sample
+        assert!(
+            seen[1].0[VAD_CONTEXT_SAMPLES + 9..]
+                .iter()
+                .all(|v| *v == 0.25)
+        );
+    }
+
+    #[test]
+    fn empty_audio_never_invokes_the_classifier() {
+        let probabilities = process_windows(&[], |_, _| panic!("classifier must not run")).unwrap();
+        assert!(probabilities.is_empty());
     }
 }

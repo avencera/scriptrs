@@ -1,7 +1,20 @@
+use ndarray::Array3;
+
 use crate::deployment::ParakeetDeployment;
 use crate::error::TranscriptionError;
 use crate::language::{LanguageSelection, filter_top_k_language, validate_candidate_logits};
 use crate::vocab::Vocabulary;
+
+/// Prediction-network outputs for one token step, shared by every runtime
+#[derive(Debug, Clone)]
+pub(crate) struct DecoderStepOutputs {
+    /// Projected decoder output in `[1, hidden, 1]` order
+    pub decoder_step: Array3<f32>,
+    /// Next LSTM hidden state in `[layers, 1, hidden]` order
+    pub hidden_state: Array3<f32>,
+    /// Next LSTM cell state in `[layers, 1, hidden]` order
+    pub cell_state: Array3<f32>,
+}
 
 /// Encoder hidden states that tests can inject without Core ML
 #[derive(Debug, Clone, PartialEq)]
@@ -44,7 +57,18 @@ pub struct JointOutputs {
 }
 
 impl JointOutputs {
-    fn validate(&self) -> Result<(), TranscriptionError> {
+    /// Reject tensors that cannot come from a well-formed joint head
+    ///
+    /// Every token id, including top-K candidates, must be at most the RNNT
+    /// blank id, which is the last id the joint head can emit.
+    fn validate(&self, blank_id: usize) -> Result<(), TranscriptionError> {
+        if self.token_id > blank_id {
+            return Err(TranscriptionError::InvalidModelOutput(format!(
+                "joint token id {} exceeded blank id {blank_id}",
+                self.token_id
+            )));
+        }
+
         if let (Some(top_k_ids), Some(top_k_logits)) =
             (self.top_k_ids.as_deref(), self.top_k_logits.as_deref())
             && top_k_ids.len() != top_k_logits.len()
@@ -53,6 +77,14 @@ impl JointOutputs {
                 "joint top-k id/logit length mismatch: ids={} logits={}",
                 top_k_ids.len(),
                 top_k_logits.len()
+            )));
+        }
+
+        if let Some(top_k_ids) = self.top_k_ids.as_deref()
+            && let Some(bad) = top_k_ids.iter().find(|id| **id > blank_id)
+        {
+            return Err(TranscriptionError::InvalidModelOutput(format!(
+                "joint top-k id {bad} exceeded blank id {blank_id}"
             )));
         }
 
@@ -78,12 +110,12 @@ pub fn decode_joint_outputs(
     vocabulary: &Vocabulary,
     language: LanguageSelection,
 ) -> Result<DecodedJointStep, TranscriptionError> {
-    outputs.validate()?;
+    let blank_id = vocabulary.blank_id();
+    outputs.validate(blank_id)?;
 
     let duration_frames = deployment.map_duration_bin(outputs.duration_bin)?;
     let mut token_id = outputs.token_id;
     let mut confidence = outputs.token_prob.clamp(0.0, 1.0);
-    let blank_id = vocabulary.blank_id();
 
     if let Some(top_k_logits) = outputs.top_k_logits.as_deref() {
         validate_candidate_logits(top_k_logits)?;
@@ -199,6 +231,47 @@ mod tests {
             ),
             Err(TranscriptionError::InvalidLanguageLogit { index: 1, value })
                 if value.is_infinite()
+        ));
+    }
+
+    #[test]
+    fn joint_decode_rejects_token_ids_past_the_blank() {
+        let outputs = JointOutputs {
+            token_id: 5,
+            token_prob: 0.9,
+            duration_bin: 1,
+            top_k_ids: None,
+            top_k_logits: None,
+        };
+        let error = decode_joint_outputs(
+            &outputs,
+            &ParakeetDeployment::v3(),
+            &vocab(),
+            LanguageSelection::Auto,
+        )
+        .expect_err("token id past the blank cannot come from the joint head");
+        assert!(matches!(
+            error,
+            TranscriptionError::InvalidModelOutput(message)
+                if message.contains("token id 5 exceeded blank id 4")
+        ));
+
+        let outputs = JointOutputs {
+            token_id: 2,
+            token_prob: 0.9,
+            duration_bin: 1,
+            top_k_ids: Some(vec![2, 9]),
+            top_k_logits: Some(vec![1.0, 0.5]),
+        };
+        assert!(matches!(
+            decode_joint_outputs(
+                &outputs,
+                &ParakeetDeployment::v3(),
+                &vocab(),
+                LanguageSelection::Language(ParakeetLanguage::Polish),
+            ),
+            Err(TranscriptionError::InvalidModelOutput(message))
+                if message.contains("top-k id 9 exceeded blank id 4")
         ));
     }
 

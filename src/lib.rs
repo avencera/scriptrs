@@ -3,10 +3,11 @@
 
 //! Rust transcription with native CoreML Parakeet v2 and v3 inference
 //!
-//! `scriptrs` is currently a narrow macOS-first transcription crate:
+//! `scriptrs` is currently a narrow transcription crate:
 //!
-//! - macOS only
-//! - CoreML only
+//! - CoreML on macOS by default
+//! - ONNX Runtime with the CUDA execution provider behind the `onnx-cuda`
+//!   feature, using a local manifest-described bundle
 //! - Parakeet TDT v2 and v3
 //! - mono 16kHz `&[f32]` input
 //!
@@ -64,6 +65,30 @@
 //! You can force local model resolution with an environment variable:
 //!
 //! - `SCRIPTRS_MODELS_DIR=/path/to/models`
+//!
+//! # ONNX/CUDA bundles
+//!
+//! With the `onnx-bundle` feature, validate a local bundle with
+//! [`validate_onnx_bundle`]. With the `onnx-cuda` feature, open it with
+//! [`OnnxCudaBundle::open`] and pass it to [`ModelBundle::from_onnx_cuda`].
+//! The bundle directory holds `manifest.json` plus exactly the graphs and
+//! tokenizer the manifest declares; see `docs/onnx-cuda-bundle.md` for the
+//! manifest schema and graph tensor contract. Opening never downloads
+//! anything and never falls back to the CPU provider:
+//!
+//! ```no_run
+//! # #[cfg(feature = "onnx-cuda")]
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use scriptrs::{CudaDevice, ModelBundle, OnnxCudaBundle, ParakeetDeployment, TranscriptionPipeline};
+//!
+//! let bundle = OnnxCudaBundle::open("bundles/parakeet-v3", ParakeetDeployment::v3(), CudaDevice::new(0))?;
+//! let pipeline = TranscriptionPipeline::from_bundle(ModelBundle::from_onnx_cuda(bundle))?;
+//! # let _ = pipeline;
+//! # Ok(())
+//! # }
+//! # #[cfg(not(feature = "onnx-cuda"))]
+//! # fn main() {}
+//! ```
 //!
 //! # Input requirements
 //!
@@ -141,6 +166,8 @@ mod model;
 mod model_io;
 mod models;
 mod pipeline;
+#[cfg(feature = "long-form")]
+mod preprocessing;
 mod types;
 mod vocab;
 
@@ -149,6 +176,9 @@ mod coreml;
 
 #[cfg(feature = "long-form")]
 mod long_form;
+
+#[cfg(feature = "onnx-bundle")]
+mod onnx;
 
 pub use config::TranscriptionConfig;
 pub use deployment::{
@@ -170,6 +200,23 @@ pub use model_io::{DecodedJointStep, EncoderOutputs, JointOutputs, decode_joint_
 pub use models::ModelBundle;
 #[cfg(feature = "online")]
 pub use models::ModelManager;
+#[cfg(feature = "onnx-bundle")]
+pub use onnx::{
+    BundlePath, BundlePathError, DigestParseError, ExportIdentity, FileAsset, GitRevision,
+    GitRevisionParseError, GraphAsset, GraphKind, MANIFEST_FILE_NAME, ManifestDeployment,
+    ManifestSchema, OnnxBundleError, OnnxBundleManifest, OnnxBundleValidation,
+    PARAKEET_BUNDLE_SCHEMA, ParakeetGraphContract, ParakeetGraphs, Sha256Digest,
+    SileroGraphContract, SourceCheckpoint, TokenizerAsset, TokenizerFormat, VadAsset,
+    validate_onnx_bundle,
+};
+#[cfg(feature = "onnx-cuda")]
+pub use onnx::{CudaDevice, OnnxCudaBundle};
 pub use pipeline::TranscriptionPipeline;
+#[cfg(feature = "long-form")]
+pub use preprocessing::{
+    AudioWindowMut, PreprocessedTranscriptionError, SourceSampleRange, TranscriptionControl,
+    TranscriptionControlError, TranscriptionDeadline, WindowIndex, WindowLimit, WindowLimitError,
+    WindowPreprocessor,
+};
 pub use types::{TimedToken, TranscriptChunk, TranscriptionResult};
 pub use vocab::Vocabulary;

@@ -18,6 +18,26 @@ pub enum TranscriptionError {
         /// The provided audio length in seconds
         actual_seconds: f64,
     },
+    /// A sample was not finite at the transcription preparation boundary
+    #[error("audio sample at index {index} was not finite")]
+    InvalidAudioSample {
+        /// Index of the invalid sample in the validated input or window
+        index: usize,
+    },
+    /// The transcription was cancelled through its shared control state
+    #[error("transcription was cancelled")]
+    Cancelled,
+    /// The transcription's absolute deadline has passed
+    #[error("transcription deadline expired")]
+    DeadlineExpired,
+    /// The planned task count exceeded the request limit
+    #[error("transcription planned {planned} windows, exceeding the limit of {limit}")]
+    WindowLimitExceeded {
+        /// Number of windows in the completed plan
+        planned: usize,
+        /// Maximum number of windows allowed for the request
+        limit: usize,
+    },
     /// Required model assets were missing
     #[error("missing model asset: {path}")]
     MissingModelAsset {
@@ -71,6 +91,14 @@ pub enum TranscriptionError {
     /// CoreML model loading or prediction failed
     #[error("{0}")]
     CoreMl(String),
+    /// An ONNX bundle failed startup validation or session creation
+    #[cfg(feature = "onnx-bundle")]
+    #[error(transparent)]
+    OnnxBundle(#[from] crate::onnx::OnnxBundleError),
+    /// ONNX Runtime inference failed after the bundle was opened
+    #[cfg(feature = "onnx-cuda")]
+    #[error("{0}")]
+    Onnx(String),
     /// The current platform does not support native CoreML inference
     #[error("native CoreML transcription is only supported on macOS")]
     UnsupportedPlatform,

@@ -2,6 +2,9 @@ use std::path::{Path, PathBuf};
 
 use crate::deployment::ParakeetDeployment;
 use crate::error::TranscriptionError;
+#[cfg(feature = "onnx-cuda")]
+use crate::onnx::OnnxCudaBundle;
+use crate::vocab::Vocabulary;
 
 #[cfg(feature = "online")]
 use hf_hub::{Repo, RepoType};
@@ -11,37 +14,47 @@ const VAD_DIR: &str = "vad/silero-vad.mlmodelc";
 #[cfg(feature = "online")]
 const SCRIPTRS_MODELS_DIR_ENV: &str = "SCRIPTRS_MODELS_DIR";
 
-/// Resolved model paths for `scriptrs`
+/// Resolved model bundle for `scriptrs`
+///
+/// A bundle pairs one [`ParakeetDeployment`] with one runtime layout. Core ML
+/// bundles are resolved from a directory with [`Self::from_dir`]; ONNX/CUDA
+/// bundles are opened and validated with [`OnnxCudaBundle::open`] and then
+/// converted with [`Self::from_onnx_cuda`]. The runtime is never inferred
+/// from file extensions or the host platform.
 ///
 /// Most callers will use `TranscriptionPipeline::from_pretrained` or
 /// `TranscriptionPipeline::from_dir` instead of constructing this directly.
 #[derive(Debug, Clone)]
 pub struct ModelBundle {
     root: PathBuf,
+    deployment: ParakeetDeployment,
+    runtime: RuntimeBundle,
+}
+
+/// Runtime-specific asset layout behind a [`ModelBundle`]
+///
+/// The ONNX bundle carries its manifest and session handles, so it is boxed
+/// to keep the Core ML layout small.
+#[derive(Debug, Clone)]
+pub(crate) enum RuntimeBundle {
+    CoreMl(CoreMlLayout),
+    #[cfg(feature = "onnx-cuda")]
+    OnnxCuda(Box<OnnxCudaBundle>),
+}
+
+/// Compiled Core ML asset paths for one deployment
+#[derive(Debug, Clone)]
+pub(crate) struct CoreMlLayout {
     encoder_dir: PathBuf,
     decoder_dir: PathBuf,
     joint_decision_dir: PathBuf,
     vocab_path: PathBuf,
-    deployment: ParakeetDeployment,
     #[cfg(feature = "vad")]
     vad_dir: PathBuf,
 }
 
-impl ModelBundle {
-    /// Resolve the v2 model layout from a local directory
-    ///
-    /// This only resolves paths. File existence is checked later by
-    /// [`Self::validate_base`].
-    pub fn from_dir(models_dir: impl Into<PathBuf>) -> Self {
-        Self::from_dir_with_deployment(models_dir, ParakeetDeployment::v2())
-    }
-
-    /// Resolve model paths using an explicit deployment
-    pub fn from_dir_with_deployment(
-        models_dir: impl Into<PathBuf>,
-        deployment: ParakeetDeployment,
-    ) -> Self {
-        let root = models_dir.into();
+impl CoreMlLayout {
+    fn resolve(root: &Path, deployment: &ParakeetDeployment) -> Self {
         let layout = deployment.layout();
         Self {
             encoder_dir: root.join(layout.encoder()),
@@ -50,18 +63,14 @@ impl ModelBundle {
             vocab_path: root.join(layout.vocab()),
             #[cfg(feature = "vad")]
             vad_dir: root.join(VAD_DIR),
-            deployment,
-            root,
         }
     }
 
-    /// Deployment that owns this bundle's layout and limits
-    pub fn deployment(&self) -> &ParakeetDeployment {
-        &self.deployment
-    }
-
-    /// Validate that the deployment's Parakeet assets are present
-    pub fn validate_base(&self) -> Result<(), TranscriptionError> {
+    fn validate_base(
+        &self,
+        root: &Path,
+        deployment: &ParakeetDeployment,
+    ) -> Result<(), TranscriptionError> {
         let required = [
             self.encoder_dir.as_path(),
             self.decoder_dir.as_path(),
@@ -72,29 +81,17 @@ impl ModelBundle {
             return Ok(());
         };
 
-        let sibling = self.root.join(self.deployment.sibling_vocab_path());
+        let sibling = root.join(deployment.sibling_vocab_path());
         if sibling.exists() {
             return Err(TranscriptionError::LayoutMismatch {
-                expected: self.deployment.version(),
-                found: self.deployment.sibling_version(),
+                expected: deployment.version(),
+                found: deployment.sibling_version(),
             });
         }
 
         Err(TranscriptionError::MissingModelAsset {
             path: missing.to_path_buf(),
         })
-    }
-
-    #[cfg(feature = "vad")]
-    /// Validate that the Parakeet and VAD model assets are present
-    pub fn validate_long_form(&self) -> Result<(), TranscriptionError> {
-        self.validate_base()?;
-        if !self.vad_dir.exists() {
-            return Err(TranscriptionError::MissingModelAsset {
-                path: self.vad_dir.clone(),
-            });
-        }
-        Ok(())
     }
 
     pub(crate) fn encoder_dir(&self) -> &Path {
@@ -109,13 +106,116 @@ impl ModelBundle {
         &self.joint_decision_dir
     }
 
-    pub(crate) fn vocab_path(&self) -> &Path {
-        &self.vocab_path
-    }
-
     #[cfg(feature = "vad")]
     pub(crate) fn vad_dir(&self) -> &Path {
         &self.vad_dir
+    }
+}
+
+impl ModelBundle {
+    /// Resolve the v2 Core ML model layout from a local directory
+    ///
+    /// This only resolves paths. File existence is checked later by
+    /// [`Self::validate_base`].
+    pub fn from_dir(models_dir: impl Into<PathBuf>) -> Self {
+        Self::from_dir_with_deployment(models_dir, ParakeetDeployment::v2())
+    }
+
+    /// Resolve Core ML model paths using an explicit deployment
+    pub fn from_dir_with_deployment(
+        models_dir: impl Into<PathBuf>,
+        deployment: ParakeetDeployment,
+    ) -> Self {
+        let root = models_dir.into();
+        let runtime = RuntimeBundle::CoreMl(CoreMlLayout::resolve(&root, &deployment));
+        Self {
+            root,
+            deployment,
+            runtime,
+        }
+    }
+
+    /// Wrap an already validated ONNX/CUDA bundle
+    ///
+    /// The bundle carried its own validation when it was opened, so
+    /// [`Self::validate_base`] has nothing left to check for this runtime.
+    #[cfg(feature = "onnx-cuda")]
+    pub fn from_onnx_cuda(bundle: OnnxCudaBundle) -> Self {
+        Self {
+            root: bundle.root().to_path_buf(),
+            deployment: bundle.deployment().clone(),
+            runtime: RuntimeBundle::OnnxCuda(Box::new(bundle)),
+        }
+    }
+
+    /// Deployment that owns this bundle's model semantics and limits
+    pub fn deployment(&self) -> &ParakeetDeployment {
+        &self.deployment
+    }
+
+    /// Validate that the deployment's Parakeet assets are present
+    pub fn validate_base(&self) -> Result<(), TranscriptionError> {
+        match &self.runtime {
+            RuntimeBundle::CoreMl(layout) => layout.validate_base(&self.root, &self.deployment),
+            #[cfg(feature = "onnx-cuda")]
+            RuntimeBundle::OnnxCuda(_) => Ok(()),
+        }
+    }
+
+    #[cfg(feature = "vad")]
+    /// Validate that the Parakeet and VAD model assets are present
+    pub fn validate_long_form(&self) -> Result<(), TranscriptionError> {
+        self.validate_base()?;
+        match &self.runtime {
+            RuntimeBundle::CoreMl(layout) if !layout.vad_dir.exists() => {
+                Err(TranscriptionError::MissingModelAsset {
+                    path: layout.vad_dir.clone(),
+                })
+            }
+            RuntimeBundle::CoreMl(_) => Ok(()),
+            #[cfg(feature = "onnx-cuda")]
+            RuntimeBundle::OnnxCuda(bundle) if !bundle.has_vad() => Err(self.missing_vad_error()),
+            #[cfg(feature = "onnx-cuda")]
+            RuntimeBundle::OnnxCuda(_) => Ok(()),
+        }
+    }
+
+    pub(crate) fn runtime(&self) -> &RuntimeBundle {
+        &self.runtime
+    }
+
+    #[cfg(test)]
+    pub(crate) fn vocab_path(&self) -> &Path {
+        match &self.runtime {
+            RuntimeBundle::CoreMl(layout) => &layout.vocab_path,
+            #[cfg(feature = "onnx-cuda")]
+            RuntimeBundle::OnnxCuda(_) => panic!("ONNX bundles retain parsed vocabulary bytes"),
+        }
+    }
+
+    pub(crate) fn vocabulary(&self) -> Result<Vocabulary, TranscriptionError> {
+        match &self.runtime {
+            RuntimeBundle::CoreMl(layout) => {
+                Vocabulary::load_for_deployment(&layout.vocab_path, &self.deployment)
+            }
+            #[cfg(feature = "onnx-cuda")]
+            RuntimeBundle::OnnxCuda(bundle) => Ok(bundle.vocabulary().clone()),
+        }
+    }
+
+    /// Error to return when a VAD run is requested but the bundle has no VAD model
+    #[cfg(feature = "vad")]
+    pub(crate) fn missing_vad_error(&self) -> TranscriptionError {
+        match &self.runtime {
+            RuntimeBundle::CoreMl(layout) => TranscriptionError::MissingModelAsset {
+                path: layout.vad_dir.clone(),
+            },
+            #[cfg(feature = "onnx-cuda")]
+            RuntimeBundle::OnnxCuda(bundle) => crate::onnx::OnnxBundleError::MissingVad {
+                manifest: bundle.manifest_path(),
+            }
+            .into(),
+        }
     }
 
     /// Return the root directory that contains the model bundle
@@ -161,6 +261,13 @@ impl ModelBundle {
             return Ok(Self::from_dir_with_deployment(models_dir, deployment));
         }
         ModelManager::new()?.ensure_with_deployment(deployment, true)
+    }
+}
+
+#[cfg(feature = "onnx-cuda")]
+impl From<OnnxCudaBundle> for ModelBundle {
+    fn from(bundle: OnnxCudaBundle) -> Self {
+        Self::from_onnx_cuda(bundle)
     }
 }
 
@@ -322,7 +429,7 @@ fn snapshot_root_from_cached_file(cached_path: &Path, relative_path: &str) -> Pa
 
 #[cfg(test)]
 mod tests {
-    use super::ModelBundle;
+    use super::{CoreMlLayout, ModelBundle, RuntimeBundle};
     use crate::deployment::{ParakeetDeployment, ParakeetVersion};
     use crate::error::TranscriptionError;
     use std::fs;
@@ -333,6 +440,14 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/models")
     }
 
+    fn coreml_layout(bundle: &ModelBundle) -> &CoreMlLayout {
+        match bundle.runtime() {
+            RuntimeBundle::CoreMl(layout) => layout,
+            #[cfg(feature = "onnx-cuda")]
+            RuntimeBundle::OnnxCuda(_) => panic!("directory bundles resolve Core ML layouts"),
+        }
+    }
+
     #[test]
     fn v2_bundle_resolves_existing_fixture_paths() {
         let bundle = ModelBundle::from_dir(fixture_models());
@@ -341,7 +456,7 @@ mod tests {
             .expect("v2 fixture layout should validate");
         assert_eq!(bundle.deployment().version(), ParakeetVersion::V2);
         assert!(
-            bundle
+            coreml_layout(&bundle)
                 .encoder_dir()
                 .ends_with("parakeet-v2/encoder.mlmodelc")
         );

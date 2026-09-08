@@ -7,7 +7,6 @@ use crate::frontend::ParakeetFeatureExtractor;
 use crate::model::ParakeetModel;
 use crate::models::ModelBundle;
 use crate::types::TranscriptionResult;
-use crate::vocab::Vocabulary;
 use ndarray::Array2;
 
 /// Single-chunk Parakeet transcription pipeline
@@ -50,7 +49,7 @@ impl TranscriptionPipeline {
     pub fn from_bundle(bundle: ModelBundle) -> Result<Self, TranscriptionError> {
         bundle.validate_base()?;
         let config = TranscriptionConfig::from_deployment(bundle.deployment());
-        let vocab = Vocabulary::load_for_deployment(bundle.vocab_path(), bundle.deployment())?;
+        let vocab = bundle.vocabulary()?;
         let model = ParakeetModel::from_bundle(&bundle, &vocab, &config)?;
         Ok(Self {
             extractor: ParakeetFeatureExtractor::new(&config),
