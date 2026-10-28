@@ -4,8 +4,7 @@
 
 `scriptrs` is early and intentionally narrow right now:
 
-- Apple CoreML on macOS by default
-- ONNX Runtime with the CUDA execution provider behind the `onnx-cuda` feature, from a local validated bundle
+- Apple CoreML on macOS
 - Parakeet TDT v2 and v3
 - no other backends
 
@@ -27,44 +26,6 @@ The base crate exposes a single-chunk `TranscriptionPipeline`. Fast long-audio c
 - Other ASR models
 - Streaming transcription
 - Stable public guarantees around model layout or long-form behavior
-
-## ONNX Runtime on CUDA
-
-The `onnx-cuda` feature adds a second runtime behind the same model boundary.
-It loads a local bundle described by `manifest.json`, verifies every file
-digest, checks each graph against the split-graph tensor contract, and runs
-the graphs with the ONNX Runtime CUDA execution provider. The frontend,
-greedy TDT decoder, language filtering, long-form planner, and VAD chunking
-are shared with the CoreML path.
-
-```toml
-[dependencies]
-scriptrs = { version = "0.2.0", default-features = false, features = ["onnx-cuda", "vad"] }
-```
-
-```rust
-use scriptrs::{CudaDevice, ModelBundle, OnnxCudaBundle, ParakeetDeployment, TranscriptionPipeline};
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let bundle = OnnxCudaBundle::open("bundles/parakeet-v3", ParakeetDeployment::v3(), CudaDevice::new(0))?;
-    let pipeline = TranscriptionPipeline::from_bundle(ModelBundle::from_onnx_cuda(bundle))?;
-    let result = pipeline.run(&load_mono_16khz_audio())?;
-
-    println!("{}", result.text);
-    Ok(())
-}
-
-fn load_mono_16khz_audio() -> Vec<f32> {
-    Vec::new()
-}
-```
-
-Opening a bundle never downloads anything and never falls back to the CPU
-provider; a host without a usable CUDA runtime fails at `open`. The manifest
-schema and the exact graph tensor contract are in
-[`docs/onnx-cuda-bundle.md`](docs/onnx-cuda-bundle.md). The feature pins
-`ort = "=2.0.0-rc.12"` (ONNX Runtime 1.24) so it can share one runtime with
-SpeakRS, and it needs Rust 1.88 because of that crate.
 
 ## Install
 

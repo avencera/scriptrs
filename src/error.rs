@@ -91,14 +91,6 @@ pub enum TranscriptionError {
     /// CoreML model loading or prediction failed
     #[error("{0}")]
     CoreMl(String),
-    /// An ONNX bundle failed startup validation or session creation
-    #[cfg(feature = "onnx-bundle")]
-    #[error(transparent)]
-    OnnxBundle(#[from] crate::onnx::OnnxBundleError),
-    /// ONNX Runtime inference failed after the bundle was opened
-    #[cfg(feature = "onnx-cuda")]
-    #[error("{0}")]
-    Onnx(String),
     /// The current platform does not support native CoreML inference
     #[error("native CoreML transcription is only supported on macOS")]
     UnsupportedPlatform,

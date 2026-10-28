@@ -2,8 +2,6 @@ use std::path::{Path, PathBuf};
 
 use crate::deployment::ParakeetDeployment;
 use crate::error::TranscriptionError;
-#[cfg(feature = "onnx-cuda")]
-use crate::onnx::OnnxCudaBundle;
 use crate::vocab::Vocabulary;
 
 #[cfg(feature = "online")]
@@ -17,10 +15,8 @@ const SCRIPTRS_MODELS_DIR_ENV: &str = "SCRIPTRS_MODELS_DIR";
 /// Resolved model bundle for `scriptrs`
 ///
 /// A bundle pairs one [`ParakeetDeployment`] with one runtime layout. Core ML
-/// bundles are resolved from a directory with [`Self::from_dir`]; ONNX/CUDA
-/// bundles are opened and validated with [`OnnxCudaBundle::open`] and then
-/// converted with [`Self::from_onnx_cuda`]. The runtime is never inferred
-/// from file extensions or the host platform.
+/// bundles are resolved from a directory with [`Self::from_dir`]. The runtime
+/// is never inferred from file extensions or the host platform.
 ///
 /// Most callers will use `TranscriptionPipeline::from_pretrained` or
 /// `TranscriptionPipeline::from_dir` instead of constructing this directly.
@@ -32,14 +28,9 @@ pub struct ModelBundle {
 }
 
 /// Runtime-specific asset layout behind a [`ModelBundle`]
-///
-/// The ONNX bundle carries its manifest and session handles, so it is boxed
-/// to keep the Core ML layout small.
 #[derive(Debug, Clone)]
 pub(crate) enum RuntimeBundle {
     CoreMl(CoreMlLayout),
-    #[cfg(feature = "onnx-cuda")]
-    OnnxCuda(Box<OnnxCudaBundle>),
 }
 
 /// Compiled Core ML asset paths for one deployment
@@ -135,19 +126,6 @@ impl ModelBundle {
         }
     }
 
-    /// Wrap an already validated ONNX/CUDA bundle
-    ///
-    /// The bundle carried its own validation when it was opened, so
-    /// [`Self::validate_base`] has nothing left to check for this runtime.
-    #[cfg(feature = "onnx-cuda")]
-    pub fn from_onnx_cuda(bundle: OnnxCudaBundle) -> Self {
-        Self {
-            root: bundle.root().to_path_buf(),
-            deployment: bundle.deployment().clone(),
-            runtime: RuntimeBundle::OnnxCuda(Box::new(bundle)),
-        }
-    }
-
     /// Deployment that owns this bundle's model semantics and limits
     pub fn deployment(&self) -> &ParakeetDeployment {
         &self.deployment
@@ -157,8 +135,6 @@ impl ModelBundle {
     pub fn validate_base(&self) -> Result<(), TranscriptionError> {
         match &self.runtime {
             RuntimeBundle::CoreMl(layout) => layout.validate_base(&self.root, &self.deployment),
-            #[cfg(feature = "onnx-cuda")]
-            RuntimeBundle::OnnxCuda(_) => Ok(()),
         }
     }
 
@@ -173,10 +149,6 @@ impl ModelBundle {
                 })
             }
             RuntimeBundle::CoreMl(_) => Ok(()),
-            #[cfg(feature = "onnx-cuda")]
-            RuntimeBundle::OnnxCuda(bundle) if !bundle.has_vad() => Err(self.missing_vad_error()),
-            #[cfg(feature = "onnx-cuda")]
-            RuntimeBundle::OnnxCuda(_) => Ok(()),
         }
     }
 
@@ -188,8 +160,6 @@ impl ModelBundle {
     pub(crate) fn vocab_path(&self) -> &Path {
         match &self.runtime {
             RuntimeBundle::CoreMl(layout) => &layout.vocab_path,
-            #[cfg(feature = "onnx-cuda")]
-            RuntimeBundle::OnnxCuda(_) => panic!("ONNX bundles retain parsed vocabulary bytes"),
         }
     }
 
@@ -198,8 +168,6 @@ impl ModelBundle {
             RuntimeBundle::CoreMl(layout) => {
                 Vocabulary::load_for_deployment(&layout.vocab_path, &self.deployment)
             }
-            #[cfg(feature = "onnx-cuda")]
-            RuntimeBundle::OnnxCuda(bundle) => Ok(bundle.vocabulary().clone()),
         }
     }
 
@@ -210,11 +178,6 @@ impl ModelBundle {
             RuntimeBundle::CoreMl(layout) => TranscriptionError::MissingModelAsset {
                 path: layout.vad_dir.clone(),
             },
-            #[cfg(feature = "onnx-cuda")]
-            RuntimeBundle::OnnxCuda(bundle) => crate::onnx::OnnxBundleError::MissingVad {
-                manifest: bundle.manifest_path(),
-            }
-            .into(),
         }
     }
 
@@ -261,13 +224,6 @@ impl ModelBundle {
             return Ok(Self::from_dir_with_deployment(models_dir, deployment));
         }
         ModelManager::new()?.ensure_with_deployment(deployment, true)
-    }
-}
-
-#[cfg(feature = "onnx-cuda")]
-impl From<OnnxCudaBundle> for ModelBundle {
-    fn from(bundle: OnnxCudaBundle) -> Self {
-        Self::from_onnx_cuda(bundle)
     }
 }
 
@@ -443,8 +399,6 @@ mod tests {
     fn coreml_layout(bundle: &ModelBundle) -> &CoreMlLayout {
         match bundle.runtime() {
             RuntimeBundle::CoreMl(layout) => layout,
-            #[cfg(feature = "onnx-cuda")]
-            RuntimeBundle::OnnxCuda(_) => panic!("directory bundles resolve Core ML layouts"),
         }
     }
 

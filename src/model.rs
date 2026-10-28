@@ -322,13 +322,9 @@ impl EncoderInputBuffer {
 /// [`ParakeetModel`] and [`GreedyDecodeState`].
 #[derive(Debug, Clone)]
 enum ParakeetModelInner {
-    // boxed: the Core ML model caches input shapes inline and would dwarf the
-    // shared ONNX session handle
     #[cfg(target_os = "macos")]
     SplitCoreMl(Box<crate::coreml::ParakeetSplitCoreMlModel>),
-    #[cfg(feature = "onnx-cuda")]
-    OnnxCuda(crate::onnx::ParakeetOnnxModel),
-    #[cfg(not(any(target_os = "macos", feature = "onnx-cuda")))]
+    #[cfg(not(target_os = "macos"))]
     Unsupported,
 }
 
@@ -354,8 +350,6 @@ impl ParakeetModelInner {
                     Err(TranscriptionError::UnsupportedPlatform)
                 }
             }
-            #[cfg(feature = "onnx-cuda")]
-            RuntimeBundle::OnnxCuda(onnx) => Ok(Self::OnnxCuda(onnx.parakeet_model())),
         }
     }
 
@@ -371,11 +365,7 @@ impl ParakeetModelInner {
             Self::SplitCoreMl(model) => {
                 model.run_encoder(input, feature_size, target_frames, &[feature_frames as i32])
             }
-            #[cfg(feature = "onnx-cuda")]
-            Self::OnnxCuda(model) => {
-                model.run_encoder(input, feature_size, target_frames, feature_frames)
-            }
-            #[cfg(not(any(target_os = "macos", feature = "onnx-cuda")))]
+            #[cfg(not(target_os = "macos"))]
             Self::Unsupported => Err(TranscriptionError::UnsupportedPlatform),
         }
     }
@@ -397,11 +387,7 @@ impl ParakeetModelInner {
                     cell_state: output.cell_state,
                 })
             }
-            #[cfg(feature = "onnx-cuda")]
-            Self::OnnxCuda(model) => model
-                .run_decoder(targets, target_length, hidden_state, cell_state)
-                .map(CachedDecoderStep::from),
-            #[cfg(not(any(target_os = "macos", feature = "onnx-cuda")))]
+            #[cfg(not(target_os = "macos"))]
             Self::Unsupported => Err(TranscriptionError::UnsupportedPlatform),
         }
     }
@@ -414,9 +400,7 @@ impl ParakeetModelInner {
         match self {
             #[cfg(target_os = "macos")]
             Self::SplitCoreMl(model) => model.run_joint(encoder_step, decoder_step),
-            #[cfg(feature = "onnx-cuda")]
-            Self::OnnxCuda(model) => model.run_joint(encoder_step, decoder_step),
-            #[cfg(not(any(target_os = "macos", feature = "onnx-cuda")))]
+            #[cfg(not(target_os = "macos"))]
             Self::Unsupported => Err(TranscriptionError::UnsupportedPlatform),
         }
     }

@@ -4,8 +4,6 @@ use crate::coreml::SileroVadCoreMlModel;
 use crate::error::TranscriptionError;
 use crate::long_form::planner::VadConfig;
 use crate::models::{ModelBundle, RuntimeBundle};
-#[cfg(feature = "onnx-cuda")]
-use crate::onnx::SileroOnnxModel;
 use crate::preprocessing::TranscriptionControl;
 
 /// Silero VAD owner: window chunking, context carry-over, tail padding, and
@@ -37,9 +35,7 @@ impl SileroVad {
 enum VadModelInner {
     #[cfg(target_os = "macos")]
     CoreMl(SileroVadCoreMlModel),
-    #[cfg(feature = "onnx-cuda")]
-    Onnx(SileroOnnxModel),
-    #[cfg(not(any(target_os = "macos", feature = "onnx-cuda")))]
+    #[cfg(not(target_os = "macos"))]
     Unsupported,
 }
 
@@ -62,8 +58,6 @@ impl VadModelInner {
                     Err(TranscriptionError::UnsupportedPlatform)
                 }
             }
-            #[cfg(feature = "onnx-cuda")]
-            RuntimeBundle::OnnxCuda(onnx) => Ok(onnx.vad_model().map(Self::Onnx)),
         }
     }
 
@@ -81,11 +75,7 @@ impl VadModelInner {
                 copy_state_vec(&outputs.cell_state, cell_state)?;
                 Ok(outputs.probability)
             }),
-            #[cfg(feature = "onnx-cuda")]
-            Self::Onnx(model) => {
-                process_windows(audio, control, |window, state| model.run(window, state))
-            }
-            #[cfg(not(any(target_os = "macos", feature = "onnx-cuda")))]
+            #[cfg(not(target_os = "macos"))]
             Self::Unsupported => {
                 let _ = audio;
                 let _ = control;
@@ -100,7 +90,7 @@ impl VadModelInner {
 /// The recurrent state starts at zero for each recording. Each window is
 /// `VAD_CONTEXT_SAMPLES` from the previous chunk followed by one chunk of
 /// `VAD_WINDOW_SAMPLES`; a short final chunk is padded with its last sample.
-#[cfg(any(target_os = "macos", feature = "onnx-cuda"))]
+#[cfg(target_os = "macos")]
 fn process_windows(
     audio: &[f32],
     control: &TranscriptionControl,
@@ -149,7 +139,7 @@ fn copy_state_vec(values: &[f32], state: &mut [f32]) -> Result<(), Transcription
     Ok(())
 }
 
-#[cfg(all(test, any(target_os = "macos", feature = "onnx-cuda")))]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::process_windows;
     use crate::constants::{VAD_CONTEXT_SAMPLES, VAD_STATE_SIZE, VAD_WINDOW_SAMPLES};
