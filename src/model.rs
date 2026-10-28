@@ -71,7 +71,9 @@ enum ParakeetModelInner {
     },
     #[cfg(feature = "cuda")]
     Cuda(crate::cuda::model::CudaModel),
-    #[cfg(not(target_os = "macos"))]
+    // keeps the matches below compiling where no runtime exists
+    #[cfg(not(any(target_os = "macos", feature = "cuda")))]
+    #[expect(dead_code, reason = "from_bundle fails with UnsupportedPlatform first")]
     Unsupported,
 }
 
@@ -120,7 +122,7 @@ impl ParakeetModelInner {
             Self::SplitCoreMl { .. } => false,
             #[cfg(feature = "cuda")]
             Self::Cuda(_) => true,
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", feature = "cuda")))]
             Self::Unsupported => false,
         }
     }
@@ -137,7 +139,7 @@ impl ParakeetModelInner {
             }
             #[cfg(feature = "cuda")]
             Self::Cuda(model) => model.transcribe_chunks(chunks, policy),
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", feature = "cuda")))]
             Self::Unsupported => {
                 let _ = (chunks, policy);
                 Err(TranscriptionError::UnsupportedPlatform)

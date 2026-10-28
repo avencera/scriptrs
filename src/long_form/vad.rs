@@ -36,7 +36,9 @@ impl SileroVad {
 enum VadModelInner {
     #[cfg(target_os = "macos")]
     CoreMl(SileroVadCoreMlModel),
+    // no VAD runtime outside Core ML; keeps the matches below compiling
     #[cfg(not(target_os = "macos"))]
+    #[expect(dead_code, reason = "from_bundle never builds a VAD model off macOS")]
     Unsupported,
 }
 

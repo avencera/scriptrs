@@ -6,9 +6,9 @@ pub(crate) const SAMPLES_PER_ENCODER_FRAME: usize = MEL_HOP_SAMPLES * ENCODER_SU
 pub(crate) const DURATION_BINS: [usize; 5] = [0, 1, 2, 3, 4];
 #[cfg(feature = "vad")]
 pub(crate) const VAD_WINDOW_SAMPLES: usize = 512;
-#[cfg(feature = "vad")]
+#[cfg(all(feature = "vad", target_os = "macos"))]
 pub(crate) const VAD_CONTEXT_SAMPLES: usize = 64;
-#[cfg(feature = "vad")]
+#[cfg(all(feature = "vad", target_os = "macos"))]
 pub(crate) const VAD_STATE_SIZE: usize = 128;
 pub(crate) const SECONDS_PER_ENCODER_FRAME: f64 =
     SAMPLES_PER_ENCODER_FRAME as f64 / SAMPLE_RATE as f64;

@@ -1,8 +1,11 @@
+#[cfg(any(test, target_os = "macos"))]
 use crate::constants::MAX_TOKENS_PER_STEP;
 use crate::deployment::ParakeetDeployment;
 use crate::error::TranscriptionError;
 use crate::language::{LanguageSelection, ParakeetLanguage, Script, token_matches_script};
-use crate::model_io::{DecodedJointStep, JointOutputs, decode_joint_outputs};
+use crate::model_io::DecodedJointStep;
+#[cfg(any(test, target_os = "macos"))]
+use crate::model_io::{JointOutputs, decode_joint_outputs};
 use crate::vocab::Vocabulary;
 
 /// Greedy TDT token rule shared by every backend
@@ -49,6 +52,7 @@ impl<'a> DecodePolicy<'a> {
     ///
     /// Matches NeMo's label-looping `max_symbols`: the cap counts tokens
     /// emitted with duration 0 at one frame, and a blank always advances.
+    #[cfg(any(test, target_os = "macos"))]
     pub(crate) const fn max_symbols_per_frame(&self) -> usize {
         MAX_TOKENS_PER_STEP
     }
@@ -58,6 +62,7 @@ impl<'a> DecodePolicy<'a> {
     }
 
     /// Apply the token rule to one step backend joint output
+    #[cfg(any(test, target_os = "macos"))]
     pub(crate) fn decide(
         &self,
         outputs: &JointOutputs,

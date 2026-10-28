@@ -1,3 +1,4 @@
+#[cfg(any(test, target_os = "macos"))]
 use ndarray::Array3;
 
 use crate::deployment::ParakeetDeployment;
@@ -7,7 +8,8 @@ use crate::language::{
 };
 use crate::vocab::Vocabulary;
 
-/// Prediction-network outputs for one token step, shared by every runtime
+/// Prediction-network outputs for one token step, shared by every step runtime
+#[cfg(any(test, target_os = "macos"))]
 #[derive(Debug, Clone)]
 pub(crate) struct DecoderStepOutputs {
     /// Projected decoder output in `[1, hidden, 1]` order
@@ -58,6 +60,7 @@ pub struct JointOutputs {
 
 impl JointOutputs {
     /// Bind optional parallel top-K tensors into one typed candidate list
+    #[cfg(target_os = "macos")]
     pub(crate) fn bind_top_k(
         ids: Option<Vec<usize>>,
         logits: Option<Vec<f32>>,

@@ -149,14 +149,17 @@ impl CoreMlLayout {
         })
     }
 
+    #[cfg(any(test, target_os = "macos"))]
     pub(crate) fn encoder_dir(&self) -> &Path {
         &self.encoder_dir
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn decoder_dir(&self) -> &Path {
         &self.decoder_dir
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn joint_decision_dir(&self) -> &Path {
         &self.joint_decision_dir
     }
