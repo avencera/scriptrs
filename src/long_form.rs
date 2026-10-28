@@ -4,9 +4,9 @@ mod planner;
 pub(crate) mod vad;
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, sync_channel};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 
 use crate::config::TranscriptionConfig;
@@ -449,7 +449,8 @@ impl LongFormTranscriptionPipeline {
     /// `worker_count` threads prepare windows on the CPU ahead of the model, so the
     /// next batch is ready while the model runs the current one; on a 1 h recording
     /// preparation was 30 % of the wall time when it ran in between, and the first
-    /// batch still waits on it
+    /// batch still waits on it. Workers stay at most one batch ahead of the model,
+    /// which bounds the prepared windows held in memory
     fn run_batched_plan<P: WindowPreprocessor + ?Sized>(
         &self,
         audio: &[f32],
@@ -462,16 +463,14 @@ impl LongFormTranscriptionPipeline {
         let batch_size = config.batch_size;
         let worker_count = parallel_worker_count(tasks.len(), config.worker_count);
         let next_task = AtomicUsize::new(0);
+        let lookahead = Lookahead::new(batch_size);
 
         let raw_tasks = thread::scope(
             |scope| -> Result<Vec<_>, PreprocessedTranscriptionError<P::Error>> {
-                // at most a batch waits beyond those in progress, which bounds host
-                // memory while the model runs
                 let (sender, receiver) = sync_channel(batch_size);
                 for _ in 0..worker_count {
                     let sender = sender.clone();
-                    let next_task = &next_task;
-                    let tasks = &tasks;
+                    let (next_task, lookahead, tasks) = (&next_task, &lookahead, &tasks);
                     scope.spawn(move || {
                         let preparer = TranscriptionPipeline::chunk_preparer(&config.transcription);
                         let preparation = PreparationContext {
@@ -484,6 +483,9 @@ impl LongFormTranscriptionPipeline {
                             let Some(task) = tasks.get(task_idx) else {
                                 break;
                             };
+                            if !lookahead.wait_for(task_idx) {
+                                break;
+                            }
                             let window = prepare_window(&preparation, &preparer, task, task_idx);
                             let failed = window.is_err();
                             // a closed channel means the model side has stopped
@@ -497,33 +499,49 @@ impl LongFormTranscriptionPipeline {
 
                 // windows arrive in any order; batches are cut in plan order, and an
                 // error surfaces when its window is reached, as on the serial path
-                let mut ready = BTreeMap::new();
-                let mut raw_tasks = Vec::with_capacity(tasks.len());
-                for batch_start in (0..tasks.len()).step_by(batch_size) {
-                    let batch_end = (batch_start + batch_size).min(tasks.len());
-                    let mut windows = Vec::with_capacity(batch_end - batch_start);
-                    for task_idx in batch_start..batch_end {
-                        while !ready.contains_key(&task_idx) {
-                            let (done_idx, window) = receiver.recv().map_err(|_| {
-                                TranscriptionError::InvalidModelOutput(format!(
-                                    "long-form window {task_idx} was never prepared"
-                                ))
-                            })?;
-                            ready.insert(done_idx, window);
+                let consume = || -> Result<Vec<_>, PreprocessedTranscriptionError<P::Error>> {
+                    let mut ready = BTreeMap::new();
+                    let mut raw_tasks = Vec::with_capacity(tasks.len());
+                    for batch_start in (0..tasks.len()).step_by(batch_size) {
+                        let batch_end = (batch_start + batch_size).min(tasks.len());
+                        let mut windows = Vec::with_capacity(batch_end - batch_start);
+                        for task_idx in batch_start..batch_end {
+                            while !ready.contains_key(&task_idx) {
+                                let (done_idx, window) = receiver.recv().map_err(|_| {
+                                    TranscriptionError::InvalidModelOutput(format!(
+                                        "long-form window {task_idx} was never prepared"
+                                    ))
+                                })?;
+                                ready.insert(done_idx, window);
+                            }
+                            if let Some(window) = ready.remove(&task_idx) {
+                                windows.push(window?);
+                            }
                         }
-                        if let Some(window) = ready.remove(&task_idx) {
-                            windows.push(window?);
-                        }
-                    }
+                        // the next batch prepares while this one runs
+                        lookahead.allow(batch_end + batch_size);
 
-                    control.check()?;
-                    let raws = self
-                        .inner
-                        .transcribe_prepared_batch(windows, config.transcription.language)?;
-                    raw_tasks.extend(raws.into_iter().map(Some));
-                    control.check()?;
+                        control.check()?;
+                        let raws = self
+                            .inner
+                            .transcribe_prepared_batch(windows, config.transcription.language)?;
+                        raw_tasks.extend(raws.into_iter().map(Some));
+                        control.check()?;
+                    }
+                    Ok(raw_tasks)
+                };
+                let result = consume();
+
+                // the scope joins the workers next: stop them rather than wait for
+                // windows nobody will read, as the parallel path does after an error
+                if let Err(error) = &result
+                    && should_cancel_after_error(error)
+                {
+                    control.cancel();
                 }
-                Ok(raw_tasks)
+                lookahead.stop();
+                drop(receiver);
+                result
             },
         )?;
 
@@ -892,6 +910,54 @@ fn push_overlap_task(
         kind: ChunkTaskKind::Overlap,
     });
     task_idx
+}
+
+/// Lets batched-plan workers prepare a window only while it is less than a bound
+/// ahead of the model, so prepared windows waiting in memory stay bounded however
+/// unevenly the workers finish
+struct Lookahead {
+    /// Windows below this index may be prepared, and whether the model side stopped
+    state: Mutex<(usize, bool)>,
+    changed: Condvar,
+}
+
+impl Lookahead {
+    fn new(allowed: usize) -> Self {
+        Self {
+            state: Mutex::new((allowed, false)),
+            changed: Condvar::new(),
+        }
+    }
+
+    /// Blocks until window `task_idx` may be prepared; false once the model side
+    /// has stopped
+    fn wait_for(&self, task_idx: usize) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            let (allowed, stopped) = *state;
+            if stopped {
+                return false;
+            }
+            if task_idx < allowed {
+                return true;
+            }
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    fn allow(&self, allowed: usize) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.0 = state.0.max(allowed);
+        self.changed.notify_all();
+    }
+
+    fn stop(&self) {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).1 = true;
+        self.changed.notify_all();
+    }
 }
 
 struct TaskContext<'a, P: ?Sized> {
