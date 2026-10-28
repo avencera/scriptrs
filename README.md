@@ -139,6 +139,23 @@ On all 44 Earnings-21 calls (39 h), long-form with the defaults runs at 2500x wi
 8.24 % pooled WER; NeMo transcribing each whole call with local attention scores
 9.58 %.
 
+On harder English audio, long-form with the defaults and English selected has a
+lower WER than Whisper large-v3 (run through WhisperX 3.8.6 in float16) on every
+set:
+
+| Set | Recordings | Hours | scriptrs | Whisper large-v3 |
+|---|---:|---:|---:|---:|
+| Earnings-21 earnings calls | 44 | 39.3 | **8.2 %** | 9.7 % |
+| AMI meetings, headset mix | 34 | 18.7 | **21.5 %** | 23.8 % |
+| AMI meetings, far-field microphone | 34 | 18.7 | **23.2 %** | 28.3 % |
+| EdAcc accented conversations | 40 | 18.2 | **16.0 %** | 19.2 % |
+| CHiME-6 dinner parties | 4 | 9.7 | **44.0 %** | 44.7 % |
+| AppTek call-center calls, 14 accents | 56 | 9.4 | **11.2 %** | 12.6 % |
+| Mean over sets | 212 | 114 | **20.7 %** | 23.1 % |
+
+WER is pooled over each set's recordings, both sides through Whisper's English
+normalizer.
+
 The encoder's matrix multiplies use TF32 tensor cores on Ampere and newer GPUs.
 Older GPUs run them in FP32. For output that matches NeMo's FP32 decode token for
 token, set FP32 on any GPU:
