@@ -50,3 +50,12 @@ pub fn add(a: f32, b: f32) -> f32 {
 pub fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
+
+/// Rounds `value` to the nearest FP16, returned as its bits
+///
+/// Past ±65504 it overflows to infinity, as torch's `half()` does
+#[cfg(feature = "encoder")]
+#[inline(always)]
+pub fn to_f16(value: f32) -> u16 {
+    (value as f16).to_bits()
+}

@@ -47,8 +47,8 @@ pub(crate) enum RuntimeBundle {
 
 /// Arithmetic precision of the CUDA backend's encoder matrix multiplies
 ///
-/// The weights, activations and accumulation stay FP32 either way; decoding always
-/// runs in FP32
+/// The residual stream, the matrix multiplies' outputs and their accumulation stay
+/// FP32 at every precision, and decoding always runs in FP32
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Precision {
@@ -58,6 +58,11 @@ pub enum Precision {
     Tf32,
     /// Full FP32 multiplies, matching NeMo's FP32 decode token for token
     Fp32,
+    /// FP16 weights and operands for the Conformer layers' linear layers, with FP32
+    /// accumulation; the rest of the encoder runs as [`Precision::Tf32`]. FP16 keeps
+    /// TF32's 10-bit mantissa, so the weights take half the memory and the multiplies
+    /// run at the faster FP16 tensor-core rate. Activations past ±65504 would overflow
+    Fp16,
 }
 
 /// Native fp32 weights and vocabulary for one deployment, as
@@ -232,7 +237,8 @@ impl ModelBundle {
     /// Set the precision of the CUDA encoder's matrix multiplies, TF32 by default
     ///
     /// [`Precision::Fp32`] gives up the tensor-core speedup for output that matches
-    /// NeMo's FP32 decode exactly. Core ML bundles ignore it
+    /// NeMo's FP32 decode exactly; [`Precision::Fp16`] is faster still with FP16
+    /// weights. Core ML bundles ignore it
     #[cfg(feature = "cuda")]
     pub fn with_precision(mut self, precision: Precision) -> Self {
         if let RuntimeBundle::Native(layout) = &mut self.runtime {

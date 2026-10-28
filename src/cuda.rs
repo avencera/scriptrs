@@ -5,6 +5,7 @@
 
 pub(crate) mod decoder;
 pub(crate) mod encoder;
+pub(crate) mod fp16;
 pub(crate) mod kernels;
 pub(crate) mod model;
 #[cfg(test)]
@@ -18,6 +19,7 @@ use cudakit::cudarc::driver::{
 };
 use cudakit::{DeviceTensor, Error, Math, Sgemm};
 
+use crate::cuda::encoder::EncoderMath;
 use crate::cuda::kernels::CudaRuntime;
 use crate::error::TranscriptionError;
 use crate::models::Precision;
@@ -141,11 +143,12 @@ impl<T> Drop for HostStaging<T> {
     }
 }
 
-/// The cuBLAS math of a model precision
-pub(crate) fn math(precision: Precision) -> Math {
+/// The encoder GEMM precision of a model precision
+pub(crate) fn math(precision: Precision) -> EncoderMath {
     match precision {
-        Precision::Fp32 => Math::Fp32,
-        Precision::Tf32 => Math::Tf32,
+        Precision::Fp32 => EncoderMath::Single(Math::Fp32),
+        Precision::Tf32 => EncoderMath::Single(Math::Tf32),
+        Precision::Fp16 => EncoderMath::Fp16,
     }
 }
 

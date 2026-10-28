@@ -193,6 +193,17 @@ let bundle = ModelBundle::from_native_dir("models", ParakeetDeployment::v3())
     .with_precision(Precision::Fp32);
 ```
 
+`Precision::Fp16` is faster. It stores the encoder layers' linear weights in FP16,
+which has TF32's 10-bit mantissa, and runs those matrix multiplies on FP16 tensor
+cores with FP32 accumulation. On an RTX 5090 with Parakeet v3:
+
+| | TF32 (default) | FP16 |
+|---|---|---|
+| LibriSpeech test-clean, one utterance at a time | 953x, 1.93 % WER | 1166x, 1.93 % WER |
+| Earnings-21, long-form | 2498x, 8.24 % WER | 3376x, 8.24 % WER |
+
+On LibriSpeech, FP16 produces the same transcripts as TF32.
+
 ## Usage
 
 ### Short audio
