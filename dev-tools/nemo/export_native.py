@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import importlib.metadata
+import inspect
 import importlib.resources
 import json
 import tarfile
@@ -28,7 +30,7 @@ import yaml
 from safetensors.torch import save_file
 
 FORMAT = "scriptrs-native"
-FORMAT_VERSION = "1"
+FORMAT_VERSION = "2"
 
 # checkpoint prefixes the native runtime reads; the preprocessor filterbank and
 # window are kept so the Rust frontend can be checked against NeMo's own buffers
@@ -85,15 +87,45 @@ def tar_member(archive: tarfile.TarFile, suffix: str) -> tarfile.TarInfo:
     return matches[0]
 
 
+def resolved(section: dict, keys: tuple[str, ...]) -> dict:
+    """`keys` of one config section, with absent keys filled from the defaults of the
+    NeMo class that section builds, so the runtime checks the values NeMo really uses"""
+    module_name, class_name = section["_target_"].rsplit(".", 1)
+    parameters = inspect.signature(getattr(importlib.import_module(module_name), class_name)).parameters
+    values = {}
+    for key in keys:
+        if key in section:
+            values[key] = section[key]
+        elif key in parameters and parameters[key].default is not inspect.Parameter.empty:
+            values[key] = parameters[key].default
+        else:
+            raise SystemExit(f"{section['_target_']} has no `{key}` and no default for it")
+    return values
+
+
 def model_config(cfg: dict, version: str) -> dict:
-    """Subset of the NeMo config the native runtime checks before trusting weights"""
+    """The NeMo settings the native runtime checks before trusting the weights
+
+    Includes every setting that changes the numbers at inference, so a checkpoint the
+    runtime does not implement fails at load. Dropout and training-only settings are
+    left out
+    """
     pre, enc, dec, joint = cfg["preprocessor"], cfg["encoder"], cfg["decoder"], cfg["joint"]
     decoding = cfg["decoding"]
+    prednet = dec["prednet"]
+    decoder = resolved(dec, ("vocab_size", "blank_as_pad", "normalization_mode"))
+    decoder.update(
+        pred_hidden=prednet["pred_hidden"],
+        pred_rnn_layers=prednet["pred_rnn_layers"],
+        # RNNTDecoder reads this with `prednet.get("rnn_hidden_size", -1)`; a positive
+        # value other than pred_hidden adds an LSTM projection
+        rnn_hidden_size=prednet.get("rnn_hidden_size", -1),
+    )
     return {
         "version": version,
-        "preprocessor": {
-            key: pre[key]
-            for key in (
+        "preprocessor": resolved(
+            pre,
+            (
                 "sample_rate",
                 "normalize",
                 "window_size",
@@ -105,18 +137,28 @@ def model_config(cfg: dict, version: str) -> dict:
                 "frame_splicing",
                 "pad_to",
                 "pad_value",
-            )
-        },
-        "encoder": {
-            key: enc[key]
-            for key in (
+                "preemph",
+                "mag_power",
+                "log_zero_guard_type",
+                "log_zero_guard_value",
+                "exact_pad",
+                "lowfreq",
+                "highfreq",
+                "mel_norm",
+            ),
+        ),
+        "encoder": resolved(
+            enc,
+            (
                 "feat_in",
+                "feat_out",
                 "n_layers",
                 "d_model",
                 "use_bias",
                 "subsampling",
                 "subsampling_factor",
                 "subsampling_conv_channels",
+                "causal_downsampling",
                 "ff_expansion_factor",
                 "self_attention_model",
                 "n_heads",
@@ -126,17 +168,14 @@ def model_config(cfg: dict, version: str) -> dict:
                 "pos_emb_max_len",
                 "conv_kernel_size",
                 "conv_norm_type",
-            )
-        },
-        "decoder": {
-            "vocab_size": dec["vocab_size"],
-            "blank_as_pad": dec["blank_as_pad"],
-            "pred_hidden": dec["prednet"]["pred_hidden"],
-            "pred_rnn_layers": dec["prednet"]["pred_rnn_layers"],
-        },
+                "conv_context_size",
+                "reduction",
+                "global_tokens",
+            ),
+        ),
+        "decoder": decoder,
         "joint": {
-            "num_classes": joint["num_classes"],
-            "num_extra_outputs": joint["num_extra_outputs"],
+            **resolved(joint, ("num_classes", "num_extra_outputs")),
             "joint_hidden": joint["jointnet"]["joint_hidden"],
             "activation": joint["jointnet"]["activation"],
         },

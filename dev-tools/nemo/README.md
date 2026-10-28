@@ -21,10 +21,12 @@ vad/silero-vad-v5.safetensors
 ```
 
 Tensors keep their NeMo or Silero names and stay fp32. The safetensors metadata
-holds `format`, `format_version`, the source checkpoint and its SHA-256, and the
-model config the runtime checks: `src/native` (the `cuda` feature) refuses a
-file whose config uses an option the native engine does not implement or does
-not match the requested deployment. The vocab files are byte-identical to the
+holds `format`, `format_version` (now `2`), the source checkpoint and its SHA-256,
+and the model config the runtime checks. The config lists every setting that
+changes the numbers at inference, with keys the checkpoint omits filled from the
+NeMo class defaults, so it records what NeMo actually runs. `src/native` (the
+`cuda` feature) refuses a file whose config uses an option the native engine does
+not implement or does not match the requested deployment. The vocab files are byte-identical to the
 published Core ML bundle's.
 
 ## `dump_ref.py`
@@ -32,7 +34,9 @@ published Core ML bundle's.
 Writes `b1` (one 10.4 s utterance) and `b8` (8 utterances, 2.3–25.5 s, zero
 padded) reference sets: the mel, every subsampling stage, all submodules of
 layers 0 and 23, every layer output, the encoder output, a per-step greedy TDT
-trace, and a bf16-autocast encoder output for tolerance scale. `--vad-audio`
+trace, and a bf16-autocast encoder output for tolerance scale. The trace follows
+NeMo's label-looping frame advance (the same rules as `HostLoop`), and generation
+fails unless its tokens and timestamps equal NeMo's batched decode. `--vad-audio`
 adds Silero v5 per-window probabilities. `--long-audio <wav>` writes only
 `long-full` and `long-local`: one 120 s excerpt (from 300 s by default) with full
 attention, then with NeMo's long-form recipe (`rel_pos_local_attn` [256, 256]),

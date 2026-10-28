@@ -10,7 +10,7 @@ use crate::error::TranscriptionError;
 use crate::native::spec::ParakeetSpec;
 
 const FORMAT: &str = "scriptrs-native";
-const FORMAT_VERSION: &str = "1";
+const FORMAT_VERSION: &str = "2";
 
 /// Memory-mapped native weight file written by `dev-tools/nemo/export_native.py`
 ///

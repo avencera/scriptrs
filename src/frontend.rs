@@ -320,22 +320,20 @@ mod tests {
         let samples: Vec<f32> = audio.iter().take(audio_len).copied().collect();
         let features = extractor.extract(&samples).unwrap();
 
-        assert!(
-            features.nrows() >= mel_len,
-            "{} < {mel_len} frames",
-            features.nrows()
-        );
+        // NeMo's tensor carries one padded frame past `mel_len`; the frontend must stop at it
+        assert_eq!(features.nrows(), mel_len, "frame count");
+        assert_eq!(features.ncols(), mel.shape()[1], "mel features");
         let mut max_abs = 0.0f32;
         for frame in 0..mel_len {
-            for bin in 0..128 {
-                let diff = (features[[frame, bin]] - mel[[0, bin, frame]]).abs();
-                max_abs = max_abs.max(diff);
+            for bin in 0..features.ncols() {
+                let value = features[[frame, bin]];
+                assert!(value.is_finite(), "frame {frame} bin {bin} is {value}");
+                max_abs = max_abs.max((value - mel[[0, bin, frame]]).abs());
             }
         }
         assert!(
             max_abs < 1e-4,
-            "max abs mel difference {max_abs} over {mel_len} frames ({} computed)",
-            features.nrows()
+            "max abs mel difference {max_abs} over {mel_len} frames"
         );
     }
 

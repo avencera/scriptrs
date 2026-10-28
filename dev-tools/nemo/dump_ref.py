@@ -103,47 +103,82 @@ class Recorder:
             h.remove()
 
 
+def label_loop(step, length, blank, max_symbols):
+    """Greedy TDT frame advance, as NeMo's label-looping decoder and scriptrs's HostLoop run it
+
+    `step(t, emitted_so_far)` returns `(token, duration)` for one joint evaluation and
+    `label_loop` yields `(t, token, duration)` for each. A blank with duration 0 still
+    advances one frame. A positive duration always advances by exactly that duration.
+    `max_symbols` tokens in a row at one frame force a one-frame advance
+    """
+    t, emitted = 0, 0
+    while t < length:
+        token, duration = step(t, emitted)
+        yield t, token, duration
+        if token != blank:
+            emitted += 1
+        if duration > 0:
+            t += duration
+            emitted = 0
+        elif token == blank or emitted >= max_symbols:
+            t += 1
+            emitted = 0
+
+
+def check_label_loop():
+    """Scripted cases for the edges NeMo's batched decode rarely reaches on real audio"""
+    blank = 99
+
+    def run(script, length, max_symbols=10):
+        script = iter(script)
+        return [(t, tok, dur) for t, tok, dur in label_loop(lambda t, n: next(script), length, blank, max_symbols)]
+
+    # blank with duration 0 advances one frame instead of spinning
+    assert run([(blank, 0), (blank, 0)], 2) == [(0, blank, 0), (1, blank, 0)]
+    # max_symbols zero-duration tokens force the advance
+    steps = run([(1, 0)] * 3 + [(blank, 2)], 3, max_symbols=3)
+    assert [t for t, _, _ in steps] == [0, 0, 0, 1], steps
+    # a positive duration on the last allowed symbol advances by that duration only
+    steps = run([(1, 0), (1, 0), (1, 2), (blank, 1)], 3, max_symbols=3)
+    assert [t for t, _, _ in steps] == [0, 0, 0, 2], steps
+
+
 @torch.no_grad()
 def trace_tdt(model, enc_bt, length):
-    """Reference greedy TDT decode for one utterance, mirroring NeMo GreedyTDTInfer._greedy_decode"""
+    """Per-step reference greedy TDT decode for one utterance, following `label_loop`"""
     dec, joint = model.decoder, model.joint
     durations = list(model.cfg.decoding.durations)
     max_symbols = model.cfg.decoding.greedy.max_symbols
     blank = dec.blank_idx
     enc_proj = joint.project_encoder(enc_bt[:length].unsqueeze(0))  # (1, T, 640)
-    state, last = None, None
-    g = None
-    rec = {k: [] for k in ("t", "label_in", "token", "dur", "pred_out", "logits", "h", "c")}
+    decoder = {"state": None, "last": None}
+    rec = {k: [] for k in ("t", "label_in", "token", "dur", "pred_out", "logits")}
     tokens, stamps, durs = [], [], []
-    t = 0
-    while t < length:
-        symbols = 0
-        need_loop = True
-        while need_loop and symbols < max_symbols:
-            label = torch.tensor([[blank if last is None else last]], device=enc_bt.device)
-            # SOS is the blank index; with blank_as_pad its embedding is zero
-            g_new, state_new = dec.predict(None if last is None else label, state, add_sos=False, batch_size=1)
-            pred_proj = joint.project_prednet(g_new)  # (1, 1, 640)
-            logits = joint.joint_after_projection(enc_proj[:, t : t + 1], pred_proj)[0, 0, 0]
-            tok = int(logits[: -len(durations)].argmax())
-            dk = int(logits[-len(durations) :].argmax())
-            skip = durations[dk]
-            rec["t"].append(t)
-            rec["label_in"].append(blank if last is None else last)
-            rec["token"].append(tok)
-            rec["dur"].append(skip)
-            rec["pred_out"].append(g_new[0, 0].float().cpu())
-            rec["logits"].append(logits.float().cpu())
-            if tok != blank:
-                tokens.append(tok)
-                stamps.append(t)
-                durs.append(skip)
-                state, last = state_new, tok
-            symbols += 1
-            t += skip
-            need_loop = skip == 0
-        if symbols == max_symbols:
-            t += 1
+
+    def step(t, _emitted):
+        last = decoder["last"]
+        label = torch.tensor([[blank if last is None else last]], device=enc_bt.device)
+        # SOS is the blank index; with blank_as_pad its embedding is zero
+        g_new, state_new = dec.predict(None if last is None else label, decoder["state"], add_sos=False, batch_size=1)
+        pred_proj = joint.project_prednet(g_new)  # (1, 1, 640)
+        logits = joint.joint_after_projection(enc_proj[:, t : t + 1], pred_proj)[0, 0, 0]
+        tok = int(logits[: -len(durations)].argmax())
+        skip = durations[int(logits[-len(durations) :].argmax())]
+        rec["label_in"].append(blank if last is None else last)
+        rec["pred_out"].append(g_new[0, 0].float().cpu())
+        rec["logits"].append(logits.float().cpu())
+        if tok != blank:
+            decoder["state"], decoder["last"] = state_new, tok
+        return tok, skip
+
+    for t, tok, skip in label_loop(step, length, blank, max_symbols):
+        rec["t"].append(t)
+        rec["token"].append(tok)
+        rec["dur"].append(skip)
+        if tok != blank:
+            tokens.append(tok)
+            stamps.append(t)
+            durs.append(skip)
     out = {
         "trace.t": torch.tensor(rec["t"], dtype=torch.int32),
         "trace.label_in": torch.tensor(rec["label_in"], dtype=torch.int32),
@@ -185,14 +220,18 @@ def run_set(model, rows, device, audios=None):
     for b, (r, h) in enumerate(zip(rows, hyps)):
         tr = trace_tdt(model, enc[b].transpose(0, 1), int(enc_len[b]))
         nemo_tokens = [int(x) for x in h.y_sequence]
+        nemo_stamps = [int(x) for x in h.timestamp]
         ref_tokens = tr["hyp.tokens"].tolist()
+        # the trace is the reference the native decoders are held to, so it must be NeMo's decode
+        if ref_tokens != nemo_tokens or tr["hyp.timestamps"].tolist() != nemo_stamps:
+            raise SystemExit(f"{r['id']}: per-step trace disagrees with NeMo's batched decode")
         for k, v in tr.items():
             t[f"utt{b}.{k}"] = v
         t[f"utt{b}.nemo_batched.tokens"] = torch.tensor(nemo_tokens, dtype=torch.int32)
+        t[f"utt{b}.nemo_batched.timestamps"] = torch.tensor(nemo_stamps, dtype=torch.int32)
         meta["utterances"].append({
             "index": b, "id": r["id"], "duration_s": r["duration"], "ref_text": r["text"],
             "nemo_text": h.text, "trace_text": model.tokenizer.ids_to_text(ref_tokens),
-            "trace_matches_nemo_batched": ref_tokens == nemo_tokens,
             "trace_steps": len(tr["trace.t"]), "tokens": len(ref_tokens),
         })
 
@@ -272,6 +311,8 @@ def dump_long(model, out, audio_path, offset_s, seconds, device):
     model.change_attention_model(*LOCAL_ATTENTION)
     # chunking only splits the subsampling convs to save memory; numerics are unchanged
     model.change_subsampling_conv_chunking_factor(1)
+    # the swap builds fresh attention modules in training mode, with dropout on
+    model.eval()
     sets["long-local"] = run_set(model, [row], device, [audio])
     for name, (tensors, meta) in sets.items():
         meta["source"] = {"audio": audio_path, "offset_s": offset_s, "seconds": seconds}
@@ -296,6 +337,7 @@ def main():
     ap.add_argument("--long-offset", type=float, default=300.0, help="excerpt start in seconds")
     ap.add_argument("--long-seconds", type=float, default=120.0, help="excerpt length in seconds")
     args = ap.parse_args()
+    check_label_loop()
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     device = "cuda"

@@ -10,7 +10,7 @@ use crate::error::TranscriptionError;
 /// constants. Parsing rejects NeMo options the engines do not implement, so a
 /// checkpoint with biased linears or local attention fails at load instead of
 /// computing a wrong transcript.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ParakeetSpec {
     pub version: ParakeetVersion,
     pub frontend: FrontendConfig,
@@ -24,12 +24,13 @@ pub(crate) struct ParakeetSpec {
 }
 
 /// STFT geometry the checkpoint's mel filterbank was trained with
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct FrontendConfig {
     pub sample_rate: usize,
     pub n_fft: usize,
     pub win_length: usize,
     pub hop_length: usize,
+    pub preemphasis: f32,
 }
 
 /// FastConformer encoder with 8x depthwise-striding subsampling and rel-pos attention
@@ -86,12 +87,23 @@ impl ParakeetSpec {
         pre.expect_bool("log", true)?;
         pre.expect_usize("frame_splicing", 1)?;
         pre.expect_usize("pad_to", 0)?;
+        pre.expect_f32("pad_value", 0.0)?;
+        // the featurizer squares magnitudes, adds 2^-24 before the log and builds a
+        // slaney filterbank from 0 Hz to Nyquist with centered frames
+        pre.expect_f32("mag_power", 2.0)?;
+        pre.expect_str("log_zero_guard_type", "add")?;
+        pre.expect_f32("log_zero_guard_value", 2f32.powi(-24))?;
+        pre.expect_bool("exact_pad", false)?;
+        pre.expect_f32("lowfreq", 0.0)?;
+        pre.expect_null("highfreq")?;
+        pre.expect_str("mel_norm", "slaney")?;
         let sample_rate = pre.usize("sample_rate")?;
         let frontend = FrontendConfig {
             sample_rate,
             n_fft: pre.usize("n_fft")?,
             win_length: pre.seconds_as_samples("window_size", sample_rate)?,
             hop_length: pre.seconds_as_samples("window_stride", sample_rate)?,
+            preemphasis: pre.f64("preemph")? as f32,
         };
 
         let enc = config.object("encoder")?;
@@ -101,6 +113,12 @@ impl ParakeetSpec {
         enc.expect_bool("use_bias", false)?;
         enc.expect_bool("xscaling", false)?;
         enc.expect_bool("untie_biases", true)?;
+        enc.expect_bool("causal_downsampling", false)?;
+        enc.expect_i64("feat_out", -1)?;
+        enc.expect_usize("global_tokens", 0)?;
+        // null resolves to the symmetric `(kernel - 1) / 2` padding the conv module uses
+        enc.expect_null("conv_context_size")?;
+        enc.expect_null("reduction")?;
         let context = enc.array("att_context_size")?;
         if context.len() != 2 || context.iter().any(|value| value.as_i64() != Some(-1)) {
             return Err(invalid(format!(
@@ -147,11 +165,20 @@ impl ParakeetSpec {
 
         let dec = config.object("decoder")?;
         dec.expect_bool("blank_as_pad", true)?;
+        dec.expect_null("normalization_mode")?;
         let predictor = PredictorSpec {
             vocab_size: dec.usize("vocab_size")?,
             hidden: dec.usize("pred_hidden")?,
             layers: dec.usize("pred_rnn_layers")?,
         };
+        // a positive rnn_hidden_size other than pred_hidden adds an LSTM projection
+        let rnn_hidden = dec.i64("rnn_hidden_size")?;
+        if rnn_hidden > 0 && rnn_hidden as usize != predictor.hidden {
+            return Err(invalid(format!(
+                "decoder rnn_hidden_size {rnn_hidden} projects the {} wide LSTM",
+                predictor.hidden
+            )));
+        }
 
         let joint_config = config.object("joint")?;
         joint_config.expect_str("activation", "relu")?;
@@ -260,6 +287,15 @@ impl ParakeetSpec {
             }
         }
 
+        if self.frontend.preemphasis != frontend.preemphasis() {
+            return Err(invalid(format!(
+                "preemphasis is {} in the weights but {} in the {:?} deployment",
+                self.frontend.preemphasis,
+                frontend.preemphasis(),
+                deployment.version()
+            )));
+        }
+
         if self.durations != deployment.duration_bins() {
             return Err(invalid(format!(
                 "durations {:?} differ from the deployment's {:?}",
@@ -308,16 +344,25 @@ impl<'a> Config<'a> {
             .ok_or_else(|| invalid(format!("config `{key}` is not a non-negative integer")))
     }
 
+    fn i64(self, key: &str) -> Result<i64, TranscriptionError> {
+        self.field(key)?
+            .as_i64()
+            .ok_or_else(|| invalid(format!("config `{key}` is not an integer")))
+    }
+
+    fn f64(self, key: &str) -> Result<f64, TranscriptionError> {
+        self.field(key)?
+            .as_f64()
+            .ok_or_else(|| invalid(format!("config `{key}` is not a number")))
+    }
+
     /// NeMo stores STFT windows in seconds; anything off the sample grid is rejected
     fn seconds_as_samples(
         self,
         key: &str,
         sample_rate: usize,
     ) -> Result<usize, TranscriptionError> {
-        let seconds = self
-            .field(key)?
-            .as_f64()
-            .ok_or_else(|| invalid(format!("config `{key}` is not a number")))?;
+        let seconds = self.f64(key)?;
         let samples = seconds * sample_rate as f64;
         let rounded = samples.round();
         if rounded < 1.0 || (samples - rounded).abs() > 1e-6 {
@@ -366,5 +411,142 @@ impl<'a> Config<'a> {
             )));
         }
         Ok(())
+    }
+
+    fn expect_i64(self, key: &str, expected: i64) -> Result<(), TranscriptionError> {
+        let found = self.i64(key)?;
+        if found != expected {
+            return Err(invalid(format!(
+                "config `{key}` is {found}; the native engine implements {expected}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Exact match at the frontend's f32 precision; serde_json's float parsing can
+    /// land one f64 ulp off the value Python wrote
+    fn expect_f32(self, key: &str, expected: f32) -> Result<(), TranscriptionError> {
+        let found = self.f64(key)?;
+        if found as f32 != expected {
+            return Err(invalid(format!(
+                "config `{key}` is {found}; the native engine implements {expected}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn expect_null(self, key: &str) -> Result<(), TranscriptionError> {
+        let found = self.field(key)?;
+        if !found.is_null() {
+            return Err(invalid(format!(
+                "config `{key}` is {found}; the native engine implements only null"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::ParakeetSpec;
+    use crate::deployment::ParakeetDeployment;
+    use crate::error::TranscriptionError;
+
+    /// The config `export_native.py` writes for parakeet-tdt-0.6b-v3
+    fn v3_config() -> Value {
+        json!({
+            "version": "v3",
+            "preprocessor": {
+                "sample_rate": 16000, "normalize": "per_feature", "window_size": 0.025,
+                "window_stride": 0.01, "window": "hann", "features": 128, "n_fft": 512,
+                "log": true, "frame_splicing": 1, "pad_to": 0, "pad_value": 0.0,
+                "preemph": 0.97, "mag_power": 2.0, "log_zero_guard_type": "add",
+                "log_zero_guard_value": 5.960464477539063e-08, "exact_pad": false,
+                "lowfreq": 0, "highfreq": null, "mel_norm": "slaney"
+            },
+            "encoder": {
+                "feat_in": 128, "feat_out": -1, "n_layers": 24, "d_model": 1024,
+                "use_bias": false, "subsampling": "dw_striding", "subsampling_factor": 8,
+                "subsampling_conv_channels": 256, "causal_downsampling": false,
+                "ff_expansion_factor": 4, "self_attention_model": "rel_pos", "n_heads": 8,
+                "att_context_size": [-1, -1], "xscaling": false, "untie_biases": true,
+                "pos_emb_max_len": 5000, "conv_kernel_size": 9, "conv_norm_type": "batch_norm",
+                "conv_context_size": null, "reduction": null, "global_tokens": 0
+            },
+            "decoder": {
+                "vocab_size": 8192, "blank_as_pad": true, "normalization_mode": null,
+                "pred_hidden": 640, "pred_rnn_layers": 2, "rnn_hidden_size": -1
+            },
+            "joint": {
+                "num_classes": 8192, "num_extra_outputs": 5, "joint_hidden": 640,
+                "activation": "relu"
+            },
+            "decoding": { "model_type": "tdt", "durations": [0, 1, 2, 3, 4], "max_symbols": 10 }
+        })
+    }
+
+    fn load(config: &Value) -> Result<ParakeetSpec, TranscriptionError> {
+        let spec = ParakeetSpec::from_config_json(&config.to_string())?;
+        spec.validate_for(&ParakeetDeployment::v3())?;
+        Ok(spec)
+    }
+
+    #[test]
+    fn exported_v3_config_loads_for_v3() {
+        let spec = load(&v3_config()).unwrap();
+        assert_eq!(spec.encoder.layers, 24);
+        assert_eq!(spec.frontend.win_length, 400);
+        assert_eq!(spec.joint.outputs, 8192 + 1 + 5);
+    }
+
+    #[test]
+    fn settings_that_change_the_numbers_are_rejected() {
+        let changes = [
+            ("preprocessor", "preemph", json!(0.0)),
+            ("preprocessor", "mag_power", json!(1.0)),
+            ("preprocessor", "log_zero_guard_type", json!("clamp")),
+            ("preprocessor", "log_zero_guard_value", json!(1e-5)),
+            ("preprocessor", "exact_pad", json!(true)),
+            ("preprocessor", "lowfreq", json!(20)),
+            ("preprocessor", "highfreq", json!(7600)),
+            ("preprocessor", "mel_norm", json!(null)),
+            ("preprocessor", "pad_value", json!(-1.0)),
+            ("preprocessor", "pad_to", json!(16)),
+            ("encoder", "causal_downsampling", json!(true)),
+            ("encoder", "feat_out", json!(512)),
+            ("encoder", "conv_context_size", json!([8, 0])),
+            ("encoder", "reduction", json!("pooling")),
+            ("encoder", "global_tokens", json!(1)),
+            ("encoder", "att_context_size", json!([128, 128])),
+            ("encoder", "use_bias", json!(true)),
+            ("decoder", "normalization_mode", json!("layer")),
+            ("decoder", "rnn_hidden_size", json!(1024)),
+            ("joint", "activation", json!("tanh")),
+            ("decoding", "max_symbols", json!(5)),
+        ];
+        for (section, key, value) in changes {
+            let mut config = v3_config();
+            config[section][key] = value.clone();
+            assert!(
+                matches!(load(&config), Err(TranscriptionError::InvalidWeights(_))),
+                "{section}.{key} = {value} was accepted"
+            );
+
+            let mut config = v3_config();
+            config[section].as_object_mut().unwrap().remove(key);
+            assert!(
+                load(&config).is_err(),
+                "missing {section}.{key} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn rnn_hidden_size_equal_to_pred_hidden_is_no_projection() {
+        let mut config = v3_config();
+        config["decoder"]["rnn_hidden_size"] = json!(640);
+        load(&config).unwrap();
     }
 }
