@@ -15,6 +15,7 @@ path = "src/lib.rs"
 
 # one feature per area: each area is compiled on its own into one PTX file
 [features]
+decode = []
 encoder = []
 
 [dependencies]

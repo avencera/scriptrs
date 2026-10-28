@@ -471,9 +471,9 @@ $L__BB2_9:                              // %bb13.i
 	setp.ne.b64 	%p7, %rd22, %rd102;
 	@%p7 bra 	$L__BB2_9;
 	bra.uni 	$L__BB2_10;
-$L__BB2_10:                             // %_RINvNtCsj8c3sdyj7Tg_21scriptrs_cuda_kernels7encoder12block_reduceNvB2_3addEB4_.exit.loopexit.unr-lcssa.loopexit
+$L__BB2_10:                             // %_RINvNtCsj8c3sdyj7Tg_21scriptrs_cuda_kernels6common12block_reduceNvB2_3addEB4_.exit.loopexit.unr-lcssa.loopexit
 	add.s64 	%rd103, %rd102, 1;
-$L__BB2_11:                             // %_RINvNtCsj8c3sdyj7Tg_21scriptrs_cuda_kernels7encoder12block_reduceNvB2_3addEB4_.exit.loopexit.unr-lcssa
+$L__BB2_11:                             // %_RINvNtCsj8c3sdyj7Tg_21scriptrs_cuda_kernels6common12block_reduceNvB2_3addEB4_.exit.loopexit.unr-lcssa
 	setp.eq.b64 	%p8, %rd104, 0;
 	@%p8 bra 	$L__BB2_14;
 	bra.uni 	$L__BB2_12;
@@ -491,7 +491,7 @@ $L__BB2_13:                             // %bb13.i.epil
 	setp.ne.b64 	%p9, %rd104, 0;
 	@%p9 bra 	$L__BB2_13;
 	bra.uni 	$L__BB2_14;
-$L__BB2_14:                             // %_RINvNtCsj8c3sdyj7Tg_21scriptrs_cuda_kernels7encoder12block_reduceNvB2_3addEB4_.exit
+$L__BB2_14:                             // %_RINvNtCsj8c3sdyj7Tg_21scriptrs_cuda_kernels6common12block_reduceNvB2_3addEB4_.exit
 	cvt.u32.u64 	%r63, %rd115;
 	setp.ge.u32 	%p10, %r63, %r30;
 	bar.sync 	0;
@@ -574,9 +574,9 @@ $L__BB2_23:                             // %bb13.i22
 	setp.ne.b64 	%p16, %rd47, %rd110;
 	@%p16 bra 	$L__BB2_23;
 	bra.uni 	$L__BB2_24;
-$L__BB2_24:                             // %_RINvNtCsj8c3sdyj7Tg_21scriptrs_cuda_kernels7encoder12block_reduceNvB2_3addEB4_.exit29.loopexit.unr-lcssa.loopexit
+$L__BB2_24:                             // %_RINvNtCsj8c3sdyj7Tg_21scriptrs_cuda_kernels6common12block_reduceNvB2_3addEB4_.exit29.loopexit.unr-lcssa.loopexit
 	add.s64 	%rd111, %rd110, 1;
-$L__BB2_25:                             // %_RINvNtCsj8c3sdyj7Tg_21scriptrs_cuda_kernels7encoder12block_reduceNvB2_3addEB4_.exit29.loopexit.unr-lcssa
+$L__BB2_25:                             // %_RINvNtCsj8c3sdyj7Tg_21scriptrs_cuda_kernels6common12block_reduceNvB2_3addEB4_.exit29.loopexit.unr-lcssa
 	setp.eq.b64 	%p17, %rd112, 0;
 	@%p17 bra 	$L__BB2_28;
 	bra.uni 	$L__BB2_26;
@@ -594,7 +594,7 @@ $L__BB2_27:                             // %bb13.i22.epil
 	setp.ne.b64 	%p18, %rd112, 0;
 	@%p18 bra 	$L__BB2_27;
 	bra.uni 	$L__BB2_28;
-$L__BB2_28:                             // %_RINvNtCsj8c3sdyj7Tg_21scriptrs_cuda_kernels7encoder12block_reduceNvB2_3addEB4_.exit29
+$L__BB2_28:                             // %_RINvNtCsj8c3sdyj7Tg_21scriptrs_cuda_kernels6common12block_reduceNvB2_3addEB4_.exit29
 	bar.sync 	0;
 	@%p10 bra 	$L__BB2_34;
 	bra.uni 	$L__BB2_29;
@@ -1033,9 +1033,9 @@ $L__BB4_21:                             // %bb13.i
 	setp.ne.b64 	%p35, %rd34, %rd128;
 	@%p35 bra 	$L__BB4_21;
 	bra.uni 	$L__BB4_22;
-$L__BB4_22:                             // %_RINvNtCsj8c3sdyj7Tg_21scriptrs_cuda_kernels7encoder12block_reduceNvB2_3maxEB4_.exit.loopexit.unr-lcssa.loopexit
+$L__BB4_22:                             // %_RINvNtCsj8c3sdyj7Tg_21scriptrs_cuda_kernels6common12block_reduceNvNtB4_7encoder3maxEB4_.exit.loopexit.unr-lcssa.loopexit
 	add.s64 	%rd129, %rd128, 1;
-$L__BB4_23:                             // %_RINvNtCsj8c3sdyj7Tg_21scriptrs_cuda_kernels7encoder12block_reduceNvB2_3maxEB4_.exit.loopexit.unr-lcssa
+$L__BB4_23:                             // %_RINvNtCsj8c3sdyj7Tg_21scriptrs_cuda_kernels6common12block_reduceNvNtB4_7encoder3maxEB4_.exit.loopexit.unr-lcssa
 	setp.eq.b64 	%p36, %rd130, 0;
 	@%p36 bra 	$L__BB4_26;
 	bra.uni 	$L__BB4_24;
@@ -1056,7 +1056,7 @@ $L__BB4_25:                             // %bb13.i.epil
 	setp.ne.b64 	%p39, %rd130, 0;
 	@%p39 bra 	$L__BB4_25;
 	bra.uni 	$L__BB4_26;
-$L__BB4_26:                             // %_RINvNtCsj8c3sdyj7Tg_21scriptrs_cuda_kernels7encoder12block_reduceNvB2_3maxEB4_.exit
+$L__BB4_26:                             // %_RINvNtCsj8c3sdyj7Tg_21scriptrs_cuda_kernels6common12block_reduceNvNtB4_7encoder3maxEB4_.exit
 	cvt.u32.u64 	%r17, %rd13;
 	bar.sync 	0;
 	setp.ge.u32 	%p40, %r142, %r17;
@@ -1146,9 +1146,9 @@ $L__BB4_34:                             // %bb13.i22
 	setp.ne.b64 	%p45, %rd56, %rd135;
 	@%p45 bra 	$L__BB4_34;
 	bra.uni 	$L__BB4_35;
-$L__BB4_35:                             // %_RINvNtCsj8c3sdyj7Tg_21scriptrs_cuda_kernels7encoder12block_reduceNvB2_3addEB4_.exit.loopexit.unr-lcssa.loopexit
+$L__BB4_35:                             // %_RINvNtCsj8c3sdyj7Tg_21scriptrs_cuda_kernels6common12block_reduceNvB2_3addEB4_.exit.loopexit.unr-lcssa.loopexit
 	add.s64 	%rd136, %rd135, 1;
-$L__BB4_36:                             // %_RINvNtCsj8c3sdyj7Tg_21scriptrs_cuda_kernels7encoder12block_reduceNvB2_3addEB4_.exit.loopexit.unr-lcssa
+$L__BB4_36:                             // %_RINvNtCsj8c3sdyj7Tg_21scriptrs_cuda_kernels6common12block_reduceNvB2_3addEB4_.exit.loopexit.unr-lcssa
 	setp.eq.b64 	%p46, %rd137, 0;
 	@%p46 bra 	$L__BB4_39;
 	bra.uni 	$L__BB4_37;
@@ -1166,7 +1166,7 @@ $L__BB4_38:                             // %bb13.i22.epil
 	setp.ne.b64 	%p47, %rd137, 0;
 	@%p47 bra 	$L__BB4_38;
 	bra.uni 	$L__BB4_39;
-$L__BB4_39:                             // %_RINvNtCsj8c3sdyj7Tg_21scriptrs_cuda_kernels7encoder12block_reduceNvB2_3addEB4_.exit
+$L__BB4_39:                             // %_RINvNtCsj8c3sdyj7Tg_21scriptrs_cuda_kernels6common12block_reduceNvB2_3addEB4_.exit
 	bar.sync 	0;
 	@%p40 bra 	$L__BB4_42;
 	bra.uni 	$L__BB4_40;

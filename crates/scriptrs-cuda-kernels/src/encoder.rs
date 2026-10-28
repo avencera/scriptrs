@@ -6,59 +6,12 @@
 //! head_dim]` and subsampling feature maps `[batch, channels, frames, features]`.
 //! Lengths are per batch row, in frames of the tensor they mask
 
-use cuda_device::{DisjointSlice, SharedArray, kernel, thread, warp};
+use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
 
-/// Upper bound on warps per block for the block reductions
-const MAX_WARPS: usize = 32;
-
-/// Reduces `value` over the block with `combine` and returns the result to every
-/// thread
-///
-/// Every thread folds the warp partials in the same order, so all threads see the
-/// same result
-#[inline(always)]
-fn block_reduce(value: f32, scratch: *mut f32, combine: impl Fn(f32, f32) -> f32) -> f32 {
-    let warp_index = thread::threadIdx_x() as usize / 32;
-    let warps = thread::blockDim_x() as usize / 32;
-    let mut partial = value;
-    let mut offset = 16u32;
-    while offset > 0 {
-        partial = combine(partial, warp::shuffle_xor_f32(partial, offset));
-        offset /= 2;
-    }
-    if warp::lane_id() == 0 {
-        // SAFETY: `warp_index < MAX_WARPS` because a block has at most 1024 threads
-        unsafe { *scratch.add(warp_index) = partial };
-    }
-    thread::sync_threads();
-
-    // SAFETY: every warp wrote its slot before the barrier above, and there is at
-    // least one warp
-    let mut total = unsafe { *scratch };
-    let mut w = 1;
-    while w < warps {
-        // SAFETY: as above
-        total = combine(total, unsafe { *scratch.add(w) });
-        w += 1;
-    }
-
-    // the scratch slots are rewritten by the next reduction
-    thread::sync_threads();
-    total
-}
-
-fn add(a: f32, b: f32) -> f32 {
-    a + b
-}
+use crate::common::{MAX_WARPS, add, block_reduce, sigmoid};
 
 fn max(a: f32, b: f32) -> f32 {
     a.max(b)
-}
-
-/// torch's `sigmoid`, `1 / (1 + exp(-x))`
-#[inline(always)]
-fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
 }
 
 /// LayerNorm over rows of `width`: `out = (x - mean) / sqrt(var + eps) * gamma + beta`

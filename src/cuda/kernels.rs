@@ -29,6 +29,7 @@ pub(crate) static PROFILE: Profile = Profile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum KernelModule {
     Encoder,
+    Decode,
 }
 
 impl KernelArea for KernelModule {
@@ -37,6 +38,7 @@ impl KernelArea for KernelModule {
     fn name(self) -> &'static str {
         match self {
             Self::Encoder => "encoder",
+            Self::Decode => "decode",
         }
     }
 
@@ -47,6 +49,10 @@ impl KernelArea for KernelModule {
         match self {
             Self::Encoder => AreaPtx::baseline(Some(EmbeddedPtx {
                 text: include_str!("ptx/encoder.sm75.ptx"),
+                cubins: &[],
+            })),
+            Self::Decode => AreaPtx::baseline(Some(EmbeddedPtx {
+                text: include_str!("ptx/decode.sm75.ptx"),
                 cubins: &[],
             })),
         }
@@ -718,6 +724,289 @@ impl EncoderKernels {
         launch.arg(&dims[0]).arg(&dims[1]).arg(&dims[2]);
         // SAFETY: matches `encoder_subsample_flatten`; indexing is checked in the
         // kernel
+        unsafe { launch.launch(config) }?;
+        Ok(())
+    }
+}
+
+/// Per-row decode state, `[batch]` each
+pub(crate) struct DecodeState<'a> {
+    pub frame: CudaViewMut<'a, u32>,
+    pub emitted: CudaViewMut<'a, u32>,
+    pub label: CudaViewMut<'a, u32>,
+    pub emit: CudaViewMut<'a, u32>,
+    pub counts: CudaViewMut<'a, u32>,
+    pub faults: CudaViewMut<'a, u32>,
+}
+
+/// Emitted tokens, `[batch, capacity]` each
+pub(crate) struct DecodeOutput<'a> {
+    pub tokens: CudaViewMut<'a, u32>,
+    pub frames: CudaViewMut<'a, u32>,
+    pub durations: CudaViewMut<'a, u32>,
+    pub confidences: CudaViewMut<'a, f32>,
+}
+
+/// Joint and duration geometry of one decode step
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DecodeShape {
+    pub batch: usize,
+    /// Token classes including the blank, which is the last
+    pub classes: usize,
+    pub max_symbols: usize,
+    /// Output slots per row
+    pub capacity: usize,
+}
+
+/// The `decode` area's kernels
+pub(crate) struct DecodeKernels {
+    joint_input: CudaFunction,
+    decide: CudaFunction,
+    embed: CudaFunction,
+    lstm_cell: CudaFunction,
+}
+
+impl DecodeKernels {
+    pub(crate) fn load(runtime: &CudaRuntime) -> Result<Self, Error> {
+        let module: LoadedKernels<KernelModule> = runtime.load_embedded(KernelModule::Decode)?;
+        Ok(Self {
+            joint_input: module.function("decode_joint_input")?,
+            decide: module.function("decode_decide")?,
+            embed: module.function("decode_embed")?,
+            lstm_cell: module.function("decode_lstm_cell")?,
+        })
+    }
+
+    /// `out[b] = relu(enc_proj[b, frame[b]] + pred_proj[b])`
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "launchers mirror their kernel's parameter list so each launch reads against it"
+    )]
+    pub(crate) fn joint_input(
+        &self,
+        stream: &CudaStream,
+        enc_proj: &CudaView<'_, f32>,
+        pred_proj: &CudaView<'_, f32>,
+        frame: &CudaView<'_, u32>,
+        lens_frames: &CudaView<'_, u32>,
+        out: &mut CudaViewMut<'_, f32>,
+        frames: usize,
+        hidden: usize,
+    ) -> Result<(), Error> {
+        let batch = lens_frames.len();
+        let n = count("joint input", &[batch, hidden])?;
+        check_len(
+            "encoder projection",
+            count("encoder projection", &[n, frames])?,
+            enc_proj.len(),
+        )?;
+        check_len("predictor projection", n, pred_proj.len())?;
+        check_len("frame cursors", batch, frame.len())?;
+        check_len("joint input", n, out.len())?;
+        let config = elements(n)?;
+        let lens = [
+            len(enc_proj),
+            len(pred_proj),
+            len(frame),
+            len(lens_frames),
+            len_mut(out),
+        ];
+        let dims = [u32_of("frames", frames)?, u32_of("hidden", hidden)?];
+        let mut launch = stream.launch_builder(&self.joint_input);
+        launch
+            .arg(enc_proj)
+            .arg(&lens[0])
+            .arg(pred_proj)
+            .arg(&lens[1])
+            .arg(frame)
+            .arg(&lens[2]);
+        launch.arg(lens_frames).arg(&lens[3]).arg(out).arg(&lens[4]);
+        launch.arg(&dims[0]).arg(&dims[1]);
+        // SAFETY: matches `decode_joint_input`; the kernel bounds-checks its index
+        // against `out` and the checks above size every input for it
+        unsafe { launch.launch(config) }?;
+        Ok(())
+    }
+
+    /// Token decision and frame advance for every unfinished row
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "launchers mirror their kernel's parameter list so each launch reads against it"
+    )]
+    pub(crate) fn decide(
+        &self,
+        stream: &CudaStream,
+        logits: &CudaView<'_, f32>,
+        lens_frames: &CudaView<'_, u32>,
+        durations: &CudaView<'_, u32>,
+        state: &mut DecodeState<'_>,
+        output: &mut DecodeOutput<'_>,
+        shape: DecodeShape,
+    ) -> Result<(), Error> {
+        let batch = shape.batch;
+        let row = shape.classes + durations.len();
+        check_len(
+            "joint logits",
+            count("joint logits", &[batch, row])?,
+            logits.len(),
+        )?;
+        check_len("frame lengths", batch, lens_frames.len())?;
+        for (context, buffer) in [
+            ("frame cursors", &state.frame),
+            ("emitted counts", &state.emitted),
+            ("labels", &state.label),
+            ("emit flags", &state.emit),
+            ("token counts", &state.counts),
+            ("faults", &state.faults),
+        ] {
+            check_len(context, batch, buffer.len())?;
+        }
+        let slots = count("decode output", &[batch, shape.capacity])?;
+        for (context, buffer) in [
+            ("tokens", &output.tokens),
+            ("token frames", &output.frames),
+            ("token durations", &output.durations),
+        ] {
+            check_len(context, slots, buffer.len())?;
+        }
+        check_len("confidences", slots, output.confidences.len())?;
+        if shape.classes == 0 || durations.is_empty() {
+            return Err(Error::BufferLength {
+                context: "joint classes and durations",
+                expected: 1,
+                actual: 0,
+            });
+        }
+
+        let config = rows(batch)?;
+        let lens = [
+            len(logits),
+            len(lens_frames),
+            len(durations),
+            len_mut(&state.frame),
+            len_mut(&state.emitted),
+            len_mut(&state.label),
+            len_mut(&state.emit),
+            len_mut(&state.counts),
+            len_mut(&state.faults),
+            len_mut(&output.tokens),
+            len_mut(&output.frames),
+            len_mut(&output.durations),
+            len_mut(&output.confidences),
+        ];
+        let dims = [
+            u32_of("classes", shape.classes)?,
+            u32_of("blank", shape.classes - 1)?,
+            u32_of("max symbols", shape.max_symbols)?,
+            u32_of("capacity", shape.capacity)?,
+        ];
+        let mut launch = stream.launch_builder(&self.decide);
+        launch
+            .arg(logits)
+            .arg(&lens[0])
+            .arg(lens_frames)
+            .arg(&lens[1])
+            .arg(durations)
+            .arg(&lens[2]);
+        launch
+            .arg(&mut state.frame)
+            .arg(&lens[3])
+            .arg(&mut state.emitted)
+            .arg(&lens[4])
+            .arg(&mut state.label)
+            .arg(&lens[5]);
+        launch
+            .arg(&mut state.emit)
+            .arg(&lens[6])
+            .arg(&mut state.counts)
+            .arg(&lens[7])
+            .arg(&mut state.faults)
+            .arg(&lens[8]);
+        launch
+            .arg(&mut output.tokens)
+            .arg(&lens[9])
+            .arg(&mut output.frames)
+            .arg(&lens[10])
+            .arg(&mut output.durations)
+            .arg(&lens[11]);
+        launch.arg(&mut output.confidences).arg(&lens[12]);
+        for dim in &dims {
+            launch.arg(dim);
+        }
+        // SAFETY: matches `decode_decide`; one block per row writes only its row's
+        // state slots and its `capacity` output slots, all sized above
+        unsafe { launch.launch(config) }?;
+        Ok(())
+    }
+
+    /// `out[b] = embed[label[b]]`
+    pub(crate) fn embed(
+        &self,
+        stream: &CudaStream,
+        embed: &CudaView<'_, f32>,
+        label: &CudaView<'_, u32>,
+        out: &mut CudaViewMut<'_, f32>,
+        hidden: usize,
+    ) -> Result<(), Error> {
+        check_len(
+            "embedding output",
+            count("embedding output", &[label.len(), hidden])?,
+            out.len(),
+        )?;
+        if hidden == 0 || embed.len() % hidden != 0 {
+            return Err(Error::BufferLength {
+                context: "embedding table",
+                expected: hidden.max(1) * embed.len().div_ceil(hidden.max(1)),
+                actual: embed.len(),
+            });
+        }
+        let config = elements(out.len())?;
+        let lens = [len(embed), len(label), len_mut(out)];
+        let hidden = u32_of("hidden", hidden)?;
+        let mut launch = stream.launch_builder(&self.embed);
+        launch
+            .arg(embed)
+            .arg(&lens[0])
+            .arg(label)
+            .arg(&lens[1])
+            .arg(out)
+            .arg(&lens[2]);
+        launch.arg(&hidden);
+        // SAFETY: matches `decode_embed`; the kernel bounds-checks its index against
+        // `out`, and the table read is a checked slice index, so a label past the
+        // table traps instead of reading out of bounds
+        unsafe { launch.launch(config) }?;
+        Ok(())
+    }
+
+    /// LSTM cell update in place for the rows that emitted
+    pub(crate) fn lstm_cell(
+        &self,
+        stream: &CudaStream,
+        gates: &CudaView<'_, f32>,
+        emit: &CudaView<'_, u32>,
+        h: &mut CudaViewMut<'_, f32>,
+        c: &mut CudaViewMut<'_, f32>,
+        hidden: usize,
+    ) -> Result<(), Error> {
+        let n = count("lstm state", &[emit.len(), hidden])?;
+        check_len("lstm gates", count("lstm gates", &[n, 4])?, gates.len())?;
+        check_len("lstm hidden", n, h.len())?;
+        check_len("lstm cell", n, c.len())?;
+        let config = elements(n)?;
+        let lens = [len(gates), len(emit), len_mut(h), len_mut(c)];
+        let hidden = u32_of("hidden", hidden)?;
+        let mut launch = stream.launch_builder(&self.lstm_cell);
+        launch
+            .arg(gates)
+            .arg(&lens[0])
+            .arg(emit)
+            .arg(&lens[1])
+            .arg(h)
+            .arg(&lens[2]);
+        launch.arg(c).arg(&lens[3]).arg(&hidden);
+        // SAFETY: matches `decode_lstm_cell`; the kernel bounds-checks its index
+        // against `h`, and `gates` and `c` are sized for it above
         unsafe { launch.launch(config) }?;
         Ok(())
     }

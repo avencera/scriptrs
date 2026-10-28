@@ -6,12 +6,11 @@
 //! keeps [`CudaEncoder::enqueue`] free of allocations and host syncs and therefore
 //! capturable in a CUDA graph
 
-use std::sync::Arc;
-
-use cudakit::cudarc::driver::{CudaSlice, CudaStream};
-use cudakit::{DeviceTensor, Error, Math, Sgemm, SgemmBatched};
+use cudakit::cudarc::driver::CudaSlice;
+use cudakit::{DeviceTensor, Sgemm, SgemmBatched};
 
 use crate::cuda::kernels::{CudaRuntime, EncoderKernels, FeatureMap, Heads};
+use crate::cuda::{linear, upload, upload_host, zeros};
 use crate::error::TranscriptionError;
 use crate::native::spec::EncoderSpec;
 use crate::native::weights::WeightFile;
@@ -129,31 +128,6 @@ impl EncoderWorkspace {
     pub(crate) fn output(&self) -> &CudaSlice<f32> {
         &self.x
     }
-}
-
-fn upload(
-    runtime: &CudaRuntime,
-    file: &WeightFile,
-    name: &str,
-    shape: &[usize],
-) -> Result<DeviceTensor, TranscriptionError> {
-    let values = file.tensor(name, shape)?;
-    Ok(DeviceTensor::upload(runtime.stream(), values, shape)?)
-}
-
-fn upload_host(runtime: &CudaRuntime, values: &[f32]) -> Result<DeviceTensor, TranscriptionError> {
-    Ok(DeviceTensor::upload(
-        runtime.stream(),
-        values,
-        &[values.len()],
-    )?)
-}
-
-fn zeros<T>(stream: &Arc<CudaStream>, len: usize) -> Result<CudaSlice<T>, Error>
-where
-    T: cudakit::cudarc::driver::DeviceRepr + cudakit::cudarc::driver::ValidAsZeroBits,
-{
-    Ok(stream.alloc_zeros(len)?)
 }
 
 impl CudaEncoder {
@@ -718,17 +692,6 @@ impl CudaEncoder {
     }
 }
 
-/// `c = alpha * a · wᵀ + beta * c` for a PyTorch `[out, in]` weight, in FP32
-fn linear(rows: usize, out: usize, inputs: usize, alpha: f32, beta: f32) -> Sgemm {
-    Sgemm {
-        b_transposed: true,
-        alpha,
-        beta,
-        math: Math::Fp32,
-        ..Sgemm::new(rows, out, inputs)
-    }
-}
-
 /// NeMo's `RelPositionalEncoding` rows for positions `frames - 1` down to
 /// `-(frames - 1)`, `[2 * frames - 1, d_model]`, computed in FP32 as NeMo does
 fn relative_positions(frames: usize, d_model: usize) -> Vec<f32> {
@@ -751,27 +714,14 @@ fn relative_positions(frames: usize, d_model: usize) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use cudakit::{Library, Options};
     use ndarray::{ArrayD, Axis, Ix3};
 
     use super::{CudaEncoder, relative_positions};
     use crate::cuda::kernels::CudaRuntime;
+    use crate::cuda::test_support::weights;
     use crate::deployment::{ParakeetDeployment, ParakeetVersion};
-    use crate::native::weights::WeightFile;
     use crate::test_support::NemoReference;
-
-    fn weights(version: ParakeetVersion) -> WeightFile {
-        let root = std::env::var_os("SCRIPTRS_NATIVE_MODELS")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/shared/models/scriptrs-native"));
-        let dir = match version {
-            ParakeetVersion::V2 => "parakeet-v2",
-            ParakeetVersion::V3 => "parakeet-v3",
-        };
-        WeightFile::open(&root.join(dir).join("model.safetensors")).expect("native weights")
-    }
 
     /// Relative L2 error and max abs difference over the valid frames of `[batch,
     /// frames, d_model]` outputs

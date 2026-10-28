@@ -55,6 +55,18 @@ impl NemoReference {
         ArrayD::from_shape_vec(IxDyn(view.shape()), values).expect("shape should match data")
     }
 
+    pub(crate) fn i32(&self, key: &str) -> Vec<i32> {
+        let tensors = self.tensors();
+        let view = tensors
+            .tensor(key)
+            .unwrap_or_else(|error| panic!("reference key `{key}`: {error}"));
+        assert_eq!(view.dtype(), Dtype::I32, "`{key}` is not i32");
+        view.data()
+            .chunks_exact(4)
+            .map(|bytes| i32::from_le_bytes(bytes.try_into().expect("4-byte chunk")))
+            .collect()
+    }
+
     pub(crate) fn i64(&self, key: &str) -> Vec<i64> {
         let tensors = self.tensors();
         let view = tensors
