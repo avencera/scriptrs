@@ -1,3 +1,4 @@
+#[cfg(target_os = "macos")]
 use crate::constants::{VAD_CONTEXT_SAMPLES, VAD_STATE_SIZE, VAD_WINDOW_SAMPLES};
 #[cfg(target_os = "macos")]
 use crate::coreml::SileroVadCoreMlModel;

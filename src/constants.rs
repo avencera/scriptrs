@@ -16,3 +16,6 @@ pub(crate) const ENCODER_HIDDEN_SIZE: usize = 1_024;
 pub(crate) const DECODER_HIDDEN_SIZE: usize = 640;
 pub(crate) const DECODER_LAYERS: usize = 2;
 pub(crate) const MAX_TOKENS_PER_STEP: usize = 10;
+// width of the v3 joint's top-K outputs in the published Core ML bundle; device
+// backends filter languages over the same candidate set
+pub(crate) const LANGUAGE_FILTER_TOP_K: usize = 64;

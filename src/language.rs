@@ -408,7 +408,7 @@ pub(crate) fn validate_candidate_logits(logits: &[f32]) -> Result<(), Transcript
     Ok(())
 }
 
-fn token_matches_script(token: &str, script: Script) -> bool {
+pub(crate) fn token_matches_script(token: &str, script: Script) -> bool {
     let cleaned = token.replace('\u{2581}', "");
     if cleaned.is_empty() {
         return true;

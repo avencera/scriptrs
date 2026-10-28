@@ -1,6 +1,7 @@
 use crate::constants::{
     DECODER_HIDDEN_SIZE, DECODER_LAYERS, DEFAULT_HARD_SAMPLE_MAX, DURATION_BINS,
-    ENCODER_HIDDEN_SIZE, MEL_HOP_SAMPLES, SAMPLE_RATE, SAMPLES_PER_ENCODER_FRAME,
+    ENCODER_HIDDEN_SIZE, LANGUAGE_FILTER_TOP_K, MEL_HOP_SAMPLES, SAMPLE_RATE,
+    SAMPLES_PER_ENCODER_FRAME,
 };
 use crate::error::TranscriptionError;
 use crate::language::{LanguageSelection, ParakeetLanguage, V3_LANGUAGES};
@@ -304,6 +305,7 @@ pub struct ParakeetDeployment {
     blank_id: usize,
     hard_sample_max: usize,
     duration_bins: &'static [usize],
+    language_filter_top_k: Option<usize>,
     model_io: ModelIo,
 }
 
@@ -325,6 +327,7 @@ impl ParakeetDeployment {
             blank_id: V2_BLANK_ID,
             hard_sample_max: DEFAULT_HARD_SAMPLE_MAX,
             duration_bins: &DURATION_BINS,
+            language_filter_top_k: None,
             model_io: ModelIo::v2(),
         }
     }
@@ -346,6 +349,7 @@ impl ParakeetDeployment {
             blank_id: V3_BLANK_ID,
             hard_sample_max: DEFAULT_HARD_SAMPLE_MAX,
             duration_bins: &DURATION_BINS,
+            language_filter_top_k: Some(LANGUAGE_FILTER_TOP_K),
             model_io: ModelIo::v3(),
         }
     }
@@ -440,6 +444,13 @@ impl ParakeetDeployment {
     /// Duration bin mapping owned by this deployment
     pub const fn duration_bins(&self) -> &'static [usize] {
         self.duration_bins
+    }
+
+    /// Joint top-K width that explicit-language filtering searches
+    ///
+    /// `None` when the deployment has no language filter (v2 is English-only).
+    pub const fn language_filter_top_k(&self) -> Option<usize> {
+        self.language_filter_top_k
     }
 
     /// Core ML tensor names for this deployment

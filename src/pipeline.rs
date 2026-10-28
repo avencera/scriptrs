@@ -1,3 +1,4 @@
+use crate::backend::EncoderChunk;
 use crate::config::TranscriptionConfig;
 use crate::constants::SAMPLES_PER_ENCODER_FRAME;
 use crate::decode::{ParakeetTdtDecoder, RawTranscription};
@@ -145,12 +146,8 @@ impl TranscriptionPipeline {
         context_samples: usize,
         language: crate::language::LanguageSelection,
     ) -> Result<RawTranscription, TranscriptionError> {
-        let mut raw = self.model.transcribe(
-            &prepared.features,
-            prepared.feature_frames,
-            prepared.target_frames,
-            language,
-        )?;
+        let chunk = EncoderChunk::new(prepared.features.view());
+        let mut raw = self.model.transcribe(chunk, language)?.raw;
         apply_time_offsets(
             &mut raw,
             global_sample_offset / SAMPLES_PER_ENCODER_FRAME,
@@ -176,8 +173,6 @@ impl TranscriptionPipeline {
 #[derive(Debug)]
 pub(crate) struct PreparedChunk {
     features: Array2<f32>,
-    feature_frames: usize,
-    target_frames: usize,
 }
 
 impl PreparedChunk {
@@ -196,19 +191,9 @@ impl PreparedChunk {
             });
         }
 
-        Ok(Self::new(
-            extractor.extract(audio)?,
-            config.max_feature_frames(),
-        ))
-    }
-
-    fn new(features: Array2<f32>, target_frames: usize) -> Self {
-        let feature_frames = features.shape()[0];
-        Self {
-            features,
-            feature_frames,
-            target_frames,
-        }
+        Ok(Self {
+            features: extractor.extract(audio)?,
+        })
     }
 }
 
