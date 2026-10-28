@@ -60,3 +60,25 @@ cargo run --release --features cuda --example cuda_bench -- \
     --models /shared/models/scriptrs-native --version v3 --out bench/v3-bs1.json
 uv run python wer.py bench/v3-bs1.texts.json
 ```
+
+## `long_texts.py` and `long_wer.py`
+
+`long_texts.py` transcribes whole recordings with NeMo's long-form recipe (local
+attention [256, 256], FP32, one batch-1 input per file, eval mode after the
+attention swap) and writes `{stem: text}`. `long_wer.py` scores any number of
+such files against the Earnings-21 `.nlp` references, pooled over the recordings
+all of them cover, with `--per-file` for each recording.
+`cuda_bench --long <wav dir>` writes the scriptrs side:
+
+```sh
+uv run python long_texts.py ~/code/speakrs/fixtures/datasets/earnings21/wav/*.wav --out nemo.texts.json
+cargo run --release --features cuda,long-form --example cuda_bench -- \
+    --models /shared/models/scriptrs-native --version v3 \
+    --long ~/code/speakrs/fixtures/datasets/earnings21/wav --repeats 1 --out bench/e21.json
+uv run python long_wer.py nemo.texts.json bench/e21.texts.json
+```
+
+`change_attention_model` rebuilds the attention modules in training mode, so a
+script that swaps attention and does not call `eval()` afterwards runs with
+dropout on. The 2026-10-23 profile's long-file runs did that: its 9.14 % on
+Earnings-21 4360674 is 9.34 % in eval mode

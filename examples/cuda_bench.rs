@@ -1,12 +1,19 @@
-//! Batch-1 speed and transcripts of the CUDA backend on LibriSpeech test-clean
+//! Batch-1 speed and transcripts of the CUDA backend on LibriSpeech test-clean, or
+//! on long recordings
 //!
 //! Mirrors the NeMo profile's `bench.py`: audio is preloaded, utterances run longest
 //! first, the longest and shortest run once as warmup, and the timed region is
 //! mel, encoder, decode and detokenization for every utterance. Writes a summary
 //! and `<out>.texts.json` (`{id: text}`) for `dev-tools/nemo/wer.py`
 //!
+//! With `--long <wav or directory>` (repeatable), the first recording runs once as
+//! warmup, then each runs through the long-form pipeline's overlap windows on one
+//! worker; the timed region excludes reading the files, and transcripts are keyed
+//! by file stem for `dev-tools/nemo/long_wer.py`. `--window` and
+//! `--overlap` (seconds) override the overlap plan
+//!
 //! ```sh
-//! cargo run --release --features cuda --example cuda_bench -- \
+//! cargo run --release --features cuda,long-form --example cuda_bench -- \
 //!     --models /shared/models/scriptrs-native --version v3 --out bench/v3-bs1.json
 //! ```
 
@@ -19,7 +26,10 @@ use std::time::Instant;
 
 use eyre::{Result, bail, eyre};
 use hound::WavReader;
-use scriptrs::{ModelBundle, ParakeetDeployment, TranscriptionPipeline};
+use scriptrs::{
+    LongFormConfig, LongFormTranscriptionPipeline, ModelBundle, ParakeetDeployment,
+    TranscriptionPipeline,
+};
 use serde_json::{Value, json};
 
 const DEFAULT_MANIFEST: &str = "/shared/datasets/librispeech-test-clean/manifest.jsonl";
@@ -30,6 +40,9 @@ struct Args {
     manifest: PathBuf,
     out: PathBuf,
     repeats: usize,
+    long: Vec<PathBuf>,
+    window_s: Option<f64>,
+    overlap_s: Option<f64>,
 }
 
 struct Utterance {
@@ -50,36 +63,12 @@ fn main() -> ExitCode {
 fn run() -> Result<()> {
     let args = parse_args()?;
     let version = format!("{:?}", args.deployment.version());
-    let pipeline = TranscriptionPipeline::from_bundle(ModelBundle::from_native_dir(
-        &args.models,
-        args.deployment,
-    ))?;
-
-    let mut utterances = load_manifest(&args.manifest)?;
-    utterances.sort_by(|a, b| b.audio.len().cmp(&a.audio.len()).then(a.id.cmp(&b.id)));
-    let audio_s: f64 = utterances
-        .iter()
-        .map(|utterance| utterance.audio.len() as f64 / 16_000.0)
-        .sum();
-    let (Some(longest), Some(shortest)) = (utterances.first(), utterances.last()) else {
-        bail!("the manifest is empty");
+    let bundle = ModelBundle::from_native_dir(&args.models, args.deployment.clone());
+    let (audio_s, walls, texts) = if args.long.is_empty() {
+        bench_manifest(bundle, &args.manifest, args.repeats)?
+    } else {
+        bench_long(bundle, &args.long, &args)?
     };
-
-    for utterance in [longest, shortest] {
-        pipeline.run(&utterance.audio)?;
-    }
-
-    let mut walls = Vec::with_capacity(args.repeats);
-    let mut texts = BTreeMap::new();
-    for _ in 0..args.repeats {
-        texts.clear();
-        let started = Instant::now();
-        for utterance in &utterances {
-            let text = pipeline.run(&utterance.audio)?.text;
-            texts.insert(utterance.id.clone(), text);
-        }
-        walls.push(started.elapsed().as_secs_f64());
-    }
 
     let mut sorted = walls.clone();
     sorted.sort_by(f64::total_cmp);
@@ -87,11 +76,12 @@ fn run() -> Result<()> {
         "backend": "scriptrs-cuda-fp32",
         "version": version,
         "bs": 1,
-        "n_utts": utterances.len(),
+        "long": !args.long.is_empty(),
+        "n_utts": texts.len(),
         "audio_s": audio_s,
         "walls_s": walls,
         "rtfx_best": audio_s / sorted[0],
-        "rtfx_median": audio_s / sorted[sorted.len() / 2],
+        "rtfx_median": audio_s / median(&sorted),
     });
     if let Some(parent) = args.out.parent() {
         fs::create_dir_all(parent)?;
@@ -105,12 +95,124 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+/// Median of sorted values, averaging the middle two like `np.median`
+fn median(sorted: &[f64]) -> f64 {
+    let middle = sorted.len() / 2;
+    if sorted.len() % 2 == 0 {
+        (sorted[middle - 1] + sorted[middle]) / 2.0
+    } else {
+        sorted[middle]
+    }
+}
+
+/// Audio seconds, wall seconds per timed pass, and transcripts by id
+type Bench = (f64, Vec<f64>, BTreeMap<String, String>);
+
+fn bench_manifest(bundle: ModelBundle, manifest: &Path, repeats: usize) -> Result<Bench> {
+    let pipeline = TranscriptionPipeline::from_bundle(bundle)?;
+    let mut utterances = load_manifest(manifest)?;
+    utterances.sort_by(|a, b| b.audio.len().cmp(&a.audio.len()).then(a.id.cmp(&b.id)));
+    let audio_s: f64 = utterances
+        .iter()
+        .map(|utterance| utterance.audio.len() as f64 / 16_000.0)
+        .sum();
+    let (Some(longest), Some(shortest)) = (utterances.first(), utterances.last()) else {
+        bail!("the manifest is empty");
+    };
+
+    for utterance in [longest, shortest] {
+        pipeline.run(&utterance.audio)?;
+    }
+
+    let mut walls = Vec::with_capacity(repeats);
+    let mut texts = BTreeMap::new();
+    for _ in 0..repeats {
+        texts.clear();
+        let started = Instant::now();
+        for utterance in &utterances {
+            let text = pipeline.run(&utterance.audio)?.text;
+            texts.insert(utterance.id.clone(), text);
+        }
+        walls.push(started.elapsed().as_secs_f64());
+    }
+    Ok((audio_s, walls, texts))
+}
+
+fn bench_long(bundle: ModelBundle, paths: &[PathBuf], args: &Args) -> Result<Bench> {
+    // one worker, because each worker of the parallel plan loads its own model
+    let mut config = LongFormConfig {
+        worker_count: 1,
+        ..LongFormConfig::from_deployment(bundle.deployment())
+    };
+    if let Some(window_s) = args.window_s {
+        config.overlap.max_model_samples = (window_s * 16_000.0) as usize;
+    }
+    if let Some(overlap_s) = args.overlap_s {
+        config.overlap.overlap_seconds = overlap_s;
+    }
+    let pipeline = LongFormTranscriptionPipeline::from_bundle(bundle)?;
+    let recordings = long_recordings(paths)?;
+    let Some(first) = recordings.first() else {
+        bail!("--long found no wav files");
+    };
+    pipeline.run_with_config(&read_wav(first)?, &config)?;
+
+    // files are read outside the timed region, one at a time, to keep memory flat
+    let mut walls = vec![0.0; args.repeats];
+    let mut texts = BTreeMap::new();
+    let mut audio_s = 0.0;
+    for path in &recordings {
+        let audio = read_wav(path)?;
+        audio_s += audio.len() as f64 / 16_000.0;
+        for wall in &mut walls {
+            let started = Instant::now();
+            let text = pipeline.run_with_config(&audio, &config)?.text;
+            *wall += started.elapsed().as_secs_f64();
+            texts.insert(stem(path)?, text);
+        }
+    }
+    Ok((audio_s, walls, texts))
+}
+
+/// The wav files named by `--long`, with directories expanded to the wavs in them
+fn long_recordings(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut recordings = Vec::new();
+    for path in paths {
+        if !path.is_dir() {
+            recordings.push(path.clone());
+            continue;
+        }
+
+        for entry in fs::read_dir(path)? {
+            let entry = entry?.path();
+            if entry
+                .extension()
+                .is_some_and(|extension| extension == "wav")
+            {
+                recordings.push(entry);
+            }
+        }
+    }
+    recordings.sort();
+    Ok(recordings)
+}
+
+fn stem(path: &Path) -> Result<String> {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| eyre!("{} has no file stem", path.display()))
+}
+
 fn parse_args() -> Result<Args> {
     let mut models = None;
     let mut deployment = ParakeetDeployment::v3();
     let mut manifest = PathBuf::from(DEFAULT_MANIFEST);
     let mut out = None;
     let mut repeats = 3;
+    let mut long = Vec::new();
+    let mut window_s = None;
+    let mut overlap_s = None;
     let mut args = env::args().skip(1);
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| eyre!("{flag} needs a value"));
@@ -126,6 +228,9 @@ fn parse_args() -> Result<Args> {
             "--manifest" => manifest = PathBuf::from(value()?),
             "--out" => out = Some(PathBuf::from(value()?)),
             "--repeats" => repeats = value()?.parse()?,
+            "--long" => long.push(PathBuf::from(value()?)),
+            "--window" => window_s = Some(value()?.parse()?),
+            "--overlap" => overlap_s = Some(value()?.parse()?),
             other => return Err(eyre!("unknown argument {other}")),
         }
     }
@@ -136,6 +241,9 @@ fn parse_args() -> Result<Args> {
         manifest,
         out: out.ok_or_else(|| eyre!("--out is required"))?,
         repeats: repeats.max(1),
+        long,
+        window_s,
+        overlap_s,
     })
 }
 
