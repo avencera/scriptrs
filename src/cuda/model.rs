@@ -8,8 +8,10 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::mem::ManuallyDrop;
+use std::ops::Deref;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use cudakit::{Graph, Library, Options};
 
@@ -99,6 +101,46 @@ impl ShapeCache {
     }
 }
 
+/// Held while any engine in the process captures a graph or is torn down
+///
+/// Each engine opens its own runtime, but all of them share device 0's primary
+/// context, and tearing one down while another thread captures fails that capture
+/// with `CUBLAS_STATUS_INTERNAL_ERROR`, `CUBLAS_STATUS_EXECUTION_FAILED` or
+/// `CUDA_ERROR_STREAM_CAPTURE_INVALIDATED`. Parallel long-form workers each load an
+/// engine, and the first to finish drops it while another may still be capturing
+/// the last window's shape. Eager runs, replays and loads overlap a teardown or a
+/// capture without failing, so they stay outside it
+static CAPTURE_OR_TEARDOWN: Mutex<()> = Mutex::new(());
+
+fn capture_or_teardown() -> MutexGuard<'static, ()> {
+    // the lock guards no data, so a panic while holding it leaves nothing to repair
+    CAPTURE_OR_TEARDOWN
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// An engine that drops under [`CAPTURE_OR_TEARDOWN`]
+///
+/// The lock has to cover the fields' drops, which run after `Drop::drop` returns,
+/// so the engine is dropped by hand inside it
+struct ExclusiveTeardown(ManuallyDrop<Engine>);
+
+impl Deref for ExclusiveTeardown {
+    type Target = Engine;
+
+    fn deref(&self) -> &Engine {
+        &self.0
+    }
+}
+
+impl Drop for ExclusiveTeardown {
+    fn drop(&mut self) {
+        let _teardown = capture_or_teardown();
+        // SAFETY: the engine is dropped only here, and nothing reads it afterward
+        unsafe { ManuallyDrop::drop(&mut self.0) };
+    }
+}
+
 struct Engine {
     // fields drop in order: graphs and buffers, then weights, then the context
     shapes: Mutex<ShapeCache>,
@@ -111,9 +153,10 @@ struct Engine {
 /// Parakeet encoder and greedy decode on CUDA device 0, shared by clones
 ///
 /// Clones may run on any thread; the shape cache's lock also serializes graph
-/// capture, which cudakit requires across threads sharing a runtime
+/// capture, which cudakit requires across threads sharing a runtime, and
+/// [`CAPTURE_OR_TEARDOWN`] keeps every capture apart from other engines' teardown
 #[derive(Clone)]
-pub(crate) struct CudaModel(Arc<Engine>);
+pub(crate) struct CudaModel(Arc<ExclusiveTeardown>);
 
 // a backend handle that is not thread-safe would quietly make pipelines `!Send`
 const _: () = {
@@ -145,13 +188,15 @@ impl CudaModel {
         let encoder = CudaEncoder::load(&runtime, &file, spec.encoder, math(precision))?;
         let decoder = CudaDecoder::load(&runtime, &file, &spec)?;
         let (free, _) = runtime.stream().context().mem_get_info()?;
-        Ok(Self(Arc::new(Engine {
-            shapes: Mutex::new(ShapeCache::new(free / CACHE_SHARE_DIVISOR)),
-            encoder,
-            decoder,
-            features: spec.encoder.features,
-            runtime,
-        })))
+        Ok(Self(Arc::new(ExclusiveTeardown(ManuallyDrop::new(
+            Engine {
+                shapes: Mutex::new(ShapeCache::new(free / CACHE_SHARE_DIVISOR)),
+                encoder,
+                decoder,
+                features: spec.encoder.features,
+                runtime,
+            },
+        )))))
     }
 
     pub(crate) fn transcribe_chunks(
@@ -250,6 +295,7 @@ impl Engine {
             None => {
                 self.encoder.enqueue(runtime, &mut shape.encoder)?;
                 let encoder_ws = &mut shape.encoder;
+                let _capture = capture_or_teardown();
                 // SAFETY: the graph is stored in the same `Shape` as the workspace it
                 // records, ahead of it, so it drops first; the workspace's buffers are
                 // never reallocated, and every launch is on the runtime's stream. The
@@ -281,6 +327,7 @@ impl Engine {
                 self.decoder
                     .run(runtime, &mut shape.decoder, STEPS_PER_CHECK)?;
                 let decoder_ws = &mut shape.decoder;
+                let _capture = capture_or_teardown();
                 // SAFETY: as for the encoder graph above
                 let graph = unsafe {
                     runtime.capture_nonempty(|| {
@@ -303,9 +350,11 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use ndarray::{Array2, Axis};
 
-    use super::CudaModel;
+    use super::{CudaModel, MEL_BUCKET};
     use crate::backend::{DecodePolicy, EncoderChunk};
     use crate::config::TranscriptionConfig;
     use crate::cuda::test_support::{native_root, nemo_parity_bundle};
@@ -406,6 +455,80 @@ mod tests {
                 "call {call}: cache over budget"
             );
         }
+    }
+
+    /// Keeps capturing graphs on one model while a second thread loads others and
+    /// drops each one during a call, as parallel long-form workers do when one
+    /// finishes first: an engine torn down mid-capture failed the capture with a
+    /// cuBLAS or capture-invalidated error
+    #[test]
+    #[ignore = "needs a CUDA GPU and the native weights; `just gpu-parity` runs it on gpu0"]
+    fn gpu_engine_teardown_does_not_break_another_capture() {
+        /// Capture is most of a call, so each drop that starts mid-call is likely to
+        /// overlap one; this many, each in a different call, make a miss vanishingly
+        /// rare
+        const TEARDOWNS: usize = 8;
+        /// `current_call` once the capture thread has stopped, which lets
+        /// the remaining drops through
+        const STOPPED: usize = usize::MAX;
+
+        let root = native_root();
+        let deployment = ParakeetDeployment::v3();
+        let weights = root.join(deployment.native_weights_path());
+        let load = || CudaModel::load(&weights, &deployment, Precision::Fp32).expect("model");
+        let model = load();
+        let vocab = ModelBundle::from_native_dir(&root, deployment.clone())
+            .vocabulary()
+            .expect("vocabulary");
+        let policy =
+            DecodePolicy::new(&deployment, &vocab, LanguageSelection::Auto).expect("policy");
+        let features = Array2::<f32>::zeros((4 * MEL_BUCKET, model.0.features));
+        // the 1-based number of the call in flight, or 0 between calls
+        let current_call = AtomicUsize::new(0);
+
+        let failure = std::thread::scope(|scope| {
+            let dropper = scope.spawn(|| {
+                let mut last_call = 0;
+                for _ in 0..TEARDOWNS {
+                    let other = load();
+                    // start each teardown inside a call no earlier teardown started in
+                    loop {
+                        let call = current_call.load(Ordering::Acquire);
+                        if call == STOPPED || (call != 0 && call != last_call) {
+                            last_call = call;
+                            break;
+                        }
+                        std::hint::spin_loop();
+                    }
+                    drop(other);
+                }
+            });
+
+            let mut calls = 0;
+            while !dropper.is_finished() {
+                // an empty cache makes every call capture its graphs anew
+                model.0.shapes.lock().expect("cache").clear();
+                current_call.store(calls + 1, Ordering::Release);
+                let decoded =
+                    model.transcribe_chunks(&[EncoderChunk::new(features.view())], &policy);
+                let failure = match decoded {
+                    Ok(decoded) if decoded.len() == 1 => None,
+                    Ok(decoded) => Some(format!("call {calls}: {} outputs", decoded.len())),
+                    Err(error) => Some(format!("call {calls}: {error}")),
+                };
+                if failure.is_some() {
+                    // lets the remaining drops through, so the scope can join
+                    current_call.store(STOPPED, Ordering::Release);
+                    return failure;
+                }
+
+                current_call.store(0, Ordering::Release);
+                calls += 1;
+            }
+            None
+        });
+
+        assert_eq!(failure, None);
     }
 
     /// Runs the 120 s long-full audio through native long-form, its six windows
