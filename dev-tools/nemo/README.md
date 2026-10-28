@@ -56,7 +56,7 @@ WER with jiwer. `--against <texts.json>` lists utterances whose raw text differs
 `examples/cuda_bench.rs` writes the transcripts:
 
 ```sh
-cargo run --release --features cuda --example cuda_bench -- \
+cargo run --release --features cuda,long-form --example cuda_bench -- \
     --models /shared/models/scriptrs-native --version v3 --out bench/v3-bs1.json
 uv run python wer.py bench/v3-bs1.texts.json
 ```

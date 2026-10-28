@@ -30,7 +30,8 @@ def main():
 
     norm = EnglishTextNormalizer()
     runs = [json.loads(Path(p).read_text()) for p in args.texts]
-    stems = sorted(set(runs[0]).intersection(*runs[1:]))
+    # long_texts.py lists recordings it skipped under "_skipped", which is no stem
+    stems = sorted(set(runs[0]).intersection(*runs[1:]) - {"_skipped"})
     refs = {stem: norm(reference(Path(args.refs) / f"{stem}.nlp")) for stem in stems}
     for path, run in zip(args.texts, runs):
         out = jiwer.process_words([refs[s] for s in stems], [norm(run[s]) for s in stems])
