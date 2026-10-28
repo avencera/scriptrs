@@ -128,6 +128,36 @@ impl EncoderWorkspace {
     pub(crate) fn output(&self) -> &CudaSlice<f32> {
         &self.x
     }
+
+    /// Device bytes held by the workspace's buffers
+    pub(crate) fn bytes(&self) -> usize {
+        let lens: usize = self.lens.iter().map(CudaSlice::num_bytes).sum();
+        let buffers = [
+            &self.mel,
+            &self.maps[0],
+            &self.maps[1],
+            &self.flat,
+            &self.x,
+            &self.normed,
+            &self.hidden,
+            &self.qkv,
+            &self.q_u,
+            &self.q_v,
+            &self.k,
+            &self.v,
+            &self.pos_emb,
+            &self.pos,
+            &self.pos_heads,
+            &self.scores,
+            &self.bd,
+            &self.context,
+            &self.merged,
+        ];
+        lens + buffers
+            .iter()
+            .map(|buffer| buffer.num_bytes())
+            .sum::<usize>()
+    }
 }
 
 impl CudaEncoder {

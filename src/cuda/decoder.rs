@@ -83,12 +83,36 @@ pub(crate) struct DecodeWorkspace {
 }
 
 impl DecodeWorkspace {
-    pub(crate) fn batch(&self) -> usize {
-        self.batch
-    }
-
-    pub(crate) fn frames(&self) -> usize {
-        self.frames
+    /// Device bytes held by the workspace's buffers
+    pub(crate) fn bytes(&self) -> usize {
+        let floats = [
+            &self.enc_proj,
+            &self.pred_proj,
+            &self.joint_in,
+            &self.logits,
+            &self.embedded,
+            &self.gates,
+            &self.confidences,
+        ];
+        let state = [
+            &self.lens,
+            &self.frame,
+            &self.emitted,
+            &self.label,
+            &self.emit,
+            &self.counts,
+            &self.faults,
+            &self.tokens,
+            &self.token_frames,
+            &self.token_durations,
+        ];
+        floats
+            .into_iter()
+            .chain(self.h.iter())
+            .chain(self.c.iter())
+            .map(CudaSlice::num_bytes)
+            .sum::<usize>()
+            + state.into_iter().map(CudaSlice::num_bytes).sum::<usize>()
     }
 
     /// Upper bound on decode steps for the current lengths: each step either emits

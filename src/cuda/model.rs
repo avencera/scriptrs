@@ -3,7 +3,8 @@
 //! A batch of chunks is padded to a mel-frame bucket, so inputs of similar length
 //! share one set of device buffers and captured graphs. The first batch of a shape
 //! runs eagerly, which also finishes cuBLAS's lazy setup, and records graphs that
-//! later batches of that shape replay
+//! later batches of that shape replay. Shapes are evicted least recently used once
+//! their buffers pass a share of device memory
 
 use std::collections::HashMap;
 use std::fmt;
@@ -29,8 +30,10 @@ const MEL_BUCKET: usize = 64;
 /// cursors
 const STEPS_PER_CHECK: usize = 16;
 
-/// Shapes kept before the cache is cleared; each holds its buffers and graphs
-const MAX_SHAPES: usize = 64;
+/// Cached shapes may hold up to this fraction (1 / divisor) of the device memory
+/// free once the weights are loaded; the rest stays free for other work on the same
+/// GPU, such as diarization
+const CACHE_SHARE_DIVISOR: usize = 2;
 
 /// Device buffers and graphs for one `(batch, padded mel frames)` shape
 struct Shape {
@@ -39,11 +42,65 @@ struct Shape {
     decode_graph: Option<Graph>,
     encoder: EncoderWorkspace,
     decoder: DecodeWorkspace,
+    bytes: usize,
+    last_used: u64,
+}
+
+/// Shapes by `(batch, padded mel frames)`, bounded by the bytes their buffers hold
+struct ShapeCache {
+    shapes: HashMap<(usize, usize), Shape>,
+    bytes: usize,
+    budget: usize,
+    uses: u64,
+}
+
+impl ShapeCache {
+    fn new(budget: usize) -> Self {
+        Self {
+            shapes: HashMap::new(),
+            bytes: 0,
+            budget,
+            uses: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.shapes.clear();
+        self.bytes = 0;
+    }
+
+    /// Adds `shape`, then evicts the least recently used others while over budget;
+    /// a shape larger than the whole budget is still kept, alone
+    fn insert(&mut self, key: (usize, usize), shape: Shape) {
+        self.bytes += shape.bytes;
+        self.shapes.insert(key, shape);
+        while self.bytes > self.budget {
+            let Some(oldest) = self
+                .shapes
+                .iter()
+                .filter(|(other, _)| **other != key)
+                .min_by_key(|(_, shape)| shape.last_used)
+                .map(|(other, _)| *other)
+            else {
+                break;
+            };
+            if let Some(evicted) = self.shapes.remove(&oldest) {
+                self.bytes -= evicted.bytes;
+            }
+        }
+    }
+
+    fn get(&mut self, key: (usize, usize)) -> Option<&mut Shape> {
+        self.uses += 1;
+        let shape = self.shapes.get_mut(&key)?;
+        shape.last_used = self.uses;
+        Some(shape)
+    }
 }
 
 struct Engine {
     // fields drop in order: graphs and buffers, then weights, then the context
-    shapes: Mutex<HashMap<(usize, usize), Shape>>,
+    shapes: Mutex<ShapeCache>,
     encoder: CudaEncoder,
     decoder: CudaDecoder,
     features: usize,
@@ -77,8 +134,9 @@ impl CudaModel {
         runtime.prepare(Library::Cublas)?;
         let encoder = CudaEncoder::load(&runtime, &file, spec.encoder)?;
         let decoder = CudaDecoder::load(&runtime, &file, &spec)?;
+        let (free, _) = runtime.stream().context().mem_get_info()?;
         Ok(Self(Rc::new(Engine {
-            shapes: Mutex::new(HashMap::new()),
+            shapes: Mutex::new(ShapeCache::new(free / CACHE_SHARE_DIVISOR)),
             encoder,
             decoder,
             features: spec.encoder.features,
@@ -132,31 +190,42 @@ impl CudaModel {
         let mut shapes = engine.shapes.lock().map_err(|_| {
             TranscriptionError::InvalidModelOutput("the CUDA model lock was poisoned".to_owned())
         })?;
-        if !shapes.contains_key(&(batch, mel_frames)) && shapes.len() >= MAX_SHAPES {
-            shapes.clear();
+        let key = (batch, mel_frames);
+        if !shapes.shapes.contains_key(&key) {
+            let shape = match engine.shape(batch, mel_frames) {
+                Ok(shape) => shape,
+                // the allocation may have failed on memory cached shapes hold: free
+                // them all and try once more
+                Err(_) => {
+                    shapes.clear();
+                    engine.shape(batch, mel_frames)?
+                }
+            };
+            shapes.insert(key, shape);
         }
-        let shape = match shapes.entry((batch, mel_frames)) {
-            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                let encoder = engine
-                    .encoder
-                    .workspace(&engine.runtime, batch, mel_frames)?;
-                let decoder = engine
-                    .decoder
-                    .workspace(&engine.runtime, batch, encoder.frames())?;
-                entry.insert(Shape {
-                    encoder_graph: None,
-                    decode_graph: None,
-                    encoder,
-                    decoder,
-                })
-            }
-        };
+        let shape = shapes.get(key).ok_or_else(|| {
+            TranscriptionError::InvalidModelOutput("a cached CUDA shape went missing".to_owned())
+        })?;
         engine.transcribe(shape, &mel, &lens)
     }
 }
 
 impl Engine {
+    fn shape(&self, batch: usize, mel_frames: usize) -> Result<Shape, TranscriptionError> {
+        let encoder = self.encoder.workspace(&self.runtime, batch, mel_frames)?;
+        let decoder = self
+            .decoder
+            .workspace(&self.runtime, batch, encoder.frames())?;
+        Ok(Shape {
+            encoder_graph: None,
+            decode_graph: None,
+            bytes: encoder.bytes() + decoder.bytes(),
+            last_used: 0,
+            encoder,
+            decoder,
+        })
+    }
+
     fn transcribe(
         &self,
         shape: &mut Shape,
@@ -221,10 +290,112 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use ndarray::{Array2, Axis};
+
+    use super::CudaModel;
+    use crate::backend::{DecodePolicy, EncoderChunk};
+    use crate::config::TranscriptionConfig;
+    use crate::decode::RawTranscription;
     use crate::deployment::{ParakeetDeployment, ParakeetVersion};
+    use crate::frontend::ParakeetFeatureExtractor;
+    use crate::language::LanguageSelection;
     use crate::models::ModelBundle;
     use crate::pipeline::TranscriptionPipeline;
     use crate::test_support::NemoReference;
+
+    fn native_root() -> PathBuf {
+        std::env::var_os("SCRIPTRS_NATIVE_MODELS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| "/shared/models/scriptrs-native".into())
+    }
+
+    /// Runs each b8 utterance alone under a cache budget of two of the largest
+    /// shapes, forward, backward and forward again, so calls keep evicting shapes and
+    /// capturing their graphs anew, and holds every output to the first, unbounded run
+    #[test]
+    #[ignore = "needs a CUDA GPU, the native weights and the NeMo references; `just gpu-parity` runs it on gpu0"]
+    fn gpu_evicted_shapes_transcribe_the_same() {
+        let root = native_root();
+        let bundle = ModelBundle::from_native_dir(&root, ParakeetDeployment::v3());
+        let deployment = bundle.deployment().clone();
+        let vocab = bundle.vocabulary().expect("vocabulary");
+        let model = CudaModel::load(&root.join(deployment.native_weights_path()), &deployment)
+            .expect("model");
+        let policy =
+            DecodePolicy::new(&deployment, &vocab, LanguageSelection::Auto).expect("policy");
+        let extractor =
+            ParakeetFeatureExtractor::new(&TranscriptionConfig::from_deployment(&deployment));
+
+        let reference = NemoReference::open(ParakeetVersion::V3, "b8");
+        let audio = reference.f32("audio");
+        let features: Vec<Array2<f32>> = reference
+            .i64("audio_len")
+            .iter()
+            .enumerate()
+            .map(|(row, len)| {
+                let samples: Vec<f32> = audio
+                    .index_axis(Axis(0), row)
+                    .iter()
+                    .take(*len as usize)
+                    .copied()
+                    .collect();
+                extractor.extract(&samples).expect("features")
+            })
+            .collect();
+        let run = |features: &Array2<f32>| -> RawTranscription {
+            let mut decoded = model
+                .transcribe_chunks(&[EncoderChunk::new(features.view())], &policy)
+                .expect("transcribe");
+            decoded.remove(0).raw
+        };
+        let expected: Vec<RawTranscription> = features.iter().map(run).collect();
+
+        let (shapes, largest) = {
+            let mut cache = model.0.shapes.lock().expect("cache");
+            let shapes = cache.shapes.len();
+            let largest = cache.shapes.values().map(|shape| shape.bytes).max();
+            cache.clear();
+            (shapes, largest.expect("a cached shape"))
+        };
+        assert!(
+            shapes >= 3,
+            "the utterances fall in {shapes} shapes; eviction needs 3"
+        );
+        model.0.shapes.lock().expect("cache").budget = 2 * largest;
+
+        let rows = features.len();
+        let order = (0..rows).chain((0..rows).rev()).chain(0..rows);
+        for (call, row) in order.enumerate() {
+            let raw = run(&features[row]);
+            let want = &expected[row];
+            assert_eq!(
+                raw.token_ids, want.token_ids,
+                "call {call} row {row} tokens"
+            );
+            assert_eq!(
+                raw.frame_indices, want.frame_indices,
+                "call {call} row {row} frames"
+            );
+            assert_eq!(
+                raw.durations, want.durations,
+                "call {call} row {row} durations"
+            );
+            assert_eq!(
+                raw.confidences, want.confidences,
+                "call {call} row {row} confidences"
+            );
+
+            let cache = model.0.shapes.lock().expect("cache");
+            let held: usize = cache.shapes.values().map(|shape| shape.bytes).sum();
+            assert_eq!(cache.bytes, held, "call {call}: cache byte count");
+            assert!(
+                cache.bytes <= cache.budget,
+                "call {call}: cache over budget"
+            );
+        }
+    }
 
     /// Transcribes the reference audio through the public pipeline on a native
     /// bundle, twice per utterance so the second pass replays the captured graphs,
@@ -232,9 +403,7 @@ mod tests {
     #[test]
     #[ignore = "needs a CUDA GPU, the native weights and the NeMo references; `just gpu-parity` runs it on gpu0"]
     fn gpu_pipeline_transcribes_like_nemo() {
-        let root = std::env::var_os("SCRIPTRS_NATIVE_MODELS")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| "/shared/models/scriptrs-native".into());
+        let root = native_root();
         for version in [ParakeetVersion::V2, ParakeetVersion::V3] {
             let deployment = match version {
                 ParakeetVersion::V2 => ParakeetDeployment::v2(),
@@ -250,7 +419,7 @@ mod tests {
                 let lens = reference.i64("audio_len");
                 for (row, expected) in reference.nemo_texts().iter().enumerate() {
                     let samples: Vec<f32> = audio
-                        .index_axis(ndarray::Axis(0), row)
+                        .index_axis(Axis(0), row)
                         .iter()
                         .take(lens[row] as usize)
                         .copied()
