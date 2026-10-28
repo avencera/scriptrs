@@ -690,7 +690,8 @@ mod vad {
             silero_fixture_probability(&second_window, first_mean),
         ];
 
-        let observed = vad.process(&audio, &config.vad).unwrap();
+        let control = crate::preprocessing::TranscriptionControl::internal_unbounded();
+        let observed = vad.process(&audio, &config.vad, &control).unwrap();
         assert_eq!(observed.len(), 2);
         for (observed, expected) in observed.iter().zip(expected) {
             assert!(
@@ -704,14 +705,14 @@ mod vad {
         let mut moved = audio.clone();
         moved[VAD_WINDOW_SAMPLES - 1] = 0.0;
         moved[100] = 0.5;
-        let moved_probabilities = vad.process(&moved, &config.vad).unwrap();
+        let moved_probabilities = vad.process(&moved, &config.vad, &control).unwrap();
         assert!((moved_probabilities[0] - observed[0]).abs() < 1e-6);
         assert!((moved_probabilities[1] - observed[1]).abs() > 1e-4);
 
         // state resets per recording
-        let again = vad.process(&audio, &config.vad).unwrap();
+        let again = vad.process(&audio, &config.vad, &control).unwrap();
         assert_eq!(again, observed);
-        assert!(vad.process(&[], &config.vad).unwrap().is_empty());
+        assert!(vad.process(&[], &config.vad, &control).unwrap().is_empty());
     }
 
     #[test]

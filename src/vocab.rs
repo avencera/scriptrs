@@ -1,6 +1,4 @@
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use crate::deployment::{ParakeetDeployment, VocabKind};
@@ -44,11 +42,26 @@ impl Vocabulary {
         path: impl AsRef<Path>,
         deployment: &ParakeetDeployment,
     ) -> Result<Self, TranscriptionError> {
+        let data = std::fs::read(path)?;
+        Self::from_bytes_for_deployment(&data, deployment)
+    }
+
+    /// Parse tokenizer bytes using a deployment's exact blank contract
+    pub fn from_bytes_for_deployment(
+        data: &[u8],
+        deployment: &ParakeetDeployment,
+    ) -> Result<Self, TranscriptionError> {
         match deployment.vocab_kind() {
-            VocabKind::SentencePieceTxt => Self::from_file_for_deployment(path, deployment),
+            VocabKind::SentencePieceTxt => {
+                Self::from_sentencepiece_bytes_for_deployment(data, deployment)
+            }
             VocabKind::JsonTokenizer => {
-                let data = std::fs::read_to_string(path)?;
-                Self::from_json_str_for_deployment(&data, deployment)
+                let text = std::str::from_utf8(data).map_err(|error| {
+                    TranscriptionError::InvalidVocabulary(format!(
+                        "JSON tokenizer is not UTF-8: {error}"
+                    ))
+                })?;
+                Self::from_json_str_for_deployment(text, deployment)
             }
         }
     }
@@ -85,7 +98,27 @@ impl Vocabulary {
             ));
         }
 
-        let vocabulary = parse_file(path, Some(deployment.blank_id()))?;
+        let data = std::fs::read(path)?;
+        Self::from_sentencepiece_bytes_for_deployment(&data, deployment)
+    }
+
+    /// Parse SentencePiece tokenizer bytes using a deployment's blank contract
+    pub fn from_sentencepiece_bytes_for_deployment(
+        data: &[u8],
+        deployment: &ParakeetDeployment,
+    ) -> Result<Self, TranscriptionError> {
+        if deployment.vocab_kind() != VocabKind::SentencePieceTxt {
+            return Err(TranscriptionError::InvalidVocabulary(
+                "SentencePiece tokenizer is not valid for this deployment".to_owned(),
+            ));
+        }
+
+        let text = std::str::from_utf8(data).map_err(|error| {
+            TranscriptionError::InvalidVocabulary(format!(
+                "SentencePiece tokenizer is not UTF-8: {error}"
+            ))
+        })?;
+        let vocabulary = parse_sentencepiece_text(text, Some(deployment.blank_id()))?;
         deployment.validate_vocabulary(&vocabulary)?;
         Ok(vocabulary)
     }
@@ -137,12 +170,22 @@ fn parse_file(
     path: impl AsRef<Path>,
     expected_blank_id: Option<usize>,
 ) -> Result<Vocabulary, TranscriptionError> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
+    let data = std::fs::read(path)?;
+    let text = std::str::from_utf8(&data).map_err(|error| {
+        TranscriptionError::InvalidVocabulary(format!(
+            "SentencePiece tokenizer is not UTF-8: {error}"
+        ))
+    })?;
+    parse_sentencepiece_text(text, expected_blank_id)
+}
+
+fn parse_sentencepiece_text(
+    text: &str,
+    expected_blank_id: Option<usize>,
+) -> Result<Vocabulary, TranscriptionError> {
     let mut entries = Vec::new();
 
-    for line in reader.lines() {
-        let line = line?;
+    for line in text.lines() {
         let mut parts = line.splitn(2, ' ');
         let Some(token) = parts.next() else {
             continue;

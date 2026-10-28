@@ -278,7 +278,7 @@ impl LongFormTranscriptionPipeline {
             .ok_or_else(|| self.inner.bundle().missing_vad_error())
             .map_err(PreprocessedTranscriptionError::from)?;
         let probabilities = vad
-            .process(audio, &config.vad)
+            .process(audio, &config.vad, control)
             .map_err(PreprocessedTranscriptionError::from)?;
         control.check()?;
         let regions = detect_speech_regions(
@@ -459,10 +459,10 @@ impl LongFormTranscriptionPipeline {
                                 WindowIndex::new(task_idx),
                             )
                             .map(|raw| CompletedTask { task_idx, raw });
-                            if let Err(error) = &result {
-                                if should_cancel_after_error(error) {
-                                    control.cancel();
-                                }
+                            if let Err(error) = &result
+                                && should_cancel_after_error(error)
+                            {
+                                control.cancel();
                             }
                             if sender.send(result).is_err() {
                                 break;
@@ -868,7 +868,13 @@ fn remember_parallel_error<E>(
         | Some(PreprocessedTranscriptionError::Transcription(
             TranscriptionError::DeadlineExpired,
         )) => {
-            if matches!(error, PreprocessedTranscriptionError::Preprocessing(_)) {
+            if !matches!(
+                error,
+                PreprocessedTranscriptionError::Transcription(TranscriptionError::Cancelled)
+                    | PreprocessedTranscriptionError::Transcription(
+                        TranscriptionError::DeadlineExpired
+                    )
+            ) {
                 *first_error = Some(error);
             }
         }

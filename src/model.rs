@@ -456,8 +456,9 @@ mod tests {
             token_id: 2,
             token_prob: 0.8,
             duration_bin: 2,
-            top_k_ids: Some(vec![2, 1]),
-            top_k_logits: Some(vec![5.0, 1.0]),
+            top_k: Some(
+                crate::language::TopKCandidates::from_parallel(vec![2, 1], vec![5.0, 1.0]).unwrap(),
+            ),
         };
         let decoded = decode_joint_outputs(
             &outputs,

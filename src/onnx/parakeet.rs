@@ -219,8 +219,7 @@ impl ParakeetOnnxModel {
                 token_id,
                 token_prob,
                 duration_bin,
-                top_k_ids,
-                top_k_logits,
+                top_k: JointOutputs::bind_top_k(top_k_ids, top_k_logits)?,
             })
         })
     }

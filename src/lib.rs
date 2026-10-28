@@ -100,10 +100,11 @@
 //! Single-chunk transcription:
 //!
 //! ```no_run
+//! # #[cfg(feature = "online")]
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! use scriptrs::TranscriptionPipeline;
 //!
 //! # fn load_audio() -> Vec<f32> { Vec::new() }
-//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let audio = load_audio();
 //! let pipeline = TranscriptionPipeline::from_pretrained()?;
 //! let result = pipeline.run(&audio)?;
@@ -111,6 +112,8 @@
 //! println!("{}", result.text);
 //! # Ok(())
 //! # }
+//! # #[cfg(not(feature = "online"))]
+//! # fn main() {}
 //! ```
 //!
 //! Long-form transcription:
@@ -187,8 +190,8 @@ pub use deployment::{
 };
 pub use error::TranscriptionError;
 pub use language::{
-    FilteredToken, LanguageSelection, ParakeetLanguage, Script, V3_LANGUAGES,
-    detect_language_from_tokens, filter_top_k_language, select_language_from_logits,
+    FilteredToken, LanguageSelection, ParakeetLanguage, Script, TopKCandidates, TopKPair,
+    V3_LANGUAGES, detect_language_from_tokens, filter_top_k_language, select_language_from_logits,
 };
 #[cfg(feature = "long-form")]
 pub use long_form::{

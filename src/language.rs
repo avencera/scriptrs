@@ -281,41 +281,86 @@ pub fn detect_language_from_tokens(
     None
 }
 
+/// One joint-head top-K candidate
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TopKPair {
+    /// Token id at this rank
+    pub token_id: usize,
+    /// Raw joint logit at this rank
+    pub logit: f32,
+}
+
+/// Nonempty top-K id/logit pairs from one joint step
+#[derive(Debug, Clone, PartialEq)]
+pub struct TopKCandidates {
+    pairs: Vec<TopKPair>,
+}
+
+impl TopKCandidates {
+    /// Bind parallel id and logit vectors into one nonempty candidate list
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TranscriptionError::InvalidModelOutput`] when the vectors are
+    /// empty or have different lengths
+    pub fn from_parallel(ids: Vec<usize>, logits: Vec<f32>) -> Result<Self, TranscriptionError> {
+        if ids.is_empty() || logits.is_empty() {
+            return Err(TranscriptionError::InvalidModelOutput(
+                "joint top-k candidates are empty".to_owned(),
+            ));
+        }
+        if ids.len() != logits.len() {
+            return Err(TranscriptionError::InvalidModelOutput(format!(
+                "joint top-k id/logit length mismatch: ids={} logits={}",
+                ids.len(),
+                logits.len()
+            )));
+        }
+
+        Ok(Self {
+            pairs: ids
+                .into_iter()
+                .zip(logits)
+                .map(|(token_id, logit)| TopKPair { token_id, logit })
+                .collect(),
+        })
+    }
+
+    /// Ordered candidate pairs
+    pub fn pairs(&self) -> &[TopKPair] {
+        &self.pairs
+    }
+}
+
 /// Pick the highest-logit top-K token whose script matches `language`
 ///
 /// Blank tokens are never replaced. Returned probability is softmax over the
 /// supplied top-K logits only, not the full vocabulary. Non-finite logits are
 /// rejected.
 pub fn filter_top_k_language(
-    top_k_ids: &[usize],
-    top_k_logits: &[f32],
+    top_k: &TopKCandidates,
     vocabulary: &Vocabulary,
     language: ParakeetLanguage,
     blank_id: usize,
 ) -> Result<Option<FilteredToken>, TranscriptionError> {
-    validate_candidate_logits(top_k_logits)?;
-    let count = top_k_ids.len().min(top_k_logits.len());
-    if count == 0 {
-        return Ok(None);
-    }
+    let logits: Vec<f32> = top_k.pairs().iter().map(|pair| pair.logit).collect();
+    validate_candidate_logits(&logits)?;
 
     let preferred_script = language.script();
     let mut best_idx = None;
     let mut best_logit = f32::NEG_INFINITY;
-    for index in 0..count {
-        let token_id = top_k_ids[index];
-        if token_id == blank_id {
+    for (index, pair) in top_k.pairs().iter().enumerate() {
+        if pair.token_id == blank_id {
             continue;
         }
-        let Some(token_text) = vocabulary.token(token_id) else {
+        let Some(token_text) = vocabulary.token(pair.token_id) else {
             continue;
         };
         if !token_matches_script(token_text, preferred_script) {
             continue;
         }
-        let logit = top_k_logits[index];
-        if best_idx.is_none() || logit > best_logit {
-            best_logit = logit;
+        if best_idx.is_none() || pair.logit > best_logit {
+            best_logit = pair.logit;
             best_idx = Some(index);
         }
     }
@@ -324,32 +369,32 @@ pub fn filter_top_k_language(
     };
 
     let mut max_logit = f32::NEG_INFINITY;
-    for logit in top_k_logits.iter().copied().take(count) {
-        if logit > max_logit {
-            max_logit = logit;
+    for pair in top_k.pairs() {
+        if pair.logit > max_logit {
+            max_logit = pair.logit;
         }
     }
     if !max_logit.is_finite() {
         return Ok(Some(FilteredToken {
-            token_id: top_k_ids[best_idx],
+            token_id: top_k.pairs()[best_idx].token_id,
             probability: 0.0,
         }));
     }
 
     let mut sum_exp = 0.0f32;
-    for logit in top_k_logits.iter().copied().take(count) {
-        sum_exp += (logit - max_logit).exp();
+    for pair in top_k.pairs() {
+        sum_exp += (pair.logit - max_logit).exp();
     }
     if sum_exp <= 0.0 {
         return Ok(Some(FilteredToken {
-            token_id: top_k_ids[best_idx],
+            token_id: top_k.pairs()[best_idx].token_id,
             probability: 0.0,
         }));
     }
 
-    let probability = ((top_k_logits[best_idx] - max_logit).exp() / sum_exp).clamp(0.0, 1.0);
+    let probability = ((top_k.pairs()[best_idx].logit - max_logit).exp() / sum_exp).clamp(0.0, 1.0);
     Ok(Some(FilteredToken {
-        token_id: top_k_ids[best_idx],
+        token_id: top_k.pairs()[best_idx].token_id,
         probability,
     }))
 }
@@ -412,8 +457,8 @@ fn char_matches_script(character: char, script: Script) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        LanguageSelection, ParakeetLanguage, V3_LANGUAGES, detect_language_from_tokens,
-        filter_top_k_language, select_language_from_logits,
+        LanguageSelection, ParakeetLanguage, TopKCandidates, V3_LANGUAGES,
+        detect_language_from_tokens, filter_top_k_language, select_language_from_logits,
     };
     use crate::deployment::ParakeetVersion;
     use crate::error::TranscriptionError;
@@ -490,8 +535,7 @@ mod tests {
         let vocabulary = vocab(&["<unk>", "cat", "<blk>"]);
         assert!(matches!(
             filter_top_k_language(
-                &[1],
-                &[f32::INFINITY],
+                &TopKCandidates::from_parallel(vec![1], vec![f32::INFINITY]).unwrap(),
                 &vocabulary,
                 ParakeetLanguage::English,
                 2,
@@ -505,8 +549,7 @@ mod tests {
     fn top_k_filter_maps_known_logits_to_known_language_ids() {
         let vocabulary = vocab(&["<unk>", "<pl>", "<ru>", "kot", "кот", "<blk>"]);
         let filtered = filter_top_k_language(
-            &[4, 3, 1],
-            &[9.0, 2.0, 1.0],
+            &TopKCandidates::from_parallel(vec![4, 3, 1], vec![9.0, 2.0, 1.0]).unwrap(),
             &vocabulary,
             ParakeetLanguage::Polish,
             5,
@@ -520,8 +563,7 @@ mod tests {
     fn top_k_filter_keeps_cyrillic_for_russian() {
         let vocabulary = vocab(&["<unk>", "cat", "кот", "<blk>"]);
         let filtered = filter_top_k_language(
-            &[1, 2],
-            &[8.0, 1.5],
+            &TopKCandidates::from_parallel(vec![1, 2], vec![8.0, 1.5]).unwrap(),
             &vocabulary,
             ParakeetLanguage::Russian,
             3,
