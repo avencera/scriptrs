@@ -1,5 +1,5 @@
 fmt:
-    cargo fmt --all
+    cargo fmt
 
 clippy:
     cargo clippy --all --all-targets --all-features -- -D warnings
