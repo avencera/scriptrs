@@ -209,7 +209,7 @@ dependencies = [
 [[package]]
 name = "cudakit"
 version = "0.1.0"
-source = "git+https://github.com/avencera/cudakit?rev=414713603a2cf721283e71ded88cd10014efdf45#414713603a2cf721283e71ded88cd10014efdf45"
+source = "git+https://github.com/avencera/cudakit?rev=bcb03304b8f0325b2a0e91bd91f5de0ddd0acf4d#bcb03304b8f0325b2a0e91bd91f5de0ddd0acf4d"
 dependencies = [
  "cudarc",
  "libloading",
