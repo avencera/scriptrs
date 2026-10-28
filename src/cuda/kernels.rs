@@ -747,6 +747,17 @@ pub(crate) struct DecodeOutput<'a> {
     pub confidences: CudaViewMut<'a, f32>,
 }
 
+/// Widest language filter `decode_decide` takes, its `MAX_FILTER_TOP_K`
+pub(crate) const MAX_FILTER_TOP_K: usize = 256;
+
+/// Language filter of a decode step, as `decode_decide` reads it
+pub(crate) struct DecodeFilter<'a> {
+    /// `[classes]`, nonzero for the token ids the filter allows
+    pub allowed: CudaView<'a, u32>,
+    /// `[1]`, the filter's top-K width, or 0 for no filter
+    pub top_k: CudaView<'a, u32>,
+}
+
 /// Joint and duration geometry of one decode step
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DecodeShape {
@@ -829,6 +840,10 @@ impl DecodeKernels {
     }
 
     /// Token decision and frame advance for every unfinished row
+    ///
+    /// A nonzero `filter.top_k` must be at most `shape.classes` and
+    /// [`MAX_FILTER_TOP_K`]; the kernel clamps it to stay in bounds, so a wider one
+    /// would search fewer candidates than asked
     #[allow(
         clippy::too_many_arguments,
         reason = "launchers mirror their kernel's parameter list so each launch reads against it"
@@ -839,6 +854,7 @@ impl DecodeKernels {
         logits: &CudaView<'_, f32>,
         lens_frames: &CudaView<'_, u32>,
         durations: &CudaView<'_, u32>,
+        filter: &DecodeFilter<'_>,
         state: &mut DecodeState<'_>,
         output: &mut DecodeOutput<'_>,
         shape: DecodeShape,
@@ -851,6 +867,8 @@ impl DecodeKernels {
             logits.len(),
         )?;
         check_len("frame lengths", batch, lens_frames.len())?;
+        check_len("allowed tokens", shape.classes, filter.allowed.len())?;
+        check_len("language filter", 1, filter.top_k.len())?;
         for (context, buffer) in [
             ("frame cursors", &state.frame),
             ("emitted counts", &state.emitted),
@@ -883,6 +901,8 @@ impl DecodeKernels {
             len(logits),
             len(lens_frames),
             len(durations),
+            len(&filter.allowed),
+            len(&filter.top_k),
             len_mut(&state.frame),
             len_mut(&state.emitted),
             len_mut(&state.label),
@@ -909,27 +929,32 @@ impl DecodeKernels {
             .arg(durations)
             .arg(&lens[2]);
         launch
-            .arg(&mut state.frame)
+            .arg(&filter.allowed)
             .arg(&lens[3])
+            .arg(&filter.top_k)
+            .arg(&lens[4]);
+        launch
+            .arg(&mut state.frame)
+            .arg(&lens[5])
             .arg(&mut state.emitted)
-            .arg(&lens[4])
+            .arg(&lens[6])
             .arg(&mut state.label)
-            .arg(&lens[5]);
+            .arg(&lens[7]);
         launch
             .arg(&mut state.emit)
-            .arg(&lens[6])
+            .arg(&lens[8])
             .arg(&mut state.counts)
-            .arg(&lens[7])
+            .arg(&lens[9])
             .arg(&mut state.faults)
-            .arg(&lens[8]);
+            .arg(&lens[10]);
         launch
             .arg(&mut output.tokens)
-            .arg(&lens[9])
+            .arg(&lens[11])
             .arg(&mut output.frames)
-            .arg(&lens[10])
+            .arg(&lens[12])
             .arg(&mut output.durations)
-            .arg(&lens[11]);
-        launch.arg(&mut output.confidences).arg(&lens[12]);
+            .arg(&lens[13]);
+        launch.arg(&mut output.confidences).arg(&lens[14]);
         for dim in &dims {
             launch.arg(dim);
         }

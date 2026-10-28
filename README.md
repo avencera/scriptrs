@@ -97,8 +97,8 @@ The `cuda` feature runs Parakeet on an NVIDIA GPU, in FP32, with no ONNX Runtime
 or PyTorch. On NeMo reference inputs (LibriSpeech utterances and a two-minute
 Earnings-21 excerpt) its tokens and timestamps match NVIDIA NeMo's greedy decode
 exactly. It is built from this
-repository only for now, and does not yet support the v3 language filter, top-K
-candidates or VAD.
+repository only for now. It supports the v3 language filter; VAD is not supported
+yet.
 
 It loads native weights rather than Core ML models:
 

@@ -12,7 +12,8 @@
 //! by file stem for `dev-tools/nemo/long_wer.py`. `--window` and `--overlap`
 //! (seconds) override the overlap plan and `--batch` the windows per model call;
 //! at batch 1 the windows run one at a time on one worker, and above it the
-//! default workers prepare windows ahead of the model
+//! default workers prepare windows ahead of the model. `--language <code>` decodes
+//! with that language's filter instead of automatic language selection
 //!
 //! ```sh
 //! cargo run --release --features cuda,long-form --example cuda_bench -- \
@@ -29,8 +30,8 @@ use std::time::Instant;
 use eyre::{Result, bail, eyre};
 use hound::WavReader;
 use scriptrs::{
-    LongFormConfig, LongFormTranscriptionPipeline, ModelBundle, ParakeetDeployment,
-    TranscriptionPipeline,
+    LanguageSelection, LongFormConfig, LongFormTranscriptionPipeline, ModelBundle,
+    ParakeetDeployment, ParakeetLanguage, TranscriptionConfig, TranscriptionPipeline,
 };
 use serde_json::{Value, json};
 
@@ -46,6 +47,7 @@ struct Args {
     window_s: Option<f64>,
     overlap_s: Option<f64>,
     batch: Option<usize>,
+    language: LanguageSelection,
 }
 
 struct Utterance {
@@ -68,7 +70,7 @@ fn run() -> Result<()> {
     let version = format!("{:?}", args.deployment.version());
     let bundle = ModelBundle::from_native_dir(&args.models, args.deployment.clone());
     let (audio_s, walls, texts, batch) = if args.long.is_empty() {
-        bench_manifest(bundle, &args.manifest, args.repeats)?
+        bench_manifest(bundle, &args.manifest, args.repeats, args.language)?
     } else {
         bench_long(bundle, &args.long, &args)?
     };
@@ -112,8 +114,17 @@ fn median(sorted: &[f64]) -> f64 {
 /// model call
 type Bench = (f64, Vec<f64>, BTreeMap<String, String>, usize);
 
-fn bench_manifest(bundle: ModelBundle, manifest: &Path, repeats: usize) -> Result<Bench> {
+fn bench_manifest(
+    bundle: ModelBundle,
+    manifest: &Path,
+    repeats: usize,
+    language: LanguageSelection,
+) -> Result<Bench> {
     let pipeline = TranscriptionPipeline::from_bundle(bundle)?;
+    let config = TranscriptionConfig {
+        language,
+        ..pipeline.config().clone()
+    };
     let mut utterances = load_manifest(manifest)?;
     utterances.sort_by(|a, b| b.audio.len().cmp(&a.audio.len()).then(a.id.cmp(&b.id)));
     let audio_s: f64 = utterances
@@ -125,7 +136,7 @@ fn bench_manifest(bundle: ModelBundle, manifest: &Path, repeats: usize) -> Resul
     };
 
     for utterance in [longest, shortest] {
-        pipeline.run(&utterance.audio)?;
+        pipeline.run_with_config(&utterance.audio, &config)?;
     }
 
     let mut walls = Vec::with_capacity(repeats);
@@ -134,7 +145,7 @@ fn bench_manifest(bundle: ModelBundle, manifest: &Path, repeats: usize) -> Resul
         texts.clear();
         let started = Instant::now();
         for utterance in &utterances {
-            let text = pipeline.run(&utterance.audio)?.text;
+            let text = pipeline.run_with_config(&utterance.audio, &config)?.text;
             texts.insert(utterance.id.clone(), text);
         }
         walls.push(started.elapsed().as_secs_f64());
@@ -144,6 +155,7 @@ fn bench_manifest(bundle: ModelBundle, manifest: &Path, repeats: usize) -> Resul
 
 fn bench_long(bundle: ModelBundle, paths: &[PathBuf], args: &Args) -> Result<Bench> {
     let mut config = LongFormConfig::for_bundle(&bundle);
+    config.transcription.language = args.language;
     if let Some(batch) = args.batch {
         config.batch_size = batch;
     }
@@ -221,6 +233,7 @@ fn parse_args() -> Result<Args> {
     let mut window_s = None;
     let mut overlap_s = None;
     let mut batch = None;
+    let mut language = LanguageSelection::Auto;
     let mut args = env::args().skip(1);
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| eyre!("{flag} needs a value"));
@@ -240,6 +253,12 @@ fn parse_args() -> Result<Args> {
             "--window" => window_s = Some(value()?.parse()?),
             "--overlap" => overlap_s = Some(value()?.parse()?),
             "--batch" => batch = Some(value()?.parse()?),
+            "--language" => {
+                let code = value()?;
+                let parsed = ParakeetLanguage::from_code(&code)
+                    .ok_or_else(|| eyre!("unknown language {code}"))?;
+                language = LanguageSelection::Language(parsed);
+            }
             other => return Err(eyre!("unknown argument {other}")),
         }
     }
@@ -254,6 +273,7 @@ fn parse_args() -> Result<Args> {
         window_s,
         overlap_s,
         batch,
+        language,
     })
 }
 

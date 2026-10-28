@@ -69,7 +69,7 @@ impl<'a> DecodePolicy<'a> {
     ///
     /// A filter applies when the deployment has a top-K language filter and the
     /// run selected one explicit language.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(any(test, feature = "cuda")), allow(dead_code))]
     pub(crate) fn language_mask(&self) -> Option<LanguageMask> {
         let top_k = self.deployment.language_filter_top_k()?;
         let language = self.language.explicit()?;
@@ -111,6 +111,15 @@ impl LanguageMask {
     /// Candidate count the filter searches, ranked by logit
     pub(crate) fn top_k(&self) -> usize {
         self.top_k
+    }
+
+    /// Whether each token id may be chosen, indexed by id, with `blank_id + 1` entries
+    #[cfg_attr(
+        not(feature = "cuda"),
+        allow(dead_code, reason = "only the CUDA backend uploads the mask")
+    )]
+    pub(crate) fn allowed(&self) -> &[bool] {
+        &self.allowed
     }
 }
 

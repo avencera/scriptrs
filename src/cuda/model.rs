@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use cudakit::{Graph, Library, Options};
 
-use crate::backend::{ChunkDecode, DecodePolicy, EncoderChunk};
+use crate::backend::{ChunkDecode, DecodePolicy, EncoderChunk, LanguageMask};
 use crate::cuda::decoder::{CudaDecoder, DecodeWorkspace};
 use crate::cuda::encoder::{CudaEncoder, EncoderWorkspace};
 use crate::cuda::kernels::CudaRuntime;
@@ -155,10 +155,9 @@ impl CudaModel {
         chunks: &[EncoderChunk<'_>],
         policy: &DecodePolicy<'_>,
     ) -> Result<Vec<ChunkDecode>, TranscriptionError> {
-        if policy.language_mask().is_some() || policy.keep_top_k() {
+        if policy.keep_top_k() {
             return Err(TranscriptionError::InvalidConfiguration(
-                "the CUDA backend does not apply the language filter or return top-K candidates yet"
-                    .to_owned(),
+                "the CUDA backend does not return top-K candidates".to_owned(),
             ));
         }
         if chunks.is_empty() {
@@ -212,7 +211,7 @@ impl CudaModel {
         let shape = shapes.get(key).ok_or_else(|| {
             TranscriptionError::InvalidModelOutput("a cached CUDA shape went missing".to_owned())
         })?;
-        engine.transcribe(shape, &mel, &lens)
+        engine.transcribe(shape, &mel, &lens, policy.language_mask().as_ref())
     }
 }
 
@@ -237,6 +236,7 @@ impl Engine {
         shape: &mut Shape,
         mel: &[f32],
         lens: &[usize],
+        language: Option<&LanguageMask>,
     ) -> Result<Vec<ChunkDecode>, TranscriptionError> {
         let runtime = &self.runtime;
         self.encoder
@@ -257,6 +257,9 @@ impl Engine {
             }
         }
 
+        // written outside capture, so the decode graph reads this call's filter
+        self.decoder
+            .set_language(runtime, &mut shape.decoder, language)?;
         self.decoder.start(
             runtime,
             &mut shape.decoder,
@@ -305,10 +308,11 @@ mod tests {
     use crate::decode::RawTranscription;
     use crate::deployment::{ParakeetDeployment, ParakeetVersion};
     use crate::frontend::ParakeetFeatureExtractor;
-    use crate::language::LanguageSelection;
+    use crate::language::{LanguageSelection, ParakeetLanguage};
     use crate::models::ModelBundle;
     use crate::pipeline::TranscriptionPipeline;
     use crate::test_support::NemoReference;
+    use crate::types::TranscriptionResult;
 
     /// Runs each b8 utterance alone under a cache budget of two of the largest
     /// shapes, forward, backward and forward again, so calls keep evicting shapes and
@@ -466,5 +470,95 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Transcribes the b8 English audio with the language set to English, whose
+    /// Latin-script filter allows every token the automatic run emits: the tokens
+    /// stay the same while the confidences become softmaxes over the top-K logits.
+    /// The filtered run replays the graphs the automatic run captured, and a last
+    /// automatic run holds that the filter turns off again
+    #[test]
+    #[ignore = "needs a CUDA GPU, the native weights and the NeMo references; `just gpu-parity` runs it on gpu0"]
+    fn gpu_english_filter_keeps_the_automatic_tokens() {
+        let bundle = ModelBundle::from_native_dir(native_root(), ParakeetDeployment::v3());
+        let deployment = bundle.deployment().clone();
+        let vocab = bundle.vocabulary().expect("vocabulary");
+        let pipeline = TranscriptionPipeline::from_bundle(bundle).expect("pipeline");
+        let automatic = pipeline.config().clone();
+        let english = TranscriptionConfig {
+            language: LanguageSelection::Language(ParakeetLanguage::English),
+            ..automatic.clone()
+        };
+        let policy = DecodePolicy::new(&deployment, &vocab, english.language).expect("policy");
+        let mask = policy
+            .language_mask()
+            .expect("v3 filters an explicit language");
+        let ids = |result: &TranscriptionResult| -> Vec<u32> {
+            result.tokens.iter().map(|token| token.token_id).collect()
+        };
+        let confidences = |result: &TranscriptionResult| -> Vec<f32> {
+            result.tokens.iter().map(|token| token.confidence).collect()
+        };
+
+        let reference = NemoReference::open(ParakeetVersion::V3, "b8");
+        let audio = reference.f32("audio");
+        let lens = reference.i64("audio_len");
+        let mut rescored = 0;
+        for (row, len) in lens.iter().enumerate() {
+            let samples: Vec<f32> = audio
+                .index_axis(Axis(0), row)
+                .iter()
+                .take(*len as usize)
+                .copied()
+                .collect();
+            let first = pipeline
+                .run_with_config(&samples, &automatic)
+                .expect("automatic");
+            let filtered = pipeline
+                .run_with_config(&samples, &english)
+                .expect("english");
+            let last = pipeline
+                .run_with_config(&samples, &automatic)
+                .expect("automatic again");
+
+            // the premise: a filter that allows every argmax never changes a token
+            assert!(!first.tokens.is_empty(), "row {row}: no tokens");
+            assert!(
+                first
+                    .tokens
+                    .iter()
+                    .all(|token| mask.allowed()[token.token_id as usize]),
+                "row {row}: the automatic run emitted a non-Latin token"
+            );
+            assert_eq!(ids(&filtered), ids(&first), "row {row} token ids");
+            assert_eq!(filtered.text, first.text, "row {row} text");
+            for (index, (filtered, first)) in filtered.tokens.iter().zip(&first.tokens).enumerate()
+            {
+                // a softmax over a subset of the logits that holds the max scores the
+                // max at least as high, up to f32 rounding
+                assert!(
+                    filtered.confidence >= first.confidence - 1e-6,
+                    "row {row} token {index}: {} below {}",
+                    filtered.confidence,
+                    first.confidence
+                );
+                if filtered.confidence != first.confidence {
+                    rescored += 1;
+                }
+            }
+            assert_eq!(
+                ids(&last),
+                ids(&first),
+                "row {row}: tokens after the filter"
+            );
+            assert_eq!(
+                confidences(&last),
+                confidences(&first),
+                "row {row}: confidences after the filter"
+            );
+        }
+
+        println!("{rescored} tokens rescored by the top-K softmax");
+        assert!(rescored > 0, "no confidence came from the top-K softmax");
     }
 }

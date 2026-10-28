@@ -18,6 +18,10 @@ use crate::language::TopKCandidates;
 #[cfg(target_os = "macos")]
 pub(crate) use host_loop::{HostLoop, StepRuntime};
 pub(crate) use policy::DecodePolicy;
+#[cfg(feature = "cuda")]
+pub(crate) use policy::LanguageMask;
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) use policy::decide_from_logits;
 
 /// Log-mel input for one chunk, in `[frames, features]` order
 #[derive(Debug, Clone, Copy)]
