@@ -939,8 +939,9 @@ mod tests {
             // the eager pass also finishes cuBLAS's lazy setup before capture
             encoder.enqueue(&runtime, &mut ws).expect("eager");
             let eager = runtime.stream().clone_dtoh(ws.output()).expect("download");
-            let graph = runtime
-                .capture_nonempty(|| encoder.enqueue(&runtime, &mut ws))
+            // SAFETY: the graph is declared after `ws` and `encoder`, so it drops before
+            // the buffers it points at, which stay in place on the runtime's stream
+            let graph = unsafe { runtime.capture_nonempty(|| encoder.enqueue(&runtime, &mut ws)) }
                 .expect("capture");
             graph.launch().expect("replay");
             let replayed = runtime.stream().clone_dtoh(ws.output()).expect("download");
