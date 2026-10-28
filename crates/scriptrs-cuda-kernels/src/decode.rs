@@ -1,10 +1,11 @@
-//! Greedy TDT decode around the cuBLAS GEMMs of the predictor and joint
+//! Greedy TDT decode around the cuBLAS GEMM of the joint
 //!
-//! One decode step for a whole batch is: joint input, joint GEMM, [`decode_decide`],
-//! then the predictor for the rows that emitted. The frame advance lives on the
-//! device, so the host can replay a captured step many times and only read back the
-//! frame cursors. Rows are batch rows; per-row state is `[batch]` and activations
-//! are `[batch, width]`, row-major
+//! One decode step for a whole batch is: the joint GEMM, [`decode_decide`], one
+//! [`decode_lstm`] per predictor layer, then [`decode_project`], which also prepares
+//! the next step's joint input. The frame advance lives on the device, so the host
+//! can replay a captured step many times and only read back the frame cursors. Rows
+//! are batch rows; per-row state is `[batch]` and activations are `[batch, width]`,
+//! row-major
 
 use cuda_device::atomic::{AtomicOrdering, BlockAtomicU32};
 use cuda_device::{DisjointSlice, SharedArray, kernel, thread, warp};
@@ -21,6 +22,21 @@ const RADIX_BINS: usize = 256;
 /// Digit of a key outside the radix select's current prefix
 const NO_DIGIT: u32 = RADIX_BINS as u32;
 
+/// LSTM gates per unit: input, forget, cell, output
+const LSTM_GATES: usize = 4;
+
+/// Batch rows [`decode_lstm`] and [`decode_project`] carry through one pass, so
+/// each weight a thread holds serves this many rows per pass
+const PASS_ROWS: usize = 8;
+
+/// Warps per block of [`decode_lstm`] and [`decode_project`], which split each
+/// weight row between them
+pub const ROW_WARPS: usize = 4;
+
+/// Weight columns each thread of those blocks holds in registers, so `hidden` is
+/// at most `ROW_WARPS * 32 * ROW_STEPS`
+pub const ROW_STEPS: usize = 8;
+
 /// Encoder frame the next joint step reads for row `b`, clamped so finished rows
 /// still read inside their own frames
 #[inline(always)]
@@ -32,38 +48,11 @@ fn joint_frame(frame: u32, len: u32) -> usize {
     }
 }
 
-/// `out = relu(enc_proj[b, frame[b]] + pred_proj[b])`, NeMo's joint input after its
-/// two projections
-///
-/// One thread per element of `[batch, hidden]`; `enc_proj` is `[batch, frames,
-/// hidden]`
-#[kernel]
-pub fn decode_joint_input(
-    enc_proj: &[f32],
-    pred_proj: &[f32],
-    frame: &[u32],
-    lens: &[u32],
-    mut out: DisjointSlice<f32>,
-    frames: u32,
-    hidden: u32,
-) {
-    let i = thread::index_1d().get();
-    if i >= out.len() {
-        return;
-    }
-
-    let hidden = hidden as usize;
-    let (b, j) = (i / hidden, i % hidden);
-    let t = joint_frame(frame[b], lens[b]);
-    let value = enc_proj[(b * frames as usize + t) * hidden + j] + pred_proj[i];
-    // SAFETY: `i < out.len()` was checked above
-    unsafe { *out.get_unchecked_mut(i) = value.max(0.0) };
-}
-
 /// First maximum over the block: the largest value, lowest index on ties
 #[inline(always)]
 fn block_argmax(value: f32, index: u32, values: *mut f32, indices: *mut u32) -> (f32, u32) {
-    let better = |v: f32, i: u32, best_v: f32, best_i: u32| v > best_v || (v == best_v && i < best_i);
+    let better =
+        |v: f32, i: u32, best_v: f32, best_i: u32| v > best_v || (v == best_v && i < best_i);
     let warp_index = thread::threadIdx_x() as usize / 32;
     let warps = thread::blockDim_x() as usize / 32;
     let (mut best_v, mut best_i) = (value, index);
@@ -159,24 +148,31 @@ fn key_value(key: u32) -> f32 {
     f32::from_bits(bits)
 }
 
-/// This thread's share of `sum(exp(logit - row_max))` over the row's class logits
+/// Class logits each `decode_decide` thread holds in registers, so the decision
+/// reads the row from memory once and every load of a thread is in flight at once
+pub const DECIDE_VALUES: usize = 12;
+
+/// The first maximum of the duration logits, one per lane of warp 0 (`index` is
+/// `u32::MAX` past them), and whether they are all finite, on every lane
 ///
-/// A NaN or +inf logit already makes the sum NaN, but a -inf adds 0; with `strict`
-/// any non-finite logit makes it NaN, which marks the row as faulted
+/// For finite logits this is the sequential first argmax; a non-finite one faults
+/// the row, so its pick only has to stay in range
 #[inline(always)]
-fn exp_sum(logits: &[f32], row: usize, classes: usize, row_max: f32, strict: bool) -> f32 {
-    let threads = thread::blockDim_x() as usize;
-    let mut sum = 0.0f32;
-    let mut i = thread::threadIdx_x() as usize;
-    while i < classes {
-        let v = logits[row + i];
-        sum += (v - row_max).exp();
-        if strict && !v.is_finite() {
-            sum = f32::NAN;
+fn duration_argmax(value: f32, index: u32) -> (usize, bool) {
+    let mut finite = u32::from(index == u32::MAX || value.is_finite());
+    let (mut best_v, mut best_i) = (value, index);
+    let mut offset = 16u32;
+    while offset > 0 {
+        let v = warp::shuffle_xor_f32(best_v, offset);
+        let i = warp::shuffle_xor(best_i, offset);
+        if i != u32::MAX && (best_i == u32::MAX || v > best_v || (v == best_v && i < best_i)) {
+            best_v = v;
+            best_i = i;
         }
-        i += threads;
+        finite &= warp::shuffle_xor(finite, offset);
+        offset /= 2;
     }
-    sum
+    (best_i as usize, finite != 0)
 }
 
 /// Shared memory the language filter works in
@@ -521,26 +517,65 @@ pub fn decode_decide(
     let top_k = filter[0].min(classes).min(MAX_FILTER_TOP_K as u32);
     let classes = classes as usize;
     let row = b * (classes + durations.len());
+
+    // a constant trip count unrolls the loads, so they are all in flight at once;
+    // the host keeps `classes` within `DECIDE_VALUES` per thread
+    let mut values = [0.0f32; DECIDE_VALUES];
+    let mut n = 0;
+    #[unroll]
+    while n < DECIDE_VALUES {
+        let i = tid + n * threads;
+        if i < classes {
+            // SAFETY: the host sizes `logits` to `[batch, classes + durations]` and `b`
+            // is a batch row; an unchecked read has no trap branch, so the loads
+            // issue together
+            values[n] = unsafe { *logits.get_unchecked(row + i) };
+        }
+        n += 1;
+    }
+    // warp 0 fetches the duration logits alongside, one per lane
+    let (duration_v, duration_i) = if tid < durations.len() {
+        (logits[row + classes + tid], tid as u32)
+    } else {
+        (f32::NEG_INFINITY, u32::MAX)
+    };
+
     let mut best_v = f32::NEG_INFINITY;
     let mut best_i = u32::MAX;
-    let mut i = tid;
-    while i < classes {
-        let v = logits[row + i];
-        if best_i == u32::MAX || v > best_v {
-            best_v = v;
-            best_i = i as u32;
+    let mut count = 0;
+    let mut n = 0;
+    #[unroll]
+    while n < DECIDE_VALUES {
+        let i = tid + n * threads;
+        if i < classes {
+            let v = values[n];
+            if best_i == u32::MAX || v > best_v {
+                best_v = v;
+                best_i = i as u32;
+            }
+            count += 1;
         }
-        i += threads;
+        n += 1;
     }
     let (row_max, token) = block_argmax(best_v, best_i, scratch, scratch_index);
 
-    // constant arguments, so each call inlines to its own loop and the unfiltered
-    // one carries no finiteness check
-    let sum = if top_k == 0 {
-        exp_sum(logits, row, classes, row_max, false)
-    } else {
-        exp_sum(logits, row, classes, row_max, true)
-    };
+    // this thread's share of `sum(exp(logit - row_max))`, in column order. A NaN or
+    // +inf logit already makes the sum NaN, but a -inf adds 0; the filter's host
+    // rule rejects any non-finite logit, so with a filter one makes the sum NaN,
+    // which marks the row as faulted
+    let mut sum = 0.0f32;
+    let mut n = 0;
+    #[unroll]
+    while n < DECIDE_VALUES {
+        if n < count {
+            let v = values[n];
+            sum += (v - row_max).exp();
+            if top_k != 0 && !v.is_finite() {
+                sum = f32::NAN;
+            }
+        }
+        n += 1;
+    }
     let sum = block_reduce(sum, scratch, add);
 
     // `token` and `top_k` are the same on every thread, so the whole block runs the
@@ -558,21 +593,15 @@ pub fn decode_decide(
     } else {
         None
     };
+    if tid >= 32 {
+        return;
+    }
+    let (bin, durations_finite) = duration_argmax(duration_v, duration_i);
     if tid != 0 {
         return;
     }
 
-    let mut bin = 0usize;
-    let mut finite = sum.is_finite() && row_max.is_finite();
-    let mut k = 0usize;
-    while k < durations.len() {
-        let v = logits[row + classes + k];
-        finite &= v.is_finite();
-        if v > logits[row + classes + bin] {
-            bin = k;
-        }
-        k += 1;
-    }
+    let finite = sum.is_finite() && row_max.is_finite() && durations_finite;
     let duration = durations[bin];
     let (token, confidence) = match filtered {
         Some(decision) => decision,
@@ -617,51 +646,315 @@ pub fn decode_decide(
     }
 }
 
-/// `out[b] = embed[label[b]]`; the blank row is zero, which is NeMo's start symbol
-#[kernel]
-pub fn decode_embed(embed: &[f32], label: &[u32], mut out: DisjointSlice<f32>, hidden: u32) {
-    let i = thread::index_1d().get();
-    if i >= out.len() {
-        return;
+/// Sum over the warp, returned to every lane
+#[inline(always)]
+fn warp_sum(value: f32) -> f32 {
+    let mut total = value;
+    let mut offset = 16u32;
+    while offset > 0 {
+        total += warp::shuffle_xor_f32(total, offset);
+        offset /= 2;
     }
-
-    let hidden = hidden as usize;
-    let (b, j) = (i / hidden, i % hidden);
-    // SAFETY: `i < out.len()` was checked above
-    unsafe { *out.get_unchecked_mut(i) = embed[label[b] as usize * hidden + j] };
+    total
 }
 
-/// PyTorch LSTM cell on precomputed gates `[batch, 4 * hidden]` (input, forget,
-/// cell, output), updating `h` and `c` in place for the rows with `emit` set
+/// One PyTorch LSTM layer for the rows with `emit` set: the gates
+/// `weight_ih · x + weight_hh · h + bias` (input, forget, cell, output) and the cell
+/// update, in one launch instead of two GEMMs and an elementwise kernel
+///
+/// `h` is the layer's state before the step and the new state goes to `h_next`,
+/// because other blocks still read `h` for their gates; `c` updates in place, as
+/// only the unit's own block touches it. Rows without `emit` copy `h` to `h_next`
+/// and keep `c`. With `embedded` set, row `b`'s input is row `label[b]` of the
+/// embedding table `input` (the blank row is zero, NeMo's start symbol); otherwise
+/// it is row `b` of `input`, the layer below's `h_next`. Weights are `[4 * hidden,
+/// hidden]`, so the layer's input and state widths are both `hidden`.
+///
+/// One block of `ROW_WARPS * 32` threads per unit. Each thread loads its columns of
+/// the unit's four gate rows once, all in flight together, and keeps them in
+/// registers for every row; rows go `PASS_ROWS` at a time, so a weight load serves
+/// that many rows. Needs `hidden <= ROW_WARPS * 32 * ROW_STEPS`
 #[kernel]
-pub fn decode_lstm_cell(
-    gates: &[f32],
+pub fn decode_lstm(
+    weight_ih: &[f32],
+    weight_hh: &[f32],
+    bias: &[f32],
+    input: &[f32],
+    label: &[u32],
     emit: &[u32],
-    mut h: DisjointSlice<f32>,
+    h: &[f32],
+    mut h_next: DisjointSlice<f32>,
     mut c: DisjointSlice<f32>,
     hidden: u32,
+    embedded: u32,
 ) {
-    let i = thread::index_1d().get();
-    if i >= h.len() {
-        return;
-    }
-
+    static mut PARTIALS: SharedArray<f32, { ROW_WARPS * LSTM_GATES * PASS_ROWS }> =
+        SharedArray::UNINIT;
+    // SAFETY: a raw pointer to the block's shared array; lane 0 of each warp writes
+    // its own slots and the cell threads read them, with barriers between
+    let partials = unsafe { SharedArray::as_raw_mut_ptr(&raw mut PARTIALS) };
     let hidden = hidden as usize;
-    let (b, j) = (i / hidden, i % hidden);
-    if emit[b] == 0 {
-        return;
+    let unit = thread::blockIdx_x() as usize;
+    let tid = thread::threadIdx_x() as usize;
+    let threads = ROW_WARPS * 32;
+    let warp_index = tid / 32;
+    let batch = emit.len();
+
+    // this thread's weights, columns `tid + s * threads` of each gate row
+    let mut w_ih = [0.0f32; LSTM_GATES * ROW_STEPS];
+    let mut w_hh = [0.0f32; LSTM_GATES * ROW_STEPS];
+    let mut s = 0;
+    #[unroll]
+    while s < ROW_STEPS {
+        let k = tid + s * threads;
+        if k < hidden {
+            let mut g = 0;
+            #[unroll]
+            while g < LSTM_GATES {
+                let at = (g * hidden + unit) * hidden + k;
+                // SAFETY: the host sizes both weights to `[4 * hidden, hidden]`, and
+                // `unit < hidden`, `k < hidden`
+                unsafe {
+                    w_ih[g * ROW_STEPS + s] = *weight_ih.get_unchecked(at);
+                    w_hh[g * ROW_STEPS + s] = *weight_hh.get_unchecked(at);
+                }
+                g += 1;
+            }
+        }
+        s += 1;
     }
 
-    let row = b * 4 * hidden;
-    let input = sigmoid(gates[row + j]);
-    let forget = sigmoid(gates[row + hidden + j]);
-    let cell = gates[row + 2 * hidden + j].tanh();
-    let output = sigmoid(gates[row + 3 * hidden + j]);
-    // SAFETY: `i < h.len()`, and the host sizes `c` like `h`
-    unsafe {
-        let c_slot = c.get_unchecked_mut(i);
-        let next = forget * *c_slot + input * cell;
-        *c_slot = next;
-        *h.get_unchecked_mut(i) = output * next.tanh();
+    let mut base = 0;
+    while base < batch {
+        let mut acc = [0.0f32; LSTM_GATES * PASS_ROWS];
+        let mut r = 0;
+        #[unroll]
+        while r < PASS_ROWS {
+            let b = base + r;
+            // `emit[b]` is the same on every thread, so the block branches together
+            if b < batch && emit[b] != 0 {
+                let x_at = if embedded != 0 {
+                    label[b] as usize * hidden
+                } else {
+                    b * hidden
+                };
+                // checked once per row, so a label past the table traps, and the
+                // loads below need no check of their own
+                let x_row = &input[x_at..x_at + hidden];
+                let h_row = &h[b * hidden..(b + 1) * hidden];
+                let mut s = 0;
+                #[unroll]
+                while s < ROW_STEPS {
+                    let k = tid + s * threads;
+                    if k < hidden {
+                        // SAFETY: `k < hidden`, the length of both rows
+                        let (x, state) =
+                            unsafe { (*x_row.get_unchecked(k), *h_row.get_unchecked(k)) };
+                        let mut g = 0;
+                        #[unroll]
+                        while g < LSTM_GATES {
+                            acc[g * PASS_ROWS + r] +=
+                                w_ih[g * ROW_STEPS + s] * x + w_hh[g * ROW_STEPS + s] * state;
+                            g += 1;
+                        }
+                    }
+                    s += 1;
+                }
+            }
+            r += 1;
+        }
+
+        let mut r = 0;
+        #[unroll]
+        while r < PASS_ROWS {
+            let b = base + r;
+            if b < batch && emit[b] != 0 {
+                let mut g = 0;
+                #[unroll]
+                while g < LSTM_GATES {
+                    let total = warp_sum(acc[g * PASS_ROWS + r]);
+                    if warp::lane_id() == 0 {
+                        // SAFETY: the slot is this warp's own, below the array's size
+                        unsafe {
+                            *partials.add((warp_index * LSTM_GATES + g) * PASS_ROWS + r) = total
+                        };
+                    }
+                    g += 1;
+                }
+            }
+            r += 1;
+        }
+        thread::sync_threads();
+
+        let b = base + tid;
+        if tid < PASS_ROWS && b < batch {
+            let i = b * hidden + unit;
+            if emit[b] != 0 {
+                // the warps' partial sums in warp order, then the bias
+                let gate_at = |g: usize| {
+                    let mut total = 0.0f32;
+                    let mut w = 0;
+                    while w < ROW_WARPS {
+                        // SAFETY: written before the barrier above, below the size
+                        total += unsafe { *partials.add((w * LSTM_GATES + g) * PASS_ROWS + tid) };
+                        w += 1;
+                    }
+                    total + bias[g * hidden + unit]
+                };
+                let input_gate = sigmoid(gate_at(0));
+                let forget = sigmoid(gate_at(1));
+                let cell = gate_at(2).tanh();
+                let output = sigmoid(gate_at(3));
+                // SAFETY: `(b, unit)` belongs to this block's unit and this thread's
+                // row alone; the host sizes `c` and `h_next` to `[batch, hidden]`
+                unsafe {
+                    let c_slot = c.get_unchecked_mut(i);
+                    let next = forget * *c_slot + input_gate * cell;
+                    *c_slot = next;
+                    *h_next.get_unchecked_mut(i) = output * next.tanh();
+                }
+            } else {
+                // SAFETY: as above
+                unsafe { *h_next.get_unchecked_mut(i) = h[i] };
+            }
+        }
+        // the next pass rewrites the partial sums
+        thread::sync_threads();
+        base += PASS_ROWS;
+    }
+}
+
+/// The predictor's joint projection and the next step's joint input, plus the
+/// step's bookkeeping
+///
+/// For the rows with `emit` set, `pred_proj[b] = weight · top[b] + bias` (other
+/// rows keep theirs, as their top state did not change). Every row then gets
+/// `joint_in[b] = relu(enc_proj[b, frame[b]] + pred_proj[b])`, NeMo's joint input
+/// after its two projections, at the frame `decode_decide` advanced to. On the side
+/// it fills each row of `logits` with `joint_bias`, so the next joint GEMM with
+/// `beta = 1` adds the joint's bias, and copies every layer's `h_next` back to `h`.
+///
+/// `weight` is `[joint_hidden, hidden]` and `top` the top layer's `h_next`, `[batch,
+/// hidden]`; `enc_proj` is `[batch, frames, joint_hidden]`. One block of `ROW_WARPS *
+/// 32` threads per output column, laid out as in `decode_lstm`, so `hidden <=
+/// ROW_WARPS * 32 * ROW_STEPS`; the side copies stride over the whole grid
+#[kernel]
+pub fn decode_project(
+    weight: &[f32],
+    bias: &[f32],
+    top: &[f32],
+    emit: &[u32],
+    enc_proj: &[f32],
+    frame: &[u32],
+    lens: &[u32],
+    joint_bias: &[f32],
+    h_next: &[f32],
+    mut h: DisjointSlice<f32>,
+    mut pred_proj: DisjointSlice<f32>,
+    mut joint_in: DisjointSlice<f32>,
+    mut logits: DisjointSlice<f32>,
+    frames: u32,
+    hidden: u32,
+) {
+    static mut PARTIALS: SharedArray<f32, { ROW_WARPS * PASS_ROWS }> = SharedArray::UNINIT;
+    // SAFETY: a raw pointer to the block's shared array; lane 0 of each warp writes
+    // its own slots and the row threads read them, with barriers between
+    let partials = unsafe { SharedArray::as_raw_mut_ptr(&raw mut PARTIALS) };
+    let (frames, hidden) = (frames as usize, hidden as usize);
+    let joint_hidden = bias.len();
+    let column = thread::blockIdx_x() as usize;
+    let tid = thread::threadIdx_x() as usize;
+    let threads = ROW_WARPS * 32;
+    let warp_index = tid / 32;
+    let batch = emit.len();
+
+    let mut w = [0.0f32; ROW_STEPS];
+    let mut s = 0;
+    #[unroll]
+    while s < ROW_STEPS {
+        let k = tid + s * threads;
+        if k < hidden {
+            // SAFETY: the host sizes `weight` to `[joint_hidden, hidden]`, one block
+            // per column, and `k < hidden`
+            w[s] = unsafe { *weight.get_unchecked(column * hidden + k) };
+        }
+        s += 1;
+    }
+
+    let mut base = 0;
+    while base < batch {
+        let mut acc = [0.0f32; PASS_ROWS];
+        let mut r = 0;
+        #[unroll]
+        while r < PASS_ROWS {
+            let b = base + r;
+            // `emit[b]` is the same on every thread, so the block branches together
+            if b < batch && emit[b] != 0 {
+                let row = &top[b * hidden..(b + 1) * hidden];
+                let mut s = 0;
+                #[unroll]
+                while s < ROW_STEPS {
+                    let k = tid + s * threads;
+                    if k < hidden {
+                        // SAFETY: `k < hidden`, the row's length
+                        acc[r] += w[s] * unsafe { *row.get_unchecked(k) };
+                    }
+                    s += 1;
+                }
+                let total = warp_sum(acc[r]);
+                if warp::lane_id() == 0 {
+                    // SAFETY: the slot is this warp's own, below the array's size
+                    unsafe { *partials.add(warp_index * PASS_ROWS + r) = total };
+                }
+            }
+            r += 1;
+        }
+        thread::sync_threads();
+
+        let b = base + tid;
+        if tid < PASS_ROWS && b < batch {
+            let i = b * joint_hidden + column;
+            let projected = if emit[b] != 0 {
+                let mut total = 0.0f32;
+                let mut w = 0;
+                while w < ROW_WARPS {
+                    // SAFETY: written before the barrier above, below the size
+                    total += unsafe { *partials.add(w * PASS_ROWS + tid) };
+                    w += 1;
+                }
+                let value = total + bias[column];
+                // SAFETY: `(b, column)` belongs to this block's column and this
+                // thread's row alone; the host sizes `pred_proj` to `[batch,
+                // joint_hidden]`
+                unsafe { *pred_proj.get_unchecked_mut(i) = value };
+                value
+            } else {
+                // SAFETY: as above
+                unsafe { *pred_proj.get_unchecked_mut(i) }
+            };
+            let t = joint_frame(frame[b], lens[b]);
+            let value = enc_proj[(b * frames + t) * joint_hidden + column] + projected;
+            // SAFETY: as above; the host sizes `joint_in` like `pred_proj`
+            unsafe { *joint_in.get_unchecked_mut(i) = value.max(0.0) };
+        }
+        // the next pass rewrites the partial sums
+        thread::sync_threads();
+        base += PASS_ROWS;
+    }
+
+    let global = column * threads + tid;
+    let stride = thread::gridDim_x() as usize * threads;
+    let outputs = joint_bias.len();
+    let mut i = global;
+    while i < logits.len() {
+        // SAFETY: `i < logits.len()`, and each index belongs to one thread
+        unsafe { *logits.get_unchecked_mut(i) = joint_bias[i % outputs] };
+        i += stride;
+    }
+    let mut i = global;
+    while i < h.len() {
+        // SAFETY: as above; the host sizes `h_next` like `h`
+        unsafe { *h.get_unchecked_mut(i) = h_next[i] };
+        i += stride;
     }
 }

@@ -107,6 +107,32 @@ fn layer_norm_rows(
 /// the class logits
 const DECIDE_THREADS: u32 = 1024;
 
+/// Class logits each `decode_decide` thread holds in registers, the kernel's
+/// `DECIDE_VALUES`
+const DECIDE_VALUES: usize = 12;
+
+/// Threads per block of `decode_lstm` and `decode_project`, one block per output,
+/// the kernels' `ROW_WARPS` warps
+const WEIGHT_ROW_THREADS: u32 = 4 * 32;
+
+/// Weight columns each of those threads holds in registers, the kernels'
+/// `ROW_STEPS`, which bounds the predictor's hidden width
+const WEIGHT_ROW_STEPS: usize = 8;
+
+/// Fails unless a weight row of `hidden` fits the registers of one
+/// `decode_lstm` or `decode_project` block
+fn check_weight_row(hidden: usize) -> Result<(), Error> {
+    let limit = WEIGHT_ROW_STEPS * WEIGHT_ROW_THREADS as usize;
+    if hidden == 0 || hidden > limit {
+        return Err(Error::BufferLength {
+            context: "predictor hidden width",
+            expected: limit,
+            actual: hidden,
+        });
+    }
+    Ok(())
+}
+
 fn elements(count: usize) -> Result<LaunchConfig, Error> {
     let count = u32::try_from(count).map_err(|_| Error::DimensionOverflow {
         context: "kernel grid",
@@ -856,74 +882,71 @@ pub(crate) struct DecodeShape {
     pub capacity: usize,
 }
 
+/// One predictor LSTM layer's weights, `[4 * hidden, hidden]` each and the summed
+/// biases `[4 * hidden]`
+pub(crate) struct LstmWeights<'a> {
+    pub weight_ih: CudaView<'a, f32>,
+    pub weight_hh: CudaView<'a, f32>,
+    pub bias: CudaView<'a, f32>,
+}
+
+/// Where a predictor layer reads its input rows
+pub(crate) enum LstmInput<'a> {
+    /// Row `label[b]` of the embedding table `[classes, hidden]`
+    Embedded {
+        table: CudaView<'a, f32>,
+        label: CudaView<'a, u32>,
+    },
+    /// Row `b` of the layer below's new state, `[batch, hidden]`
+    Below(CudaView<'a, f32>),
+}
+
+/// One predictor layer's state, `[batch, hidden]` each: the state before the step,
+/// the new state, and the cell state updated in place
+pub(crate) struct LstmState<'a> {
+    pub h: CudaView<'a, f32>,
+    pub h_next: CudaViewMut<'a, f32>,
+    pub c: CudaViewMut<'a, f32>,
+}
+
+/// The buffers `decode_project` reads and writes
+pub(crate) struct Projection<'a> {
+    /// `[joint_hidden, hidden]` and `[joint_hidden]`
+    pub weight: CudaView<'a, f32>,
+    pub bias: CudaView<'a, f32>,
+    /// The top layer's new state, `[batch, hidden]`
+    pub top: CudaView<'a, f32>,
+    /// `[batch, frames, joint_hidden]`
+    pub enc_proj: CudaView<'a, f32>,
+    pub frame: CudaView<'a, u32>,
+    pub lens: CudaView<'a, u32>,
+    /// `[outputs]`
+    pub joint_bias: CudaView<'a, f32>,
+    /// Every layer's new and current state, `[layers, batch, hidden]`
+    pub h_next: CudaView<'a, f32>,
+    pub h: CudaViewMut<'a, f32>,
+    /// `[batch, joint_hidden]`
+    pub pred_proj: CudaViewMut<'a, f32>,
+    pub joint_in: CudaViewMut<'a, f32>,
+    /// `[batch, outputs]`
+    pub logits: CudaViewMut<'a, f32>,
+}
+
 /// The `decode` area's kernels
 pub(crate) struct DecodeKernels {
-    joint_input: CudaFunction,
     decide: CudaFunction,
-    embed: CudaFunction,
-    lstm_cell: CudaFunction,
+    lstm: CudaFunction,
+    project: CudaFunction,
 }
 
 impl DecodeKernels {
     pub(crate) fn load(runtime: &CudaRuntime) -> Result<Self, Error> {
         let module: LoadedKernels<KernelModule> = runtime.load_embedded(KernelModule::Decode)?;
         Ok(Self {
-            joint_input: module.function("decode_joint_input")?,
             decide: module.function("decode_decide")?,
-            embed: module.function("decode_embed")?,
-            lstm_cell: module.function("decode_lstm_cell")?,
+            lstm: module.function("decode_lstm")?,
+            project: module.function("decode_project")?,
         })
-    }
-
-    /// `out[b] = relu(enc_proj[b, frame[b]] + pred_proj[b])`
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "launchers mirror their kernel's parameter list so each launch reads against it"
-    )]
-    pub(crate) fn joint_input(
-        &self,
-        stream: &CudaStream,
-        enc_proj: &CudaView<'_, f32>,
-        pred_proj: &CudaView<'_, f32>,
-        frame: &CudaView<'_, u32>,
-        lens_frames: &CudaView<'_, u32>,
-        out: &mut CudaViewMut<'_, f32>,
-        frames: usize,
-        hidden: usize,
-    ) -> Result<(), Error> {
-        let batch = lens_frames.len();
-        let n = count("joint input", &[batch, hidden])?;
-        check_len(
-            "encoder projection",
-            count("encoder projection", &[n, frames])?,
-            enc_proj.len(),
-        )?;
-        check_len("predictor projection", n, pred_proj.len())?;
-        check_len("frame cursors", batch, frame.len())?;
-        check_len("joint input", n, out.len())?;
-        let config = elements(n)?;
-        let lens = [
-            len(enc_proj),
-            len(pred_proj),
-            len(frame),
-            len(lens_frames),
-            len_mut(out),
-        ];
-        let dims = [u32_of("frames", frames)?, u32_of("hidden", hidden)?];
-        let mut launch = stream.launch_builder(&self.joint_input);
-        launch
-            .arg(enc_proj)
-            .arg(&lens[0])
-            .arg(pred_proj)
-            .arg(&lens[1])
-            .arg(frame)
-            .arg(&lens[2]);
-        launch.arg(lens_frames).arg(&lens[3]).arg(out).arg(&lens[4]);
-        launch.arg(&dims[0]).arg(&dims[1]);
-        // SAFETY: matches `decode_joint_input`; the kernel bounds-checks its index
-        // against `out` and the checks above size every input for it
-        unsafe { launch.launch(config) }?;
-        Ok(())
     }
 
     /// Token decision and frame advance for every unfinished row
@@ -980,6 +1003,23 @@ impl DecodeKernels {
                 context: "joint classes and durations",
                 expected: 1,
                 actual: 0,
+            });
+        }
+        // each thread holds its class logits in registers, and one lane of warp 0
+        // reads each duration logit, so wider rows would drop some
+        let widest = DECIDE_VALUES * DECIDE_THREADS as usize;
+        if shape.classes > widest {
+            return Err(Error::BufferLength {
+                context: "joint classes",
+                expected: widest,
+                actual: shape.classes,
+            });
+        }
+        if durations.len() > 32 {
+            return Err(Error::BufferLength {
+                context: "joint durations",
+                expected: 32,
+                actual: durations.len(),
             });
         }
 
@@ -1054,74 +1094,201 @@ impl DecodeKernels {
         Ok(())
     }
 
-    /// `out[b] = embed[label[b]]`
-    pub(crate) fn embed(
+    /// One predictor LSTM layer for the rows with `emit` set; the others copy their
+    /// state to `state.h_next`
+    pub(crate) fn lstm(
         &self,
         stream: &CudaStream,
-        embed: &CudaView<'_, f32>,
-        label: &CudaView<'_, u32>,
-        out: &mut CudaViewMut<'_, f32>,
+        weights: &LstmWeights<'_>,
+        input: &LstmInput<'_>,
+        emit: &CudaView<'_, u32>,
+        state: &mut LstmState<'_>,
         hidden: usize,
     ) -> Result<(), Error> {
-        check_len(
-            "embedding output",
-            count("embedding output", &[label.len(), hidden])?,
-            out.len(),
-        )?;
-        if hidden == 0 || embed.len() % hidden != 0 {
-            return Err(Error::BufferLength {
-                context: "embedding table",
-                expected: hidden.max(1) * embed.len().div_ceil(hidden.max(1)),
-                actual: embed.len(),
-            });
-        }
-        let config = elements(out.len())?;
-        let lens = [len(embed), len(label), len_mut(out)];
+        check_weight_row(hidden)?;
+        let batch = emit.len();
+        let n = count("lstm state", &[batch, hidden])?;
+        let gates = count("lstm gates", &[4, hidden])?;
+        let weight = count("lstm weight", &[gates, hidden])?;
+        check_len("lstm input weight", weight, weights.weight_ih.len())?;
+        check_len("lstm state weight", weight, weights.weight_hh.len())?;
+        check_len("lstm bias", gates, weights.bias.len())?;
+        check_len("lstm hidden", n, state.h.len())?;
+        check_len("lstm next hidden", n, state.h_next.len())?;
+        check_len("lstm cell", n, state.c.len())?;
+        // the kernel's input reads are checked slice indexes, so a label past the
+        // embedding table traps instead of reading out of bounds
+        let (rows, label, embedded) = match input {
+            LstmInput::Embedded { table, label } => {
+                if hidden == 0 || table.len() % hidden != 0 {
+                    return Err(Error::BufferLength {
+                        context: "embedding table",
+                        expected: hidden.max(1) * table.len().div_ceil(hidden.max(1)),
+                        actual: table.len(),
+                    });
+                }
+                check_len("labels", batch, label.len())?;
+                (table, label, 1u32)
+            }
+            // the label is unread without `embedded`; `emit` stands in for it
+            LstmInput::Below(below) => {
+                check_len("lstm input", n, below.len())?;
+                (below, emit, 0u32)
+            }
+        };
+
+        let config = LaunchConfig {
+            grid_dim: (u32_of("lstm units", hidden)?, 1, 1),
+            block_dim: (WEIGHT_ROW_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let lens = [
+            len(&weights.weight_ih),
+            len(&weights.weight_hh),
+            len(&weights.bias),
+            len(rows),
+            len(label),
+            len(emit),
+            len(&state.h),
+            len_mut(&state.h_next),
+            len_mut(&state.c),
+        ];
         let hidden = u32_of("hidden", hidden)?;
-        let mut launch = stream.launch_builder(&self.embed);
+        let mut launch = stream.launch_builder(&self.lstm);
         launch
-            .arg(embed)
+            .arg(&weights.weight_ih)
             .arg(&lens[0])
-            .arg(label)
+            .arg(&weights.weight_hh)
             .arg(&lens[1])
-            .arg(out)
+            .arg(&weights.bias)
             .arg(&lens[2]);
-        launch.arg(&hidden);
-        // SAFETY: matches `decode_embed`; the kernel bounds-checks its index against
-        // `out`, and the table read is a checked slice index, so a label past the
-        // table traps instead of reading out of bounds
+        launch
+            .arg(rows)
+            .arg(&lens[3])
+            .arg(label)
+            .arg(&lens[4])
+            .arg(emit)
+            .arg(&lens[5]);
+        launch
+            .arg(&state.h)
+            .arg(&lens[6])
+            .arg(&mut state.h_next)
+            .arg(&lens[7])
+            .arg(&mut state.c)
+            .arg(&lens[8]);
+        launch.arg(&hidden).arg(&embedded);
+        // SAFETY: matches `decode_lstm`; one block per unit writes only that unit's
+        // column of `h_next` and `c`, which are sized above; its unchecked reads are
+        // within the weights checked above and the rows it slices with a check
         unsafe { launch.launch(config) }?;
         Ok(())
     }
 
-    /// LSTM cell update in place for the rows that emitted
-    pub(crate) fn lstm_cell(
+    /// The predictor's joint projection for the rows with `emit` set, the next
+    /// step's joint input for every row, the joint bias into `logits`, and every
+    /// layer's new state back into `h`
+    pub(crate) fn project(
         &self,
         stream: &CudaStream,
-        gates: &CudaView<'_, f32>,
+        buffers: &mut Projection<'_>,
         emit: &CudaView<'_, u32>,
-        h: &mut CudaViewMut<'_, f32>,
-        c: &mut CudaViewMut<'_, f32>,
+        frames: usize,
         hidden: usize,
     ) -> Result<(), Error> {
-        let n = count("lstm state", &[emit.len(), hidden])?;
-        check_len("lstm gates", count("lstm gates", &[n, 4])?, gates.len())?;
-        check_len("lstm hidden", n, h.len())?;
-        check_len("lstm cell", n, c.len())?;
-        let config = elements(n)?;
-        let lens = [len(gates), len(emit), len_mut(h), len_mut(c)];
-        let hidden = u32_of("hidden", hidden)?;
-        let mut launch = stream.launch_builder(&self.lstm_cell);
+        check_weight_row(hidden)?;
+        let batch = emit.len();
+        let joint_hidden = buffers.bias.len();
+        let outputs = buffers.joint_bias.len();
+        let rows = count("joint input", &[batch, joint_hidden])?;
+        if joint_hidden == 0 || outputs == 0 {
+            return Err(Error::BufferLength {
+                context: "joint widths",
+                expected: 1,
+                actual: 0,
+            });
+        }
+        check_len(
+            "predictor projection weight",
+            count("predictor projection weight", &[joint_hidden, hidden])?,
+            buffers.weight.len(),
+        )?;
+        check_len(
+            "top state",
+            count("top state", &[batch, hidden])?,
+            buffers.top.len(),
+        )?;
+        check_len(
+            "encoder projection",
+            count("encoder projection", &[rows, frames])?,
+            buffers.enc_proj.len(),
+        )?;
+        check_len("frame cursors", batch, buffers.frame.len())?;
+        check_len("frame lengths", batch, buffers.lens.len())?;
+        check_len("predictor states", buffers.h.len(), buffers.h_next.len())?;
+        check_len("predictor projection", rows, buffers.pred_proj.len())?;
+        check_len("joint input", rows, buffers.joint_in.len())?;
+        check_len(
+            "joint logits",
+            count("joint logits", &[batch, outputs])?,
+            buffers.logits.len(),
+        )?;
+
+        let config = LaunchConfig {
+            grid_dim: (u32_of("projection grid", joint_hidden)?, 1, 1),
+            block_dim: (WEIGHT_ROW_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let lens = [
+            len(&buffers.weight),
+            len(&buffers.bias),
+            len(&buffers.top),
+            len(emit),
+            len(&buffers.enc_proj),
+            len(&buffers.frame),
+            len(&buffers.lens),
+            len(&buffers.joint_bias),
+            len(&buffers.h_next),
+            len_mut(&buffers.h),
+            len_mut(&buffers.pred_proj),
+            len_mut(&buffers.joint_in),
+            len_mut(&buffers.logits),
+        ];
+        let dims = [u32_of("frames", frames)?, u32_of("hidden", hidden)?];
+        let mut launch = stream.launch_builder(&self.project);
         launch
-            .arg(gates)
+            .arg(&buffers.weight)
             .arg(&lens[0])
-            .arg(emit)
+            .arg(&buffers.bias)
             .arg(&lens[1])
-            .arg(h)
+            .arg(&buffers.top)
             .arg(&lens[2]);
-        launch.arg(c).arg(&lens[3]).arg(&hidden);
-        // SAFETY: matches `decode_lstm_cell`; the kernel bounds-checks its index
-        // against `h`, and `gates` and `c` are sized for it above
+        launch
+            .arg(emit)
+            .arg(&lens[3])
+            .arg(&buffers.enc_proj)
+            .arg(&lens[4])
+            .arg(&buffers.frame)
+            .arg(&lens[5]);
+        launch
+            .arg(&buffers.lens)
+            .arg(&lens[6])
+            .arg(&buffers.joint_bias)
+            .arg(&lens[7])
+            .arg(&buffers.h_next)
+            .arg(&lens[8]);
+        launch
+            .arg(&mut buffers.h)
+            .arg(&lens[9])
+            .arg(&mut buffers.pred_proj)
+            .arg(&lens[10])
+            .arg(&mut buffers.joint_in)
+            .arg(&lens[11]);
+        launch.arg(&mut buffers.logits).arg(&lens[12]);
+        launch.arg(&dims[0]).arg(&dims[1]);
+        // SAFETY: matches `decode_project`; each block writes only its column of
+        // `pred_proj` and `joint_in`, the side copies stay below `logits.len()` and
+        // `h.len()`, every buffer is sized above, and its unchecked weight reads are
+        // within the weight checked above
         unsafe { launch.launch(config) }?;
         Ok(())
     }
