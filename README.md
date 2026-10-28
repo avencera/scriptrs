@@ -131,6 +131,20 @@ On all 44 Earnings-21 calls (39 h), long-form with the defaults runs at 1680x
 with 8.25 % pooled WER; NeMo transcribing each whole call with local attention
 scores 9.58 %.
 
+FP32 is the default. On Ampere and newer GPUs, the encoder's matrix multiplies
+can run on TF32 tensor cores instead; decoding stays FP32:
+
+```rust,ignore
+use scriptrs::{ModelBundle, ParakeetDeployment, Precision};
+
+let bundle = ModelBundle::from_native_dir("models", ParakeetDeployment::v3())
+    .with_precision(Precision::Tf32);
+```
+
+On the same RTX 5090, TF32 runs LibriSpeech test-clean at 939x with the same
+1.93 % WER, and the 44 Earnings-21 calls at 2490x with 8.24 % WER. A few
+transcripts differ from FP32 by a word.
+
 ## Usage
 
 ### Short audio

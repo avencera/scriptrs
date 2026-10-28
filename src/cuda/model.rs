@@ -17,8 +17,10 @@ use crate::backend::{ChunkDecode, DecodePolicy, EncoderChunk, LanguageMask};
 use crate::cuda::decoder::{CudaDecoder, DecodeWorkspace};
 use crate::cuda::encoder::{CudaEncoder, EncoderWorkspace};
 use crate::cuda::kernels::CudaRuntime;
+use crate::cuda::math;
 use crate::deployment::ParakeetDeployment;
 use crate::error::TranscriptionError;
+use crate::models::Precision;
 use crate::native::weights::WeightFile;
 
 /// Mel frames a batch is padded up to a multiple of: 0.64 s, so padding costs a
@@ -129,16 +131,18 @@ impl fmt::Debug for CudaModel {
 }
 
 impl CudaModel {
-    /// Loads native weights for `deployment` onto CUDA device 0
+    /// Loads native weights for `deployment` onto CUDA device 0, with the encoder
+    /// GEMMs at `precision`
     pub(crate) fn load(
         weights: &Path,
         deployment: &ParakeetDeployment,
+        precision: Precision,
     ) -> Result<Self, TranscriptionError> {
         let file = WeightFile::open(weights)?;
         let spec = file.parakeet_spec(deployment)?;
         let runtime = CudaRuntime::open(0, Options::default())?;
         runtime.prepare(Library::Cublas)?;
-        let encoder = CudaEncoder::load(&runtime, &file, spec.encoder)?;
+        let encoder = CudaEncoder::load(&runtime, &file, spec.encoder, math(precision))?;
         let decoder = CudaDecoder::load(&runtime, &file, &spec)?;
         let (free, _) = runtime.stream().context().mem_get_info()?;
         Ok(Self(Arc::new(Engine {
@@ -309,7 +313,7 @@ mod tests {
     use crate::deployment::{ParakeetDeployment, ParakeetVersion};
     use crate::frontend::ParakeetFeatureExtractor;
     use crate::language::{LanguageSelection, ParakeetLanguage};
-    use crate::models::ModelBundle;
+    use crate::models::{ModelBundle, Precision};
     use crate::pipeline::TranscriptionPipeline;
     use crate::test_support::NemoReference;
     use crate::types::TranscriptionResult;
@@ -324,8 +328,12 @@ mod tests {
         let bundle = ModelBundle::from_native_dir(&root, ParakeetDeployment::v3());
         let deployment = bundle.deployment().clone();
         let vocab = bundle.vocabulary().expect("vocabulary");
-        let model = CudaModel::load(&root.join(deployment.native_weights_path()), &deployment)
-            .expect("model");
+        let model = CudaModel::load(
+            &root.join(deployment.native_weights_path()),
+            &deployment,
+            Precision::Fp32,
+        )
+        .expect("model");
         let policy =
             DecodePolicy::new(&deployment, &vocab, LanguageSelection::Auto).expect("policy");
         let extractor =

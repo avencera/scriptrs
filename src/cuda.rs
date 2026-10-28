@@ -17,6 +17,7 @@ use cudakit::{DeviceTensor, Error, Math, Sgemm};
 
 use crate::cuda::kernels::CudaRuntime;
 use crate::error::TranscriptionError;
+use crate::models::Precision;
 use crate::native::weights::WeightFile;
 
 pub(crate) fn upload(
@@ -47,13 +48,28 @@ where
     Ok(stream.alloc_zeros(len)?)
 }
 
-/// `c = alpha * a · wᵀ + beta * c` for a PyTorch `[out, in]` weight, in FP32
-pub(crate) fn linear(rows: usize, out: usize, inputs: usize, alpha: f32, beta: f32) -> Sgemm {
+/// The cuBLAS math of a model precision
+pub(crate) fn math(precision: Precision) -> Math {
+    match precision {
+        Precision::Fp32 => Math::Fp32,
+        Precision::Tf32 => Math::Tf32,
+    }
+}
+
+/// `c = alpha * a · wᵀ + beta * c` for a PyTorch `[out, in]` weight
+pub(crate) fn linear(
+    rows: usize,
+    out: usize,
+    inputs: usize,
+    alpha: f32,
+    beta: f32,
+    math: Math,
+) -> Sgemm {
     Sgemm {
         b_transposed: true,
         alpha,
         beta,
-        math: Math::Fp32,
+        math,
         ..Sgemm::new(rows, out, inputs)
     }
 }

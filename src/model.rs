@@ -108,6 +108,7 @@ impl ParakeetModelInner {
             RuntimeBundle::Native(layout) => Ok(Self::Cuda(crate::cuda::model::CudaModel::load(
                 layout.weights_path(),
                 bundle.deployment(),
+                layout.precision(),
             )?)),
         }
     }

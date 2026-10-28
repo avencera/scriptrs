@@ -7,7 +7,7 @@
 //! between replays to see whether every row has reached its last frame
 
 use cudakit::cudarc::driver::CudaSlice;
-use cudakit::{DeviceTensor, Error};
+use cudakit::{DeviceTensor, Error, Math};
 
 use crate::backend::LanguageMask;
 use crate::cuda::kernels::{
@@ -308,7 +308,14 @@ impl CudaDecoder {
             &mut ws.enc_proj.slice_mut(..),
         )?;
         runtime.sgemm(
-            linear(rows, self.joint_hidden, self.encoder_hidden, 1.0, 1.0),
+            linear(
+                rows,
+                self.joint_hidden,
+                self.encoder_hidden,
+                1.0,
+                1.0,
+                Math::Fp32,
+            ),
             encoder_out,
             self.joint_enc.weight.data(),
             &mut ws.enc_proj,
@@ -365,13 +372,13 @@ impl CudaDecoder {
                 &ws.h[index - 1]
             };
             runtime.sgemm(
-                linear(batch, gates, self.hidden, 1.0, 1.0),
+                linear(batch, gates, self.hidden, 1.0, 1.0, Math::Fp32),
                 input,
                 layer.weight_ih.data(),
                 &mut ws.gates,
             )?;
             runtime.sgemm(
-                linear(batch, gates, self.hidden, 1.0, 1.0),
+                linear(batch, gates, self.hidden, 1.0, 1.0, Math::Fp32),
                 &ws.h[index],
                 layer.weight_hh.data(),
                 &mut ws.gates,
@@ -395,7 +402,7 @@ impl CudaDecoder {
             &mut ws.pred_proj.slice_mut(..),
         )?;
         runtime.sgemm(
-            linear(batch, self.joint_hidden, self.hidden, 1.0, 1.0),
+            linear(batch, self.joint_hidden, self.hidden, 1.0, 1.0, Math::Fp32),
             &ws.h[self.lstm.len() - 1],
             self.joint_pred.weight.data(),
             &mut ws.pred_proj,
@@ -426,7 +433,14 @@ impl CudaDecoder {
             &mut ws.logits.slice_mut(..),
         )?;
         runtime.sgemm(
-            linear(ws.batch, self.outputs, self.joint_hidden, 1.0, 1.0),
+            linear(
+                ws.batch,
+                self.outputs,
+                self.joint_hidden,
+                1.0,
+                1.0,
+                Math::Fp32,
+            ),
             &ws.joint_in,
             self.joint_out.weight.data(),
             &mut ws.logits,
@@ -571,7 +585,7 @@ impl CudaDecoder {
 #[cfg(test)]
 mod tests {
     use cudakit::cudarc::driver::CudaSlice;
-    use cudakit::{Library, Options};
+    use cudakit::{Library, Math, Options};
     use ndarray::Ix3;
 
     use super::{CudaDecoder, DecodeWorkspace};
@@ -680,7 +694,8 @@ mod tests {
             let file = weights(version);
             let spec = file.parakeet_spec(&deployment(version)).expect("spec");
             let decoder = CudaDecoder::load(&runtime, &file, &spec).expect("decoder");
-            let encoder = CudaEncoder::load(&runtime, &file, spec.encoder).expect("encoder");
+            let encoder =
+                CudaEncoder::load(&runtime, &file, spec.encoder, Math::Fp32).expect("encoder");
 
             for set in SETS {
                 let reference = NemoReference::open(version, set);

@@ -41,6 +41,21 @@ pub(crate) enum RuntimeBundle {
     Native(NativeLayout),
 }
 
+/// Arithmetic precision of the CUDA backend's encoder matrix multiplies
+///
+/// The weights, activations and accumulation stay FP32 either way; decoding always
+/// runs in FP32
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum Precision {
+    /// Full FP32 multiplies, the precision NeMo's reference decode uses
+    #[default]
+    Fp32,
+    /// TF32 tensor-core multiplies (10-bit mantissa) on Ampere and newer GPUs,
+    /// faster at a small cost in numerical agreement with FP32
+    Tf32,
+}
+
 /// Native fp32 weights and vocabulary for one deployment, as
 /// `dev-tools/nemo/export_native.py` writes them
 #[cfg(feature = "cuda")]
@@ -48,6 +63,7 @@ pub(crate) enum RuntimeBundle {
 pub(crate) struct NativeLayout {
     weights_path: PathBuf,
     vocab_path: PathBuf,
+    precision: Precision,
 }
 
 #[cfg(feature = "cuda")]
@@ -56,6 +72,7 @@ impl NativeLayout {
         Self {
             weights_path: root.join(deployment.native_weights_path()),
             vocab_path: root.join(deployment.layout().vocab()),
+            precision: Precision::Fp32,
         }
     }
 
@@ -73,6 +90,10 @@ impl NativeLayout {
 
     pub(crate) fn weights_path(&self) -> &Path {
         &self.weights_path
+    }
+
+    pub(crate) fn precision(&self) -> Precision {
+        self.precision
     }
 }
 
@@ -189,6 +210,18 @@ impl ModelBundle {
             deployment,
             runtime,
         }
+    }
+
+    /// Set the precision of the CUDA encoder's matrix multiplies, FP32 by default
+    ///
+    /// [`Precision::Tf32`] trades a little agreement with NeMo's FP32 decode for
+    /// speed on Ampere and newer GPUs. Core ML bundles ignore it
+    #[cfg(feature = "cuda")]
+    pub fn with_precision(mut self, precision: Precision) -> Self {
+        if let RuntimeBundle::Native(layout) = &mut self.runtime {
+            layout.precision = precision;
+        }
+        self
     }
 
     /// Deployment that owns this bundle's model semantics and limits

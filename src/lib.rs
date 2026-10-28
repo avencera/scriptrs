@@ -182,6 +182,8 @@ pub use model_io::{DecodedJointStep, EncoderOutputs, JointOutputs, decode_joint_
 pub use models::ModelBundle;
 #[cfg(feature = "online")]
 pub use models::ModelManager;
+#[cfg(feature = "cuda")]
+pub use models::Precision;
 pub use pipeline::TranscriptionPipeline;
 #[cfg(feature = "long-form")]
 pub use preprocessing::{

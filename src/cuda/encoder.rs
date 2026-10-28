@@ -7,7 +7,7 @@
 //! capturable in a CUDA graph
 
 use cudakit::cudarc::driver::CudaSlice;
-use cudakit::{DeviceTensor, Sgemm, SgemmBatched};
+use cudakit::{DeviceTensor, Math, Sgemm, SgemmBatched};
 
 use crate::cuda::kernels::{CudaRuntime, EncoderKernels, FeatureMap, Heads};
 use crate::cuda::{linear, upload, upload_host, zeros};
@@ -76,6 +76,8 @@ struct Subsampling {
 /// Encoder weights on the GPU and the kernels that run them
 pub(crate) struct CudaEncoder {
     spec: EncoderSpec,
+    /// Precision of every encoder GEMM
+    math: Math,
     subsampling: Subsampling,
     layers: Vec<Layer>,
     kernels: EncoderKernels,
@@ -161,11 +163,12 @@ impl EncoderWorkspace {
 }
 
 impl CudaEncoder {
-    /// Uploads the encoder weights and loads the kernels
+    /// Uploads the encoder weights and loads the kernels; every GEMM runs at `math`
     pub(crate) fn load(
         runtime: &CudaRuntime,
         file: &WeightFile,
         spec: EncoderSpec,
+        math: Math,
     ) -> Result<Self, TranscriptionError> {
         let d = spec.d_model;
         let channels = spec.subsampling_channels;
@@ -202,6 +205,7 @@ impl CudaEncoder {
 
         Ok(Self {
             spec,
+            math,
             subsampling,
             layers,
             kernels: EncoderKernels::load(runtime)?,
@@ -465,7 +469,14 @@ impl CudaEncoder {
         let (weight, bias) = &sub.out;
         kernels.fill_rows(stream, &bias.data().slice(..), &mut ws.x.slice_mut(..))?;
         runtime.sgemm(
-            linear(rows, self.spec.d_model, channels * third.features, 1.0, 1.0),
+            linear(
+                rows,
+                self.spec.d_model,
+                channels * third.features,
+                1.0,
+                1.0,
+                self.math,
+            ),
             &ws.flat,
             weight.data(),
             &mut ws.x,
@@ -486,7 +497,10 @@ impl CudaEncoder {
     ) -> Result<(), TranscriptionError> {
         let plane = map.frames * map.features;
         let per_row = map.channels * plane;
-        let gemm = Sgemm::new(map.channels, plane, map.channels);
+        let gemm = Sgemm {
+            math: self.math,
+            ..Sgemm::new(map.channels, plane, map.channels)
+        };
         runtime.sgemm_batched(
             SgemmBatched {
                 gemm,
@@ -559,7 +573,7 @@ impl CudaEncoder {
         self.norm(runtime, ws, norm)?;
         let mut hidden_view = ws.hidden.slice_mut(..rows * hidden);
         runtime.sgemm(
-            linear(rows, hidden, d, 1.0, 0.0),
+            linear(rows, hidden, d, 1.0, 0.0, self.math),
             &ws.normed,
             weights.linear1.data(),
             &mut hidden_view,
@@ -567,7 +581,7 @@ impl CudaEncoder {
         self.kernels.silu(runtime.stream(), &mut hidden_view)?;
         // NeMo scales the feed-forward residual by 0.5 (`fc_factor`)
         runtime.sgemm(
-            linear(rows, d, hidden, 0.5, 1.0),
+            linear(rows, d, hidden, 0.5, 1.0, self.math),
             &ws.hidden.slice(..rows * hidden),
             weights.linear2.data(),
             &mut ws.x,
@@ -598,7 +612,7 @@ impl CudaEncoder {
 
         self.norm(runtime, ws, norm)?;
         runtime.sgemm(
-            linear(rows, 3 * d, d, 1.0, 0.0),
+            linear(rows, 3 * d, d, 1.0, 0.0, self.math),
             &ws.normed,
             weights.qkv.data(),
             &mut ws.qkv,
@@ -615,7 +629,7 @@ impl CudaEncoder {
             shape,
         )?;
         runtime.sgemm(
-            linear(positions, d, d, 1.0, 0.0),
+            linear(positions, d, d, 1.0, 0.0, self.math),
             &ws.pos_emb,
             weights.pos.data(),
             &mut ws.pos,
@@ -632,6 +646,7 @@ impl CudaEncoder {
         // content scores: (q + u) · kᵀ per (batch, head)
         let content = Sgemm {
             b_transposed: true,
+            math: self.math,
             ..Sgemm::new(frames, frames, head_dim)
         };
         runtime.sgemm_batched(
@@ -643,6 +658,7 @@ impl CudaEncoder {
         // position scores: (q + v) · pᵀ per head, every utterance against one table
         let position = Sgemm {
             b_transposed: true,
+            math: self.math,
             ..Sgemm::new(rows, positions, head_dim)
         };
         runtime.sgemm_batched(
@@ -659,7 +675,10 @@ impl CudaEncoder {
             shape,
         )?;
 
-        let mix = Sgemm::new(frames, head_dim, frames);
+        let mix = Sgemm {
+            math: self.math,
+            ..Sgemm::new(frames, head_dim, frames)
+        };
         runtime.sgemm_batched(
             SgemmBatched::packed(mix, batch * heads),
             &ws.scores,
@@ -673,7 +692,7 @@ impl CudaEncoder {
             shape,
         )?;
         runtime.sgemm(
-            linear(rows, d, d, 1.0, 1.0),
+            linear(rows, d, d, 1.0, 1.0, self.math),
             &ws.merged,
             weights.out.data(),
             &mut ws.x,
@@ -694,7 +713,7 @@ impl CudaEncoder {
         self.norm(runtime, ws, norm)?;
         let pw1_len = rows * 2 * d;
         runtime.sgemm(
-            linear(rows, 2 * d, d, 1.0, 0.0),
+            linear(rows, 2 * d, d, 1.0, 0.0, self.math),
             &ws.normed,
             weights.pointwise1.data(),
             &mut ws.hidden.slice_mut(..pw1_len),
@@ -713,7 +732,7 @@ impl CudaEncoder {
             self.spec.conv_kernel,
         )?;
         runtime.sgemm(
-            linear(rows, d, d, 1.0, 1.0),
+            linear(rows, d, d, 1.0, 1.0, self.math),
             &ws.merged,
             weights.pointwise2.data(),
             &mut ws.x,
@@ -744,7 +763,7 @@ fn relative_positions(frames: usize, d_model: usize) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
-    use cudakit::{Library, Options};
+    use cudakit::{Library, Math, Options};
     use ndarray::{ArrayD, Axis, Ix3};
 
     use super::{CudaEncoder, relative_positions};
@@ -833,7 +852,8 @@ mod tests {
             };
             let file = weights(version);
             let spec = file.parakeet_spec(&deployment).expect("spec");
-            let encoder = CudaEncoder::load(&runtime, &file, spec.encoder).expect("encoder");
+            let encoder =
+                CudaEncoder::load(&runtime, &file, spec.encoder, Math::Fp32).expect("encoder");
 
             for set in ["b1", "b8", "long-full"] {
                 let reference = NemoReference::open(version, set);
@@ -906,6 +926,69 @@ mod tests {
         assert!(worst < 1e-4, "encoder output relative L2 {worst:.2e}");
     }
 
+    /// Runs the TF32 encoder end to end and holds it near NeMo FP32; its output must
+    /// differ from the FP32 encoder's, or the GEMMs never took the TF32 path
+    #[test]
+    #[ignore = "needs a CUDA GPU and the NeMo references; `just gpu-parity` runs it on gpu0"]
+    fn gpu_tf32_encoder_stays_near_nemo() {
+        let runtime = CudaRuntime::open(0, Options::default()).expect("CUDA runtime");
+        runtime.prepare(Library::Cublas).expect("cuBLAS");
+        let mut worst = 0f64;
+        for version in [ParakeetVersion::V2, ParakeetVersion::V3] {
+            let deployment = match version {
+                ParakeetVersion::V2 => ParakeetDeployment::v2(),
+                ParakeetVersion::V3 => ParakeetDeployment::v3(),
+            };
+            let file = weights(version);
+            let spec = file.parakeet_spec(&deployment).expect("spec");
+            let load =
+                |math| CudaEncoder::load(&runtime, &file, spec.encoder, math).expect("encoder");
+            let (fp32, tf32) = (load(Math::Fp32), load(Math::Tf32));
+
+            for set in ["b1", "b8", "long-full"] {
+                let reference = NemoReference::open(version, set);
+                let mel = reference
+                    .f32("mel")
+                    .into_dimensionality::<Ix3>()
+                    .expect("[batch, features, frames]");
+                let (batch, mel_frames) = (mel.shape()[0], mel.shape()[2]);
+                let lens: Vec<usize> = reference
+                    .i64("mel_len")
+                    .iter()
+                    .map(|len| *len as usize)
+                    .collect();
+                let time_major: Vec<f32> = mel.permuted_axes([0, 2, 1]).iter().copied().collect();
+                let encode = |encoder: &CudaEncoder| {
+                    let mut ws = encoder
+                        .workspace(&runtime, batch, mel_frames)
+                        .expect("workspace");
+                    encoder
+                        .set_input(&runtime, &mut ws, &time_major, &lens)
+                        .expect("input");
+                    encoder.enqueue(&runtime, &mut ws).expect("encode");
+                    let output = runtime.stream().clone_dtoh(ws.output()).expect("download");
+                    (output, ws.output_lens().to_vec())
+                };
+                let (full, out_lens) = encode(&fp32);
+                let (fast, _) = encode(&tf32);
+                assert!(
+                    full != fast,
+                    "{version:?} {set}: TF32 matches FP32 bit for bit"
+                );
+
+                let expected = reference.f32("encoder.out").permuted_axes(vec![0, 2, 1]);
+                let expected = expected.as_standard_layout().into_owned();
+                let (rel, max_abs) = compare(&fast, &expected, &out_lens);
+                println!("{version:?} {set} TF32 encoder.out rel {rel:.2e} max {max_abs:.2e}");
+                worst = worst.max(rel);
+            }
+        }
+
+        // a 10-bit mantissa per product through 24 layers lands at 6e-4 to 1.3e-2 on
+        // an RTX 5090; a broken GEMM is off by order 1. WER is the accuracy gate
+        assert!(worst < 5e-2, "TF32 encoder output relative L2 {worst:.2e}");
+    }
+
     /// Captures the encoder in a CUDA graph, checks the replay against the eager pass
     /// bit for bit, and prints replay times for the v3 reference shapes
     #[test]
@@ -916,7 +999,8 @@ mod tests {
         runtime.prepare(Library::Cublas).expect("cuBLAS");
         let file = weights(ParakeetVersion::V3);
         let spec = file.parakeet_spec(&ParakeetDeployment::v3()).expect("spec");
-        let encoder = CudaEncoder::load(&runtime, &file, spec.encoder).expect("encoder");
+        let encoder =
+            CudaEncoder::load(&runtime, &file, spec.encoder, Math::Fp32).expect("encoder");
 
         for set in ["b1", "b8"] {
             let reference = NemoReference::open(ParakeetVersion::V3, set);

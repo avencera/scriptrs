@@ -13,7 +13,8 @@
 //! (seconds) override the overlap plan and `--batch` the windows per model call;
 //! at batch 1 the windows run one at a time on one worker, and above it the
 //! default workers prepare windows ahead of the model. `--language <code>` decodes
-//! with that language's filter instead of automatic language selection
+//! with that language's filter instead of automatic language selection, and
+//! `--tf32` runs the encoder GEMMs in TF32
 //!
 //! ```sh
 //! cargo run --release --features cuda,long-form --example cuda_bench -- \
@@ -31,7 +32,7 @@ use eyre::{Result, bail, eyre};
 use hound::WavReader;
 use scriptrs::{
     LanguageSelection, LongFormConfig, LongFormTranscriptionPipeline, ModelBundle,
-    ParakeetDeployment, ParakeetLanguage, TranscriptionConfig, TranscriptionPipeline,
+    ParakeetDeployment, ParakeetLanguage, Precision, TranscriptionConfig, TranscriptionPipeline,
 };
 use serde_json::{Value, json};
 
@@ -48,6 +49,7 @@ struct Args {
     overlap_s: Option<f64>,
     batch: Option<usize>,
     language: LanguageSelection,
+    precision: Precision,
 }
 
 struct Utterance {
@@ -68,7 +70,8 @@ fn main() -> ExitCode {
 fn run() -> Result<()> {
     let args = parse_args()?;
     let version = format!("{:?}", args.deployment.version());
-    let bundle = ModelBundle::from_native_dir(&args.models, args.deployment.clone());
+    let bundle = ModelBundle::from_native_dir(&args.models, args.deployment.clone())
+        .with_precision(args.precision);
     let (audio_s, walls, texts, batch) = if args.long.is_empty() {
         bench_manifest(bundle, &args.manifest, args.repeats, args.language)?
     } else {
@@ -78,7 +81,10 @@ fn run() -> Result<()> {
     let mut sorted = walls.clone();
     sorted.sort_by(f64::total_cmp);
     let summary = json!({
-        "backend": "scriptrs-cuda-fp32",
+        "backend": match args.precision {
+            Precision::Fp32 => "scriptrs-cuda-fp32",
+            Precision::Tf32 => "scriptrs-cuda-tf32",
+        },
         "version": version,
         "bs": batch,
         "long": !args.long.is_empty(),
@@ -234,6 +240,7 @@ fn parse_args() -> Result<Args> {
     let mut overlap_s = None;
     let mut batch = None;
     let mut language = LanguageSelection::Auto;
+    let mut precision = Precision::Fp32;
     let mut args = env::args().skip(1);
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| eyre!("{flag} needs a value"));
@@ -259,6 +266,7 @@ fn parse_args() -> Result<Args> {
                     .ok_or_else(|| eyre!("unknown language {code}"))?;
                 language = LanguageSelection::Language(parsed);
             }
+            "--tf32" => precision = Precision::Tf32,
             other => return Err(eyre!("unknown argument {other}")),
         }
     }
@@ -274,6 +282,7 @@ fn parse_args() -> Result<Args> {
         overlap_s,
         batch,
         language,
+        precision,
     })
 }
 
