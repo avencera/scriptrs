@@ -397,6 +397,42 @@ mod tests {
         }
     }
 
+    /// Runs the 120 s long-full audio through native long-form, its six windows
+    /// batched into one model call and then one window at a time, and holds the two
+    /// to the same tokens
+    #[cfg(feature = "long-form")]
+    #[test]
+    #[ignore = "needs a CUDA GPU, the native weights and the NeMo references; `just gpu-parity` runs it on gpu0"]
+    fn gpu_batched_long_form_matches_serial_windows() {
+        use crate::long_form::{LongFormConfig, LongFormTranscriptionPipeline};
+
+        let bundle = ModelBundle::from_native_dir(native_root(), ParakeetDeployment::v3());
+        let batched = LongFormConfig::for_bundle(&bundle);
+        assert!(batched.batch_size >= 6, "the windows must share one batch");
+        let serial = LongFormConfig {
+            batch_size: 1,
+            worker_count: 1,
+            ..batched.clone()
+        };
+        let pipeline = LongFormTranscriptionPipeline::from_bundle(bundle).expect("pipeline");
+        let reference = NemoReference::open(ParakeetVersion::V3, "long-full");
+        let audio: Vec<f32> = reference
+            .f32("audio")
+            .iter()
+            .take(reference.i64("audio_len")[0] as usize)
+            .copied()
+            .collect();
+
+        let batched = pipeline.run_with_config(&audio, &batched).expect("batched");
+        let serial = pipeline.run_with_config(&audio, &serial).expect("serial");
+        let ids = |result: &crate::types::TranscriptionResult| -> Vec<u32> {
+            result.tokens.iter().map(|token| token.token_id).collect()
+        };
+        assert!(!batched.tokens.is_empty(), "no tokens");
+        assert_eq!(ids(&batched), ids(&serial), "token ids");
+        assert_eq!(batched.text, serial.text);
+    }
+
     /// Transcribes the reference audio through the public pipeline on a native
     /// bundle, twice per utterance so the second pass replays the captured graphs,
     /// and holds the text against NeMo's

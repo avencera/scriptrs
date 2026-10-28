@@ -146,14 +146,39 @@ impl TranscriptionPipeline {
         context_samples: usize,
         language: crate::language::LanguageSelection,
     ) -> Result<RawTranscription, TranscriptionError> {
-        let chunk = EncoderChunk::new(prepared.features.view());
-        let mut raw = self.model.transcribe(chunk, language)?.raw;
-        apply_time_offsets(
-            &mut raw,
-            global_sample_offset / SAMPLES_PER_ENCODER_FRAME,
-            context_samples / SAMPLES_PER_ENCODER_FRAME,
-        );
-        Ok(raw)
+        let window = PreparedWindow {
+            prepared,
+            global_sample_offset,
+            context_samples,
+        };
+        let mut raws = self.transcribe_prepared_batch(vec![window], language)?;
+        Ok(raws.remove(0))
+    }
+
+    /// Transcribes windows in one model call, each placed on the recording's timeline
+    pub(crate) fn transcribe_prepared_batch(
+        &self,
+        windows: Vec<PreparedWindow>,
+        language: crate::language::LanguageSelection,
+    ) -> Result<Vec<RawTranscription>, TranscriptionError> {
+        let chunks: Vec<EncoderChunk<'_>> = windows
+            .iter()
+            .map(|window| EncoderChunk::new(window.prepared.features.view()))
+            .collect();
+        let decoded = self.model.transcribe_batch(&chunks, language)?;
+        Ok(decoded
+            .into_iter()
+            .zip(&windows)
+            .map(|(decoded, window)| {
+                let mut raw = decoded.raw;
+                apply_time_offsets(
+                    &mut raw,
+                    window.global_sample_offset / SAMPLES_PER_ENCODER_FRAME,
+                    window.context_samples / SAMPLES_PER_ENCODER_FRAME,
+                );
+                raw
+            })
+            .collect())
     }
 
     #[cfg(feature = "long-form")]
@@ -173,6 +198,16 @@ impl TranscriptionPipeline {
 #[derive(Debug)]
 pub(crate) struct PreparedChunk {
     features: Array2<f32>,
+}
+
+/// A prepared long-form window and where it sits in the recording
+#[derive(Debug)]
+pub(crate) struct PreparedWindow {
+    pub(crate) prepared: PreparedChunk,
+    /// Recording sample the window's own audio starts at
+    pub(crate) global_sample_offset: usize,
+    /// Left-context samples before that start, whose tokens are dropped
+    pub(crate) context_samples: usize,
 }
 
 impl PreparedChunk {

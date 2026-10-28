@@ -7,10 +7,11 @@
 //! and `<out>.texts.json` (`{id: text}`) for `dev-tools/nemo/wer.py`
 //!
 //! With `--long <wav or directory>` (repeatable), the first recording runs once as
-//! warmup, then each runs through the long-form pipeline's overlap windows on one
-//! worker; the timed region excludes reading the files, and transcripts are keyed
-//! by file stem for `dev-tools/nemo/long_wer.py`. `--window` and
-//! `--overlap` (seconds) override the overlap plan
+//! warmup, then each runs through the long-form pipeline with the bundle's
+//! defaults; the timed region excludes reading the files, and transcripts are keyed
+//! by file stem for `dev-tools/nemo/long_wer.py`. `--window` and `--overlap`
+//! (seconds) override the overlap plan and `--batch` the windows per model call;
+//! at batch 1 the windows run one at a time on one worker
 //!
 //! ```sh
 //! cargo run --release --features cuda,long-form --example cuda_bench -- \
@@ -43,6 +44,7 @@ struct Args {
     long: Vec<PathBuf>,
     window_s: Option<f64>,
     overlap_s: Option<f64>,
+    batch: Option<usize>,
 }
 
 struct Utterance {
@@ -64,7 +66,7 @@ fn run() -> Result<()> {
     let args = parse_args()?;
     let version = format!("{:?}", args.deployment.version());
     let bundle = ModelBundle::from_native_dir(&args.models, args.deployment.clone());
-    let (audio_s, walls, texts) = if args.long.is_empty() {
+    let (audio_s, walls, texts, batch) = if args.long.is_empty() {
         bench_manifest(bundle, &args.manifest, args.repeats)?
     } else {
         bench_long(bundle, &args.long, &args)?
@@ -75,7 +77,7 @@ fn run() -> Result<()> {
     let summary = json!({
         "backend": "scriptrs-cuda-fp32",
         "version": version,
-        "bs": 1,
+        "bs": batch,
         "long": !args.long.is_empty(),
         "n_utts": texts.len(),
         "audio_s": audio_s,
@@ -105,8 +107,9 @@ fn median(sorted: &[f64]) -> f64 {
     }
 }
 
-/// Audio seconds, wall seconds per timed pass, and transcripts by id
-type Bench = (f64, Vec<f64>, BTreeMap<String, String>);
+/// Audio seconds, wall seconds per timed pass, transcripts by id, and windows per
+/// model call
+type Bench = (f64, Vec<f64>, BTreeMap<String, String>, usize);
 
 fn bench_manifest(bundle: ModelBundle, manifest: &Path, repeats: usize) -> Result<Bench> {
     let pipeline = TranscriptionPipeline::from_bundle(bundle)?;
@@ -135,15 +138,18 @@ fn bench_manifest(bundle: ModelBundle, manifest: &Path, repeats: usize) -> Resul
         }
         walls.push(started.elapsed().as_secs_f64());
     }
-    Ok((audio_s, walls, texts))
+    Ok((audio_s, walls, texts, 1))
 }
 
 fn bench_long(bundle: ModelBundle, paths: &[PathBuf], args: &Args) -> Result<Bench> {
-    // one worker, because each worker of the parallel plan loads its own model
+    // one worker, because each worker of the unbatched plan loads its own model
     let mut config = LongFormConfig {
         worker_count: 1,
-        ..LongFormConfig::from_deployment(bundle.deployment())
+        ..LongFormConfig::for_bundle(&bundle)
     };
+    if let Some(batch) = args.batch {
+        config.batch_size = batch;
+    }
     if let Some(window_s) = args.window_s {
         config.overlap.max_model_samples = (window_s * 16_000.0) as usize;
     }
@@ -171,7 +177,7 @@ fn bench_long(bundle: ModelBundle, paths: &[PathBuf], args: &Args) -> Result<Ben
             texts.insert(stem(path)?, text);
         }
     }
-    Ok((audio_s, walls, texts))
+    Ok((audio_s, walls, texts, config.batch_size))
 }
 
 /// The wav files named by `--long`, with directories expanded to the wavs in them
@@ -213,6 +219,7 @@ fn parse_args() -> Result<Args> {
     let mut long = Vec::new();
     let mut window_s = None;
     let mut overlap_s = None;
+    let mut batch = None;
     let mut args = env::args().skip(1);
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| eyre!("{flag} needs a value"));
@@ -231,6 +238,7 @@ fn parse_args() -> Result<Args> {
             "--long" => long.push(PathBuf::from(value()?)),
             "--window" => window_s = Some(value()?.parse()?),
             "--overlap" => overlap_s = Some(value()?.parse()?),
+            "--batch" => batch = Some(value()?.parse()?),
             other => return Err(eyre!("unknown argument {other}")),
         }
     }
@@ -244,6 +252,7 @@ fn parse_args() -> Result<Args> {
         long,
         window_s,
         overlap_s,
+        batch,
     })
 }
 

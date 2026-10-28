@@ -15,7 +15,7 @@ use crate::decode::RawTranscription;
 use crate::deployment::ParakeetDeployment;
 use crate::error::TranscriptionError;
 use crate::models::ModelBundle;
-use crate::pipeline::{ChunkPreparer, TranscriptionPipeline};
+use crate::pipeline::{ChunkPreparer, PreparedWindow, TranscriptionPipeline};
 use crate::preprocessing::{
     AudioWindowMut, IdentityPreprocessor, PreprocessedTranscriptionError, SourceSampleRange,
     TranscriptionControl, WindowIndex, WindowPreprocessor,
@@ -23,6 +23,15 @@ use crate::preprocessing::{
 use crate::types::{TimedToken, TranscriptChunk, TranscriptionResult};
 
 pub use planner::OverlapChunkConfig;
+
+/// Overlap window for native bundles, 30 s at 16 kHz
+#[cfg(feature = "cuda")]
+const NATIVE_WINDOW_SAMPLES: usize = 480_000;
+#[cfg(feature = "cuda")]
+const NATIVE_OVERLAP_SECONDS: f64 = 8.0;
+/// Windows per CUDA call in native long-form runs
+#[cfg(feature = "cuda")]
+const NATIVE_BATCH_SIZE: usize = 16;
 #[cfg(feature = "vad")]
 pub use planner::{VadConfig, VadSegmentationConfig};
 
@@ -40,7 +49,8 @@ use self::vad::SileroVad;
 /// that exceeds a single Parakeet window
 ///
 /// With `long-form`, the default path chunks the full recording with overlap
-/// windows and runs up to 4 workers in parallel
+/// windows and runs up to 4 workers in parallel, or, on a native CUDA bundle,
+/// runs batches of windows through one model
 ///
 /// With `vad`, you can switch to VAD-based speech region detection
 /// for recordings that contain long silences or a lot of non-speech content
@@ -62,8 +72,12 @@ pub struct LongFormTranscriptionPipeline {
 pub struct LongFormConfig {
     /// Long-form planning mode
     pub mode: LongFormMode,
-    /// Parallel chunk workers used for long-form transcription
+    /// Parallel chunk workers used for long-form transcription, each with its own
+    /// model; unused when `batch_size` is above 1
     pub worker_count: usize,
+    /// Windows per model call; above 1, windows run in batches through the
+    /// pipeline's one model instead of on parallel workers
+    pub batch_size: usize,
     /// Single-chunk transcription settings
     pub transcription: TranscriptionConfig,
     #[cfg(feature = "vad")]
@@ -88,6 +102,7 @@ impl LongFormConfig {
         Self {
             mode: LongFormMode::default(),
             worker_count: 4,
+            batch_size: 1,
             transcription: TranscriptionConfig::from_deployment(deployment),
             #[cfg(feature = "vad")]
             vad: VadConfig::default(),
@@ -97,8 +112,33 @@ impl LongFormConfig {
         }
     }
 
+    /// Long-form settings for a bundle: the deployment's, adjusted to its runtime
+    ///
+    /// A native CUDA bundle gets 30 s windows with 8 s of overlap, run 16 at a time
+    /// through one model. Longer windows lose accuracy: on Earnings-21 they did best
+    /// at 20-40 s with 4-8 s of overlap, and from 60 s up WER rose by 1-4 points
+    pub fn for_bundle(bundle: &ModelBundle) -> Self {
+        #[cfg_attr(
+            not(feature = "cuda"),
+            allow(unused_mut, reason = "only native bundles adjust the defaults")
+        )]
+        let mut config = Self::from_deployment(bundle.deployment());
+        #[cfg(feature = "cuda")]
+        if matches!(bundle.runtime(), crate::models::RuntimeBundle::Native(_)) {
+            config.overlap.max_model_samples = NATIVE_WINDOW_SAMPLES;
+            config.overlap.overlap_seconds = NATIVE_OVERLAP_SECONDS;
+            config.batch_size = NATIVE_BATCH_SIZE;
+        }
+        config
+    }
+
     /// Validate all settings against the deployment that owns the pipeline
     pub fn validate_for(&self, deployment: &ParakeetDeployment) -> Result<(), TranscriptionError> {
+        if self.batch_size == 0 {
+            return Err(TranscriptionError::InvalidConfiguration(
+                "long-form batch_size must be positive".to_owned(),
+            ));
+        }
         self.transcription.validate_for(deployment)?;
         self.overlap.validate_for(deployment)?;
 
@@ -147,7 +187,7 @@ impl LongFormTranscriptionPipeline {
     /// Build a long-form pipeline from a resolved model bundle
     pub fn from_bundle(bundle: ModelBundle) -> Result<Self, TranscriptionError> {
         bundle.validate_base()?;
-        let default_config = LongFormConfig::from_deployment(bundle.deployment());
+        let default_config = LongFormConfig::for_bundle(&bundle);
         #[cfg(feature = "vad")]
         let vad = SileroVad::from_bundle(&bundle)?;
         let inner = TranscriptionPipeline::from_bundle(bundle)?;
@@ -352,6 +392,9 @@ impl LongFormTranscriptionPipeline {
         if execution_plan.tasks.is_empty() {
             return Ok(TranscriptionResult::empty(duration_seconds(audio.len())));
         }
+        if config.batch_size > 1 {
+            return self.run_batched_plan(audio, execution_plan, config, control, preprocessor);
+        }
         let worker_count = parallel_worker_count(execution_plan.tasks.len(), config.worker_count);
         if worker_count <= 1 {
             return self.run_serial_plan(audio, execution_plan, config, control, preprocessor);
@@ -394,6 +437,47 @@ impl LongFormTranscriptionPipeline {
                 Some(transcribe_task(&context, task, WindowIndex::new(task_idx))?);
         }
         control.check()?;
+        Ok(self.build_parallel_result(audio.len(), &tasks, regions, raw_tasks)?)
+    }
+
+    /// Runs the plan's windows `batch_size` at a time through the pipeline's model
+    fn run_batched_plan<P: WindowPreprocessor + ?Sized>(
+        &self,
+        audio: &[f32],
+        execution_plan: LongFormExecutionPlan,
+        config: &LongFormConfig,
+        control: &TranscriptionControl,
+        preprocessor: &P,
+    ) -> Result<TranscriptionResult, PreprocessedTranscriptionError<P::Error>> {
+        let LongFormExecutionPlan { tasks, regions } = execution_plan;
+        let preparer = TranscriptionPipeline::chunk_preparer(&config.transcription);
+        let preparation = PreparationContext {
+            audio,
+            control,
+            preprocessor,
+        };
+        let mut raw_tasks = Vec::with_capacity(tasks.len());
+        for (batch_idx, batch) in tasks.chunks(config.batch_size).enumerate() {
+            let mut windows = Vec::with_capacity(batch.len());
+            for (offset, task) in batch.iter().enumerate() {
+                let index = WindowIndex::new(batch_idx * config.batch_size + offset);
+                let samples = prepare_window_samples(&preparation, task, index)?;
+                let prepared = preparer.prepare(&samples)?;
+                windows.push(PreparedWindow {
+                    prepared,
+                    global_sample_offset: task.global_sample_offset,
+                    context_samples: task.context_samples,
+                });
+            }
+
+            control.check()?;
+            let raws = self
+                .inner
+                .transcribe_prepared_batch(windows, config.transcription.language)?;
+            raw_tasks.extend(raws.into_iter().map(Some));
+            control.check()?;
+        }
+
         Ok(self.build_parallel_result(audio.len(), &tasks, regions, raw_tasks)?)
     }
 

@@ -121,7 +121,15 @@ let result = pipeline.run(&audio)?;
 ```
 
 A native bundle accepts single inputs up to 40 s; longer audio goes through
-`LongFormTranscriptionPipeline`.
+`LongFormTranscriptionPipeline`. For native bundles, long-form defaults to 30 s
+windows with 8 s overlap, run 16 at a time through one model. Longer windows or
+shorter overlaps lose accuracy on long recordings.
+
+On an RTX 5090, v3 runs LibriSpeech test-clean one utterance at a time at 719x
+real time with 1.93 % WER, the same WER as NeMo's FP32 greedy decode at 410x.
+On all 44 Earnings-21 calls (39 h), long-form with the defaults runs at 1260x
+with 8.25 % pooled WER; NeMo transcribing each whole call with local attention
+scores 9.58 %.
 
 ## Usage
 
@@ -190,7 +198,7 @@ fn load_mono_16khz_audio() -> Vec<f32> {
 }
 ```
 
-`LongFormConfig` defaults to the fast overlap-chunking path with `4` workers. You can tune the worker count when you want less or more parallelism:
+`LongFormConfig` defaults to the fast overlap-chunking path with `4` workers, each loading its own model. With `batch_size` above 1, windows instead run in batches through the pipeline's one model, which is the default for native CUDA bundles. `LongFormConfig::for_bundle(&bundle)` gives a bundle's defaults to start from when you change one setting. You can tune the worker count when you want less or more parallelism:
 
 ```rust
 use scriptrs::{LongFormConfig, LongFormTranscriptionPipeline};

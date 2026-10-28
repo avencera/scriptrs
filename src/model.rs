@@ -31,16 +31,6 @@ impl ParakeetModel {
         })
     }
 
-    /// Encode and greedily decode one chunk
-    pub(crate) fn transcribe(
-        &self,
-        chunk: EncoderChunk<'_>,
-        language: LanguageSelection,
-    ) -> Result<ChunkDecode, TranscriptionError> {
-        let mut decoded = self.transcribe_batch(&[chunk], language)?;
-        Ok(decoded.remove(0))
-    }
-
     /// Encode and greedily decode each chunk, in order
     pub(crate) fn transcribe_batch(
         &self,
