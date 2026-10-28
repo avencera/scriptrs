@@ -67,6 +67,11 @@ const ELEMENT_THREADS: u32 = 256;
 /// Threads per block for the row kernels (LayerNorm, softmax)
 const ROW_THREADS: u32 = 256;
 
+/// Threads per block of `decode_decide`, one block per batch row: a decode step
+/// has only `batch` blocks, so a wide block hides the latency of each pass over
+/// the class logits
+const DECIDE_THREADS: u32 = 1024;
+
 fn elements(count: usize) -> Result<LaunchConfig, Error> {
     let count = u32::try_from(count).map_err(|_| Error::DimensionOverflow {
         context: "kernel grid",
@@ -896,7 +901,10 @@ impl DecodeKernels {
             });
         }
 
-        let config = rows(batch)?;
+        let config = LaunchConfig {
+            block_dim: (DECIDE_THREADS, 1, 1),
+            ..rows(batch)?
+        };
         let lens = [
             len(logits),
             len(lens_frames),
