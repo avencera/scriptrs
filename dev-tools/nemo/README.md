@@ -33,7 +33,10 @@ Writes `b1` (one 10.4 s utterance) and `b8` (8 utterances, 2.3–25.5 s, zero
 padded) reference sets: the mel, every subsampling stage, all submodules of
 layers 0 and 23, every layer output, the encoder output, a per-step greedy TDT
 trace, and a bf16-autocast encoder output for tolerance scale. `--vad-audio`
-adds Silero v5 per-window probabilities. NeMo runs on the GPU in fp32 with TF32
+adds Silero v5 per-window probabilities. `--long-audio <wav>` writes only
+`long-full` and `long-local`: one 120 s excerpt (from 300 s by default) with full
+attention, then with NeMo's long-form recipe (`rel_pos_local_attn` [256, 256]),
+the only sets where the two attention modes differ. Each is about 3.5 GB. NeMo runs on the GPU in fp32 with TF32
 off, so run it through the homebased `gpu0` queue.
 
 The v3 sets at `/shared/datasets/parakeet-ref/` came from the profile's original

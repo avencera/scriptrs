@@ -2,8 +2,10 @@
 
 Writes <out>/b1.safetensors and <out>/b8.safetensors (plus .json metadata): per-stage
 encoder activations (fp32, TF32 off), a step-by-step greedy TDT decode trace per
-utterance, and a bf16-autocast encoder output for tolerance scale. With --vad it also
-writes <out>/vad.safetensors from the Silero v5 TorchScript model.
+utterance, and a bf16-autocast encoder output for tolerance scale. With --vad-audio it
+also writes <out>/vad.safetensors from the Silero v5 TorchScript model. With --long-audio
+it writes long-full and long-local sets for one long excerpt, the second with NeMo's
+long-form recipe (rel_pos_local_attn [256, 256])
 
 Ported from ~/code/open-asr-kernels/parakeet-profile/scripts/dump_ref.py, which wrote
 the v3 set in /shared/datasets/parakeet-ref; the key layout is unchanged
@@ -158,8 +160,9 @@ def trace_tdt(model, enc_bt, length):
 
 
 @torch.no_grad()
-def run_set(model, rows, device):
-    audios = [sf.read(r["audio_filepath"], dtype="float32")[0] for r in rows]
+def run_set(model, rows, device, audios=None):
+    if audios is None:
+        audios = [sf.read(r["audio_filepath"], dtype="float32")[0] for r in rows]
     lens = torch.tensor([len(a) for a in audios], dtype=torch.int64)
     sig = torch.zeros(len(audios), int(lens.max()))
     for i, a in enumerate(audios):
@@ -249,11 +252,49 @@ def dump_vad(out, audio_path):
     print("vad", meta)
 
 
+# NeMo's long-form recipe, as the 2026-10-23 profile ran it on the 1 h Earnings-21 file
+LOCAL_ATTENTION = ("rel_pos_local_attn", [256, 256])
+
+
+def dump_long(model, out, audio_path, offset_s, seconds, device):
+    """One long excerpt with full attention, then with local attention
+
+    Short LibriSpeech sets never exceed the 256-frame local window, so these are the only
+    references where the two attention modes differ
+    """
+    info = sf.info(audio_path)
+    start = int(offset_s * info.samplerate)
+    audio, _ = sf.read(audio_path, dtype="float32", start=start, frames=int(seconds * info.samplerate))
+    row = {"id": f"{Path(audio_path).stem}@{offset_s}s", "duration": len(audio) / info.samplerate, "text": ""}
+    sets = {}
+    sets["long-full"] = run_set(model, [row], device, [audio])
+    # the model stays in local mode; main exits after this
+    model.change_attention_model(*LOCAL_ATTENTION)
+    # chunking only splits the subsampling convs to save memory; numerics are unchanged
+    model.change_subsampling_conv_chunking_factor(1)
+    sets["long-local"] = run_set(model, [row], device, [audio])
+    for name, (tensors, meta) in sets.items():
+        meta["source"] = {"audio": audio_path, "offset_s": offset_s, "seconds": seconds}
+        meta["attention"] = list(LOCAL_ATTENTION) if name == "long-local" else ["rel_pos", [-1, -1]]
+        write_set(out, name, tensors, meta)
+
+
+def write_set(out, name, tensors, meta):
+    tensors = {k: v.contiguous() for k, v in tensors.items()}
+    save_file(tensors, str(out / f"{name}.safetensors"))
+    meta["keys"] = {k: [list(v.shape), str(v.dtype)] for k, v in tensors.items()}
+    (out / f"{name}.json").write_text(json.dumps(meta, indent=1))
+    print(name, len(tensors), "tensors", json.dumps({k: v for k, v in meta.items() if k != "keys"})[:2000])
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--version", choices=sorted(NEMO_PATHS), required=True)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--vad-audio", help="also dump Silero v5 references for this 16 kHz wav")
+    ap.add_argument("--long-audio", help="dump only the long-full and long-local sets from this 16 kHz wav")
+    ap.add_argument("--long-offset", type=float, default=300.0, help="excerpt start in seconds")
+    ap.add_argument("--long-seconds", type=float, default=120.0, help="excerpt length in seconds")
     args = ap.parse_args()
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
@@ -263,15 +304,14 @@ def main():
     if args.vad_audio:
         dump_vad(out, args.vad_audio)
     model = load_model(args.version, device)
+    if args.long_audio:
+        dump_long(model, out, args.long_audio, args.long_offset, args.long_seconds, device)
+        return
 
     rows = load_manifest()
     for name, sel in pick_sets(rows).items():
         tensors, meta = run_set(model, sel, device)
-        tensors = {k: v.contiguous() for k, v in tensors.items()}
-        save_file(tensors, str(out / f"{name}.safetensors"))
-        meta["keys"] = {k: [list(v.shape), str(v.dtype)] for k, v in tensors.items()}
-        (out / f"{name}.json").write_text(json.dumps(meta, indent=1))
-        print(name, len(tensors), "tensors", json.dumps({k: v for k, v in meta.items() if k != "keys"})[:2000])
+        write_set(out, name, tensors, meta)
 
 
 if __name__ == "__main__":
