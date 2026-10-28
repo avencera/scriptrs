@@ -47,3 +47,16 @@ The v3 sets at `/shared/datasets/parakeet-ref/` came from the profile's original
 script, which this one ports with an unchanged key layout; v2 sets are in `v2/`
 and Silero's in `silero-v5/`. `just parity` in the repository root checks the
 Rust side against them.
+
+## `wer.py`
+
+Scores a `{id: text}` transcript file on LibriSpeech test-clean the way the NeMo
+profile bench does: Whisper's English normalizer, empty references dropped, corpus
+WER with jiwer. `--against <texts.json>` lists utterances whose raw text differs.
+`examples/cuda_bench.rs` writes the transcripts:
+
+```sh
+cargo run --release --features cuda --example cuda_bench -- \
+    --models /shared/models/scriptrs-native --version v3 --out bench/v3-bs1.json
+uv run python wer.py bench/v3-bs1.texts.json
+```

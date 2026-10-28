@@ -81,3 +81,7 @@ hound = "3.5.1"
 memmap2 = "0.9"
 safetensors = "0.8"
 tempfile = "3.23.0"
+
+[[example]]
+name = "cuda_bench"
+required-features = ["cuda"]
