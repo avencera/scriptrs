@@ -143,6 +143,8 @@ mod language;
 mod model;
 mod model_io;
 mod models;
+#[cfg(feature = "cuda")]
+mod native;
 mod pipeline;
 #[cfg(feature = "long-form")]
 mod preprocessing;

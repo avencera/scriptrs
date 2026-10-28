@@ -88,6 +88,9 @@ pub enum TranscriptionError {
     /// Model output shapes or dtypes were unexpected
     #[error("{0}")]
     InvalidModelOutput(String),
+    /// A native weight file was malformed or does not match its deployment
+    #[error("invalid model weights: {0}")]
+    InvalidWeights(String),
     /// CoreML model loading or prediction failed
     #[error("{0}")]
     CoreMl(String),

@@ -22,7 +22,9 @@ vad/silero-vad-v5.safetensors
 
 Tensors keep their NeMo or Silero names and stay fp32. The safetensors metadata
 holds `format`, `format_version`, the source checkpoint and its SHA-256, and the
-model config the runtime checks. The vocab files are byte-identical to the
+model config the runtime checks: `src/native` (the `cuda` feature) refuses a
+file whose config uses an option the native engine does not implement or does
+not match the requested deployment. The vocab files are byte-identical to the
 published Core ML bundle's.
 
 ## `dump_ref.py`
