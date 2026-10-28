@@ -22,3 +22,25 @@ check:
     just no-ort
     just clippy
     just test
+
+# GPU parity tests (`gpu_` prefix) against the NeMo references; they need the GPU,
+# so submit them through the homebased gpu0 queue instead of running them directly
+gpu-parity *args:
+    cargo test --release --features cuda --lib gpu_ -- --ignored --nocapture --test-threads 1 {{args}}
+
+# rebuild src/cuda/ptx/<area>.sm75.ptx from crates/scriptrs-cuda-kernels with the
+# cuda-oxide nightly; a hand-built stand-in until cudakit-build owns the toolchain
+cuda-kernels area="encoder":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out=$(mktemp -d)
+    trap 'rm -rf "$out"' EXIT
+    cd crates/scriptrs-cuda-kernels
+    # cuda-oxide writes PTX only while rustc compiles the crate
+    env -u RUSTUP_TOOLCHAIN -u CARGO -u RUSTC CARGO_TARGET_DIR="$PWD/target" \
+        cargo +nightly-2026-08-28 clean -p scriptrs-cuda-kernels
+    env -u RUSTUP_TOOLCHAIN -u CARGO -u RUSTC CARGO_TARGET_DIR="$PWD/target" \
+        CUDA_OXIDE_PTX_DIR="$out" CUDA_OXIDE_LLC="${CUDA_OXIDE_LLC:-/usr/bin/llc-21}" \
+        LIBCLANG_PATH="${LIBCLANG_PATH:-/usr/lib/llvm-21/lib}" \
+        cargo +nightly-2026-08-28 oxide build --arch sm_75 --features {{area}}
+    cp "$out/scriptrs_cuda_kernels.ptx" ../../src/cuda/ptx/{{area}}.sm75.ptx

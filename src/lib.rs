@@ -135,6 +135,8 @@
 mod backend;
 mod config;
 mod constants;
+#[cfg(feature = "cuda")]
+mod cuda;
 mod decode;
 mod deployment;
 mod error;
