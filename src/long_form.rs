@@ -1192,14 +1192,14 @@ mod tests {
     use std::fmt::{Display, Formatter};
     use std::sync::{Arc, Mutex};
 
+    #[cfg(feature = "cuda")]
+    use super::LongFormTranscriptionPipeline;
     #[cfg(feature = "vad")]
     use super::{ChunkTaskKind, SampleRange, build_region_plan};
     use super::{
         LongFormConfig, LongFormMode, PreparationContext, RegionTaskKind, WindowPreprocessor,
         parallel_worker_count, prepare_window_samples,
     };
-    #[cfg(feature = "cuda")]
-    use super::LongFormTranscriptionPipeline;
     #[cfg(feature = "cuda")]
     use crate::cuda::test_support::nemo_parity_bundle;
     use crate::deployment::ParakeetDeployment;

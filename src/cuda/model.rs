@@ -455,9 +455,8 @@ mod tests {
                 ParakeetVersion::V2 => ParakeetDeployment::v2(),
                 ParakeetVersion::V3 => ParakeetDeployment::v3(),
             };
-            let pipeline =
-                TranscriptionPipeline::from_bundle(nemo_parity_bundle(deployment))
-                    .expect("pipeline");
+            let pipeline = TranscriptionPipeline::from_bundle(nemo_parity_bundle(deployment))
+                .expect("pipeline");
 
             for set in ["b1", "b8"] {
                 let reference = NemoReference::open(version, set);
