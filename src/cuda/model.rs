@@ -296,13 +296,12 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use ndarray::{Array2, Axis};
 
     use super::CudaModel;
     use crate::backend::{DecodePolicy, EncoderChunk};
     use crate::config::TranscriptionConfig;
+    use crate::cuda::test_support::native_root;
     use crate::decode::RawTranscription;
     use crate::deployment::{ParakeetDeployment, ParakeetVersion};
     use crate::frontend::ParakeetFeatureExtractor;
@@ -310,12 +309,6 @@ mod tests {
     use crate::models::ModelBundle;
     use crate::pipeline::TranscriptionPipeline;
     use crate::test_support::NemoReference;
-
-    fn native_root() -> PathBuf {
-        std::env::var_os("SCRIPTRS_NATIVE_MODELS")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| "/shared/models/scriptrs-native".into())
-    }
 
     /// Runs each b8 utterance alone under a cache budget of two of the largest
     /// shapes, forward, backward and forward again, so calls keep evicting shapes and

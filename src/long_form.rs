@@ -1195,7 +1195,15 @@ mod tests {
         LongFormConfig, LongFormMode, PreparationContext, RegionTaskKind, WindowPreprocessor,
         parallel_worker_count, prepare_window_samples,
     };
+    #[cfg(feature = "cuda")]
+    use super::{LongFormTranscriptionPipeline, ModelBundle};
+    #[cfg(feature = "cuda")]
+    use crate::cuda::test_support::native_root;
     use crate::deployment::ParakeetDeployment;
+    #[cfg(feature = "cuda")]
+    use crate::error::TranscriptionError;
+    #[cfg(feature = "cuda")]
+    use crate::preprocessing::PreprocessedTranscriptionError;
     use crate::preprocessing::{
         AudioWindowMut, TranscriptionControl, TranscriptionDeadline, WindowLimit,
     };
@@ -1426,5 +1434,353 @@ mod tests {
         config.overlap.max_model_samples = 0;
 
         assert!(config.validate_for(&deployment).is_err());
+    }
+
+    /// Silence past the native single-input limit, so it takes the long-form path
+    #[cfg(feature = "cuda")]
+    const LONG_AUDIO_SAMPLES: usize = 800_000;
+
+    /// A long-form execution path, as `execute_plan` dispatches it
+    #[cfg(feature = "cuda")]
+    #[derive(Debug, Clone, Copy)]
+    enum ExecutionPath {
+        Serial,
+        Parallel,
+        Batched,
+    }
+
+    #[cfg(feature = "cuda")]
+    impl ExecutionPath {
+        /// Config that sends a multi-window plan down this path on a native bundle
+        fn config(self, base: &LongFormConfig) -> LongFormConfig {
+            match self {
+                Self::Serial => LongFormConfig {
+                    worker_count: 1,
+                    batch_size: 1,
+                    ..base.clone()
+                },
+                // each parallel worker loads its own model onto the GPU, so two keep
+                // the load short while still running windows concurrently
+                Self::Parallel => LongFormConfig {
+                    worker_count: 2,
+                    batch_size: 1,
+                    ..base.clone()
+                },
+                Self::Batched => base.clone(),
+            }
+        }
+    }
+
+    /// Native v3 pipeline and a Fast config whose plan for [`LONG_AUDIO_SAMPLES`]
+    /// spans several batches
+    ///
+    /// The 3 s windows keep the plan long while the GPU work stays small; the
+    /// native 8 s overlap is capped at half a window, which `validate_for` accepts
+    #[cfg(feature = "cuda")]
+    fn native_pipeline() -> (LongFormTranscriptionPipeline, LongFormConfig) {
+        let bundle = ModelBundle::from_native_dir(native_root(), ParakeetDeployment::v3());
+        let mut config = LongFormConfig {
+            mode: LongFormMode::Fast,
+            ..LongFormConfig::for_bundle(&bundle)
+        };
+        config.overlap.max_model_samples = 48_000;
+        assert!(
+            config.batch_size > 1 && config.worker_count > 1,
+            "the native defaults must select the batched path"
+        );
+        assert!(
+            LONG_AUDIO_SAMPLES > config.transcription.max_audio_samples,
+            "the audio must exceed the single-input limit"
+        );
+
+        let plan =
+            LongFormTranscriptionPipeline::build_fast_execution_plan(LONG_AUDIO_SAMPLES, &config);
+        assert!(
+            plan.tasks.len() > config.batch_size,
+            "the plan must span more than one batch"
+        );
+
+        let pipeline = LongFormTranscriptionPipeline::from_bundle(bundle).expect("pipeline");
+        (pipeline, config)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn recording_control(max_windows: usize) -> TranscriptionControl {
+        TranscriptionControl::new(
+            TranscriptionDeadline::from_now(std::time::Duration::from_secs(60)),
+            WindowLimit::new(max_windows).expect("the window limit is nonzero"),
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    fn observed_hooks(hook: &RecordingHook) -> Vec<(usize, usize, usize)> {
+        hook.0
+            .lock()
+            .expect("test observer should not be poisoned")
+            .clone()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn planned_windows(audio_len: usize, config: &LongFormConfig) -> Vec<(usize, usize, usize)> {
+        LongFormTranscriptionPipeline::build_fast_execution_plan(audio_len, config)
+            .tasks
+            .iter()
+            .enumerate()
+            .map(|(index, task)| (index, task.audio_start, task.audio_end))
+            .collect()
+    }
+
+    /// Audio within the single-input limit is preprocessed once, as one window
+    /// covering all of it
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs a CUDA GPU and the native weights; `just gpu-parity` runs it on gpu0"]
+    fn gpu_short_path_runs_the_preprocessor_once() {
+        let (pipeline, config) = native_pipeline();
+        let audio = vec![0.0; 16_000];
+        let hook = RecordingHook(Arc::new(Mutex::new(Vec::new())));
+
+        pipeline
+            .run_with_preprocessor(&audio, &config, &recording_control(1), &hook)
+            .expect("short audio should transcribe");
+
+        assert_eq!(observed_hooks(&hook), vec![(0, 0, audio.len())]);
+    }
+
+    /// Every path preprocesses each planned window exactly once, with its index and
+    /// source range
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs a CUDA GPU and the native weights; `just gpu-parity` runs it on gpu0"]
+    fn gpu_long_form_runs_the_preprocessor_once_per_planned_window() {
+        let (pipeline, base) = native_pipeline();
+        let audio = vec![0.0; LONG_AUDIO_SAMPLES];
+
+        for path in [
+            ExecutionPath::Serial,
+            ExecutionPath::Parallel,
+            ExecutionPath::Batched,
+        ] {
+            let config = path.config(&base);
+            let planned = planned_windows(audio.len(), &config);
+            let hook = RecordingHook(Arc::new(Mutex::new(Vec::new())));
+
+            pipeline
+                .run_with_preprocessor(&audio, &config, &recording_control(planned.len()), &hook)
+                .unwrap_or_else(|error| panic!("{path:?} run failed: {error}"));
+
+            let mut observed = observed_hooks(&hook);
+            observed.sort_unstable();
+            assert_eq!(observed, planned, "{path:?} preprocessed windows");
+        }
+    }
+
+    /// Once the deadline passes, the parallel and batched paths stop before the
+    /// remaining windows and report the deadline
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs a CUDA GPU and the native weights; `just gpu-parity` runs it on gpu0"]
+    fn gpu_deadline_stops_later_windows() {
+        struct OutlastingHook(RecordingHook);
+
+        impl WindowPreprocessor for OutlastingHook {
+            type Error = HookError;
+
+            fn process(
+                &self,
+                window: &mut AudioWindowMut<'_>,
+                control: &TranscriptionControl,
+            ) -> Result<(), Self::Error> {
+                self.0.process(window, control)?;
+                // waiting out the deadline makes the check after this window the one
+                // that fails, however long the run took to reach it
+                while !control.deadline().is_expired() {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Ok(())
+            }
+        }
+
+        let (pipeline, base) = native_pipeline();
+        let audio = vec![0.0; LONG_AUDIO_SAMPLES];
+
+        for path in [ExecutionPath::Parallel, ExecutionPath::Batched] {
+            let config = path.config(&base);
+            let planned = planned_windows(audio.len(), &config).len();
+            let hook = OutlastingHook(RecordingHook(Arc::new(Mutex::new(Vec::new()))));
+            // long enough for the parallel workers to load their models first
+            let control = TranscriptionControl::new(
+                TranscriptionDeadline::from_now(std::time::Duration::from_secs(10)),
+                WindowLimit::new(planned).expect("the plan has windows"),
+            );
+
+            let error = pipeline
+                .run_with_preprocessor(&audio, &config, &control, &hook)
+                .expect_err("the deadline should expire before later windows");
+
+            assert!(
+                matches!(
+                    error,
+                    PreprocessedTranscriptionError::Transcription(
+                        TranscriptionError::DeadlineExpired
+                    )
+                ),
+                "{path:?} returned {error}"
+            );
+            let observed = observed_hooks(&hook.0).len();
+            assert!(
+                observed > 0,
+                "{path:?} started no window before the deadline"
+            );
+            assert!(
+                observed < planned,
+                "{path:?} preprocessed all {planned} windows past the deadline"
+            );
+        }
+    }
+
+    /// Cancelling from inside a window stops the parallel and batched paths before
+    /// the remaining windows and reports the cancellation
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs a CUDA GPU and the native weights; `just gpu-parity` runs it on gpu0"]
+    fn gpu_cancellation_stops_workers() {
+        struct CancellingHook(RecordingHook);
+
+        impl WindowPreprocessor for CancellingHook {
+            type Error = HookError;
+
+            fn process(
+                &self,
+                window: &mut AudioWindowMut<'_>,
+                control: &TranscriptionControl,
+            ) -> Result<(), Self::Error> {
+                self.0.process(window, control)?;
+                control.cancel();
+                Ok(())
+            }
+        }
+
+        let (pipeline, base) = native_pipeline();
+        let audio = vec![0.0; LONG_AUDIO_SAMPLES];
+
+        for path in [ExecutionPath::Parallel, ExecutionPath::Batched] {
+            let config = path.config(&base);
+            let planned = planned_windows(audio.len(), &config).len();
+            let hook = CancellingHook(RecordingHook(Arc::new(Mutex::new(Vec::new()))));
+
+            let error = pipeline
+                .run_with_preprocessor(&audio, &config, &recording_control(planned), &hook)
+                .expect_err("cancellation should stop remaining windows");
+
+            assert!(
+                matches!(
+                    error,
+                    PreprocessedTranscriptionError::Transcription(TranscriptionError::Cancelled)
+                ),
+                "{path:?} returned {error}"
+            );
+            assert!(
+                observed_hooks(&hook.0).len() < planned,
+                "{path:?} preprocessed all {planned} windows after cancelling"
+            );
+        }
+    }
+
+    /// A preprocessor error stops the parallel and batched workers, which join and
+    /// return that error rather than finishing the plan
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs a CUDA GPU and the native weights; `just gpu-parity` runs it on gpu0"]
+    fn gpu_workers_join_after_the_first_preprocessor_error() {
+        struct FailingHook(RecordingHook);
+
+        impl WindowPreprocessor for FailingHook {
+            type Error = HookError;
+
+            fn process(
+                &self,
+                window: &mut AudioWindowMut<'_>,
+                control: &TranscriptionControl,
+            ) -> Result<(), Self::Error> {
+                self.0.process(window, control)?;
+                Err(HookError)
+            }
+        }
+
+        let (pipeline, base) = native_pipeline();
+        let audio = vec![0.0; LONG_AUDIO_SAMPLES];
+
+        for path in [ExecutionPath::Parallel, ExecutionPath::Batched] {
+            let config = path.config(&base);
+            let planned = planned_windows(audio.len(), &config).len();
+            let hook = FailingHook(RecordingHook(Arc::new(Mutex::new(Vec::new()))));
+
+            let error = pipeline
+                .run_with_preprocessor(&audio, &config, &recording_control(planned), &hook)
+                .expect_err("a preprocessor failure should join every worker");
+
+            assert!(
+                matches!(
+                    error,
+                    PreprocessedTranscriptionError::Preprocessing(HookError)
+                ),
+                "{path:?} returned {error}"
+            );
+            let observed = observed_hooks(&hook.0).len();
+            assert!(observed > 0, "{path:?} never called the preprocessor");
+            assert!(
+                observed < planned,
+                "{path:?} preprocessed all {planned} windows after the first error"
+            );
+        }
+    }
+
+    /// A worker that panics on the batched path makes the run panic instead of
+    /// leaving the model side waiting on workers parked at the look-ahead gate
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs a CUDA GPU and the native weights; `just gpu-parity` runs it on gpu0"]
+    fn gpu_batched_worker_panic_does_not_hang() {
+        struct PanickingHook;
+
+        impl WindowPreprocessor for PanickingHook {
+            type Error = HookError;
+
+            fn process(
+                &self,
+                window: &mut AudioWindowMut<'_>,
+                _control: &TranscriptionControl,
+            ) -> Result<(), Self::Error> {
+                // the model side waits on window 0, so only its preparer unwinds
+                assert_ne!(window.index().get(), 0, "test hook panics on window 0");
+                Ok(())
+            }
+        }
+
+        let (pipeline, base) = native_pipeline();
+        let config = ExecutionPath::Batched.config(&base);
+        let audio = vec![0.0; LONG_AUDIO_SAMPLES];
+        let planned = planned_windows(audio.len(), &config).len();
+        // native_pipeline guarantees more windows than one batch, so the other
+        // workers reach the gate and would park there without the panic closing it
+        assert!(
+            config.worker_count >= 2,
+            "the batched path needs other workers"
+        );
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pipeline.run_with_preprocessor(
+                &audio,
+                &config,
+                &recording_control(planned),
+                &PanickingHook,
+            )
+        }));
+
+        assert!(
+            outcome.is_err(),
+            "the batched run should raise the worker's panic"
+        );
     }
 }
