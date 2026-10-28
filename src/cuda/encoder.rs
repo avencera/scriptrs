@@ -524,6 +524,10 @@ impl CudaEncoder {
     }
 
     /// One Conformer layer on the residual stream
+    ///
+    /// Layers run in order after [`Self::enqueue_subsampling`]: a layer's closing
+    /// norm also writes the next layer's first norm to `normed`, so every layer but
+    /// the first starts from it
     pub(crate) fn enqueue_layer(
         &self,
         runtime: &CudaRuntime,
@@ -531,14 +535,37 @@ impl CudaEncoder {
         index: usize,
     ) -> Result<(), TranscriptionError> {
         let layer = &self.layers[index];
-        self.feed_forward(runtime, ws, &layer.norm_ff1, &layer.ff1)?;
-        self.attention(runtime, ws, &layer.norm_att, &layer.attention)?;
-        self.conv_module(runtime, ws, &layer.norm_conv, &layer.conv)?;
-        self.feed_forward(runtime, ws, &layer.norm_ff2, &layer.ff2)?;
+        if index == 0 {
+            self.norm(runtime, ws, &layer.norm_ff1)?;
+        }
+        self.feed_forward(runtime, ws, &layer.ff1)?;
+        self.norm(runtime, ws, &layer.norm_att)?;
+        self.attention(runtime, ws, &layer.attention)?;
+        self.norm(runtime, ws, &layer.norm_conv)?;
+        self.conv_module(runtime, ws, &layer.conv)?;
+        self.norm(runtime, ws, &layer.norm_ff2)?;
+        self.feed_forward(runtime, ws, &layer.ff2)?;
 
-        // the final norm is not residual; normalize into the scratch row and copy back
-        self.norm(runtime, ws, &layer.norm_out)?;
-        runtime.stream().memcpy_dtod(&ws.normed, &mut ws.x)?;
+        // the final norm is not residual, so it runs in place, and the next layer's
+        // first norm reads its result before it leaves the registers
+        let next = self.layers.get(index + 1).map(|next| {
+            (
+                next.norm_ff1.weight.data().slice(..),
+                next.norm_ff1.bias.data().slice(..),
+            )
+        });
+        self.kernels.layer_norm_pair(
+            runtime.stream(),
+            &mut ws.x.slice_mut(..),
+            (
+                &layer.norm_out.weight.data().slice(..),
+                &layer.norm_out.bias.data().slice(..),
+            ),
+            next.as_ref().map(|(gamma, beta)| (gamma, beta)),
+            &mut ws.normed.slice_mut(..),
+            self.spec.d_model,
+            NORM_EPS,
+        )?;
         Ok(())
     }
 
@@ -560,17 +587,16 @@ impl CudaEncoder {
         Ok(())
     }
 
-    /// `x += 0.5 * linear2(silu(linear1(norm(x))))`
+    /// `x += 0.5 * linear2(silu(linear1(normed)))`, with `normed` the sublayer's
+    /// norm of `x`
     fn feed_forward(
         &self,
         runtime: &CudaRuntime,
         ws: &mut EncoderWorkspace,
-        norm: &Norm,
         weights: &FeedForward,
     ) -> Result<(), TranscriptionError> {
         let (d, hidden) = (self.spec.d_model, self.spec.ff_hidden);
         let rows = ws.batch * ws.frames;
-        self.norm(runtime, ws, norm)?;
         let mut hidden_view = ws.hidden.slice_mut(..rows * hidden);
         runtime.sgemm(
             linear(rows, hidden, d, 1.0, 0.0, self.math),
@@ -589,12 +615,12 @@ impl CudaEncoder {
         Ok(())
     }
 
-    /// `x += linear_out(rel_pos_attention(norm(x)))`
+    /// `x += linear_out(rel_pos_attention(normed))`, with `normed` the sublayer's
+    /// norm of `x`
     fn attention(
         &self,
         runtime: &CudaRuntime,
         ws: &mut EncoderWorkspace,
-        norm: &Norm,
         weights: &Attention,
     ) -> Result<(), TranscriptionError> {
         let stream = runtime.stream();
@@ -610,7 +636,6 @@ impl CudaEncoder {
             head_dim,
         };
 
-        self.norm(runtime, ws, norm)?;
         runtime.sgemm(
             linear(rows, 3 * d, d, 1.0, 0.0, self.math),
             &ws.normed,
@@ -700,17 +725,16 @@ impl CudaEncoder {
         Ok(())
     }
 
-    /// `x += pointwise2(silu(bn(depthwise(mask(glu(pointwise1(norm(x))))))))`
+    /// `x += pointwise2(silu(bn(depthwise(mask(glu(pointwise1(normed)))))))`, with
+    /// `normed` the sublayer's norm of `x`
     fn conv_module(
         &self,
         runtime: &CudaRuntime,
         ws: &mut EncoderWorkspace,
-        norm: &Norm,
         weights: &ConvModule,
     ) -> Result<(), TranscriptionError> {
         let d = self.spec.d_model;
         let rows = ws.batch * ws.frames;
-        self.norm(runtime, ws, norm)?;
         let pw1_len = rows * 2 * d;
         runtime.sgemm(
             linear(rows, 2 * d, d, 1.0, 0.0, self.math),

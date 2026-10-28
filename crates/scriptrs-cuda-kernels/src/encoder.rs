@@ -14,10 +14,63 @@ fn max(a: f32, b: f32) -> f32 {
     a.max(b)
 }
 
+/// Row values each thread of a LayerNorm block holds in registers, so a row of up
+/// to `ROW_VALUES * blockDim.x` values is read from memory once
+pub const ROW_VALUES: usize = 8;
+
+/// Loads this thread's columns of a row, `tid + n * threads` for slot `n`, with 0
+/// past the row
+#[inline(always)]
+fn load_row(x: &[f32], row: usize, width: usize) -> [f32; ROW_VALUES] {
+    let tid = thread::threadIdx_x() as usize;
+    let threads = thread::blockDim_x() as usize;
+    let mut values = [0.0f32; ROW_VALUES];
+    let mut n = 0;
+    while n < ROW_VALUES {
+        let i = tid + n * threads;
+        if i < width {
+            values[n] = x[row + i];
+        }
+        n += 1;
+    }
+    values
+}
+
+/// The row's mean and `1 / sqrt(var + eps)` from every thread's `load_row` values;
+/// the variance is biased and taken around the mean in a second pass. Each thread
+/// adds its columns in index order, as a strided loop over the row would
+#[inline(always)]
+fn row_moments(
+    values: &[f32; ROW_VALUES],
+    width: usize,
+    eps: f32,
+    scratch: *mut f32,
+) -> (f32, f32) {
+    let tid = thread::threadIdx_x() as usize;
+    let threads = thread::blockDim_x() as usize;
+    let mut sum = 0.0f32;
+    let mut n = 0;
+    while n < ROW_VALUES && tid + n * threads < width {
+        sum += values[n];
+        n += 1;
+    }
+    let mean = block_reduce(sum, scratch, add) / width as f32;
+
+    let mut squares = 0.0f32;
+    let mut n = 0;
+    while n < ROW_VALUES && tid + n * threads < width {
+        let centered = values[n] - mean;
+        squares += centered * centered;
+        n += 1;
+    }
+    let inv_std = 1.0 / (block_reduce(squares, scratch, add) / width as f32 + eps).sqrt();
+    (mean, inv_std)
+}
+
 /// LayerNorm over rows of `width`: `out = (x - mean) / sqrt(var + eps) * gamma + beta`
 ///
-/// One block per row, 32 to 1024 threads in multiples of 32. The variance is biased
-/// and taken around the mean in a second pass
+/// One block per row, 32 to 1024 threads in multiples of 32, and `width` at most
+/// `ROW_VALUES` per thread
 #[kernel]
 pub fn encoder_layer_norm(
     x: &[f32],
@@ -36,29 +89,75 @@ pub fn encoder_layer_norm(
     let tid = thread::threadIdx_x() as usize;
     let threads = thread::blockDim_x() as usize;
 
-    let mut sum = 0.0f32;
-    let mut i = tid;
-    while i < width {
-        sum += x[row + i];
-        i += threads;
-    }
-    let mean = block_reduce(sum, scratch, add) / width as f32;
-
-    let mut squares = 0.0f32;
-    let mut i = tid;
-    while i < width {
-        let centered = x[row + i] - mean;
-        squares += centered * centered;
-        i += threads;
-    }
-    let inv_std = 1.0 / (block_reduce(squares, scratch, add) / width as f32 + eps).sqrt();
-
-    let mut i = tid;
-    while i < width {
+    let values = load_row(x, row, width);
+    let (mean, inv_std) = row_moments(&values, width, eps, scratch);
+    let mut n = 0;
+    while n < ROW_VALUES && tid + n * threads < width {
+        let i = tid + n * threads;
         // SAFETY: rows are disjoint across blocks and `i` is distinct within the block
         let slot = unsafe { out.get_unchecked_mut(row + i) };
-        *slot = (x[row + i] - mean) * inv_std * gamma[i] + beta[i];
-        i += threads;
+        *slot = (values[n] - mean) * inv_std * gamma[i] + beta[i];
+        n += 1;
+    }
+}
+
+/// A layer's closing LayerNorm in place, `x = LayerNorm(x)` with `gamma` and `beta`,
+/// then with `next` set the next layer's first LayerNorm of the result into `out`
+/// with `next_gamma` and `next_beta`
+///
+/// Saves the next layer a launch and a pass over the residual stream, and the
+/// closing norm the copy back from a scratch row. Each norm is computed as
+/// `encoder_layer_norm` computes it, with the same launch shape
+#[kernel]
+pub fn encoder_layer_norm_pair(
+    mut x: DisjointSlice<f32>,
+    gamma: &[f32],
+    beta: &[f32],
+    next_gamma: &[f32],
+    next_beta: &[f32],
+    mut out: DisjointSlice<f32>,
+    width: u32,
+    eps: f32,
+    next: u32,
+) {
+    static mut SCRATCH: SharedArray<f32, MAX_WARPS> = SharedArray::UNINIT;
+    // SAFETY: a raw pointer to the block's shared array; only `block_reduce` touches
+    // it, between barriers
+    let scratch = unsafe { SharedArray::as_raw_mut_ptr(&raw mut SCRATCH) };
+    let width = width as usize;
+    let row = thread::blockIdx_x() as usize * width;
+    let tid = thread::threadIdx_x() as usize;
+    let threads = thread::blockDim_x() as usize;
+
+    let mut values = [0.0f32; ROW_VALUES];
+    let mut n = 0;
+    while n < ROW_VALUES && tid + n * threads < width {
+        // SAFETY: rows are disjoint across blocks and `tid + n * threads` is distinct
+        // within the block, so each thread reads and later writes only its own slots
+        values[n] = unsafe { *x.get_unchecked_mut(row + tid + n * threads) };
+        n += 1;
+    }
+    let (mean, inv_std) = row_moments(&values, width, eps, scratch);
+    let mut n = 0;
+    while n < ROW_VALUES && tid + n * threads < width {
+        let i = tid + n * threads;
+        values[n] = (values[n] - mean) * inv_std * gamma[i] + beta[i];
+        // SAFETY: as above
+        unsafe { *x.get_unchecked_mut(row + i) = values[n] };
+        n += 1;
+    }
+    if next == 0 {
+        return;
+    }
+
+    let (mean, inv_std) = row_moments(&values, width, eps, scratch);
+    let mut n = 0;
+    while n < ROW_VALUES && tid + n * threads < width {
+        let i = tid + n * threads;
+        // SAFETY: as above; the host sizes `out` like `x`
+        let slot = unsafe { out.get_unchecked_mut(row + i) };
+        *slot = (values[n] - mean) * inv_std * next_gamma[i] + next_beta[i];
+        n += 1;
     }
 }
 

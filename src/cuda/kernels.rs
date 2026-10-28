@@ -68,6 +68,40 @@ const ELEMENT_THREADS: u32 = 256;
 /// Threads per block for the row kernels (LayerNorm, softmax)
 const ROW_THREADS: u32 = 256;
 
+/// Row values each LayerNorm thread holds in registers, the kernels' `ROW_VALUES`
+const ROW_VALUES: usize = 8;
+
+/// Checks a LayerNorm over rows of `width` against `x`, its parameters and `out`,
+/// and returns the launch: one block per row
+fn layer_norm_rows(
+    x: usize,
+    gamma: usize,
+    beta: usize,
+    out: usize,
+    width: usize,
+) -> Result<LaunchConfig, Error> {
+    if width == 0 || x % width != 0 {
+        return Err(Error::BufferLength {
+            context: "layer norm input",
+            expected: width.max(1) * x.div_ceil(width.max(1)),
+            actual: x,
+        });
+    }
+    // each thread holds its columns in registers, so a wider row would drop some
+    let widest = ROW_VALUES * ROW_THREADS as usize;
+    if width > widest {
+        return Err(Error::BufferLength {
+            context: "layer norm width",
+            expected: widest,
+            actual: width,
+        });
+    }
+    check_len("layer norm gamma", width, gamma)?;
+    check_len("layer norm beta", width, beta)?;
+    check_len("layer norm output", x, out)?;
+    rows(x / width)
+}
+
 /// Threads per block of `decode_decide`, one block per batch row: a decode step
 /// has only `batch` blocks, so a wide block hides the latency of each pass over
 /// the class logits
@@ -174,6 +208,7 @@ impl FeatureMap {
 /// The `encoder` area's kernels
 pub(crate) struct EncoderKernels {
     layer_norm: CudaFunction,
+    layer_norm_pair: CudaFunction,
     silu: CudaFunction,
     split_qkv: CudaFunction,
     split_heads: CudaFunction,
@@ -192,6 +227,7 @@ impl EncoderKernels {
         let module: LoadedKernels<KernelModule> = runtime.load_embedded(KernelModule::Encoder)?;
         Ok(Self {
             layer_norm: module.function("encoder_layer_norm")?,
+            layer_norm_pair: module.function("encoder_layer_norm_pair")?,
             silu: module.function("encoder_silu")?,
             split_qkv: module.function("encoder_split_qkv")?,
             split_heads: module.function("encoder_split_heads")?,
@@ -221,17 +257,7 @@ impl EncoderKernels {
         width: usize,
         eps: f32,
     ) -> Result<(), Error> {
-        if width == 0 || x.len() % width != 0 {
-            return Err(Error::BufferLength {
-                context: "layer norm input",
-                expected: width.max(1) * x.len().div_ceil(width.max(1)),
-                actual: x.len(),
-            });
-        }
-        check_len("layer norm gamma", width, gamma.len())?;
-        check_len("layer norm beta", width, beta.len())?;
-        check_len("layer norm output", x.len(), out.len())?;
-        let config = rows(x.len() / width)?;
+        let config = layer_norm_rows(x.len(), gamma.len(), beta.len(), out.len(), width)?;
         let lens = [len(x), len(gamma), len(beta), len_mut(out)];
         let width = u32_of("layer norm width", width)?;
         let mut launch = stream.launch_builder(&self.layer_norm);
@@ -245,6 +271,61 @@ impl EncoderKernels {
         launch.arg(out).arg(&lens[3]).arg(&width).arg(&eps);
         // SAFETY: the arguments match `encoder_layer_norm`'s parameters in order, and
         // one block per row of `width` stays inside `x` and `out`
+        unsafe { launch.launch(config) }?;
+        Ok(())
+    }
+
+    /// `x = LayerNorm(x)` in place with `norm`, then with `next` the next layer's
+    /// first LayerNorm of the result into `out`; without `next`, `out` is untouched
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "launchers mirror their kernel's parameter list so each launch reads against it"
+    )]
+    pub(crate) fn layer_norm_pair(
+        &self,
+        stream: &CudaStream,
+        x: &mut CudaViewMut<'_, f32>,
+        norm: (&CudaView<'_, f32>, &CudaView<'_, f32>),
+        next: Option<(&CudaView<'_, f32>, &CudaView<'_, f32>)>,
+        out: &mut CudaViewMut<'_, f32>,
+        width: usize,
+        eps: f32,
+    ) -> Result<(), Error> {
+        let (gamma, beta) = norm;
+        let config = layer_norm_rows(x.len(), gamma.len(), beta.len(), out.len(), width)?;
+        // without a next norm the kernel returns before it reads the second set, so
+        // `x`'s own parameters stand in
+        let (next_gamma, next_beta) = next.unwrap_or((gamma, beta));
+        check_len("next layer norm gamma", width, next_gamma.len())?;
+        check_len("next layer norm beta", width, next_beta.len())?;
+        let lens = [
+            len_mut(x),
+            len(gamma),
+            len(beta),
+            len(next_gamma),
+            len(next_beta),
+            len_mut(out),
+        ];
+        let width = u32_of("layer norm width", width)?;
+        let flag = u32::from(next.is_some());
+        let mut launch = stream.launch_builder(&self.layer_norm_pair);
+        launch
+            .arg(x)
+            .arg(&lens[0])
+            .arg(gamma)
+            .arg(&lens[1])
+            .arg(beta)
+            .arg(&lens[2]);
+        launch
+            .arg(next_gamma)
+            .arg(&lens[3])
+            .arg(next_beta)
+            .arg(&lens[4])
+            .arg(out)
+            .arg(&lens[5]);
+        launch.arg(&width).arg(&eps).arg(&flag);
+        // SAFETY: matches `encoder_layer_norm_pair`; one block per row of `width`
+        // stays inside `x` and `out`, which are sized alike above
         unsafe { launch.launch(config) }?;
         Ok(())
     }
