@@ -9,8 +9,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
-use std::rc::Rc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use cudakit::{Graph, Library, Options};
 
@@ -109,9 +108,16 @@ struct Engine {
 
 /// Parakeet encoder and greedy decode on CUDA device 0, shared by clones
 ///
-/// `Rc` because cudakit's runtime is not `Send` yet; clones stay on one thread
+/// Clones may run on any thread; the shape cache's lock also serializes graph
+/// capture, which cudakit requires across threads sharing a runtime
 #[derive(Clone)]
-pub(crate) struct CudaModel(Rc<Engine>);
+pub(crate) struct CudaModel(Arc<Engine>);
+
+// a backend handle that is not thread-safe would quietly make pipelines `!Send`
+const _: () = {
+    const fn thread_safe<T: Send + Sync>() {}
+    thread_safe::<CudaModel>();
+};
 
 impl fmt::Debug for CudaModel {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -135,7 +141,7 @@ impl CudaModel {
         let encoder = CudaEncoder::load(&runtime, &file, spec.encoder)?;
         let decoder = CudaDecoder::load(&runtime, &file, &spec)?;
         let (free, _) = runtime.stream().context().mem_get_info()?;
-        Ok(Self(Rc::new(Engine {
+        Ok(Self(Arc::new(Engine {
             shapes: Mutex::new(ShapeCache::new(free / CACHE_SHARE_DIVISOR)),
             encoder,
             decoder,
