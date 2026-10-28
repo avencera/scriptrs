@@ -989,7 +989,11 @@ mod tests {
 
     /// One decision per row of synthetic v3 logits, with each language's filter and
     /// with none, against the host rule `decide_from_logits`: the same token and
-    /// duration, and the same confidence within the sum-order tolerances
+    /// duration, and the same confidence within the sum-order tolerances. Each
+    /// fixture also runs under the next language's mask straight after its own, at
+    /// the same K, so a mask left over from the previous call picks the wrong ids.
+    /// Rows with a non-finite class logit fault under the filter, as the host rule
+    /// rejects them
     #[test]
     #[ignore = "needs a CUDA GPU and the native weights; `just gpu-parity` runs it on gpu0"]
     fn gpu_language_filter_matches_the_host_rule() {
@@ -1024,20 +1028,37 @@ mod tests {
             ParakeetLanguage::Russian,
             ParakeetLanguage::Greek,
         ];
+        let policies: Vec<DecodePolicy<'_>> = languages
+            .iter()
+            .map(|language| {
+                DecodePolicy::new(&deployment, &vocab, LanguageSelection::Language(*language))
+                    .expect("policy")
+            })
+            .collect();
+        let masks: Vec<LanguageMask> = policies
+            .iter()
+            .map(|policy| {
+                policy
+                    .language_mask()
+                    .expect("v3 filters an explicit language")
+            })
+            .collect();
         for (seed, language) in languages.into_iter().enumerate() {
-            let policy =
-                DecodePolicy::new(&deployment, &vocab, LanguageSelection::Language(language))
-                    .expect("policy");
-            let mask = policy
-                .language_mask()
-                .expect("v3 filters an explicit language");
-            let rows = filter_fixture(&mask, bins, seed as u64);
+            let rows = filter_fixture(&masks[seed], bins, seed as u64);
+            let next = (seed + 1) % languages.len();
 
-            for filter in [Some(&mask), None] {
+            for active in [Some(seed), Some(next), None] {
+                let (policy, filter) = match active {
+                    Some(index) => (&policies[index], Some(&masks[index])),
+                    None => (&policies[seed], None),
+                };
                 let decided = decide_once(&runtime, &decoder, &mut ws, &rows, filter);
                 for (row, logits) in rows.iter().enumerate() {
-                    let context = format!("{language:?} row {row}, filter {}", filter.is_some());
-                    let host = decide_from_logits(&policy, logits, filter).expect("host rule");
+                    let context = format!(
+                        "{language:?} row {row}, filter {:?}",
+                        active.map(|index| languages[index])
+                    );
+                    let host = decide_from_logits(policy, logits, filter).expect("host rule");
                     let plain = decide_from_logits(&auto, logits, None).expect("host rule");
                     assert_eq!(decided.faults[row], 0, "{context}: fault");
                     if host.token_id == blank {
@@ -1062,8 +1083,9 @@ mod tests {
                     );
                     // an allowed argmax ranks first, so the top-K softmax scores it, as
                     // it does a filtered token; otherwise no allowed id made the top K
-                    let top_k = filter.is_some()
-                        && (host.token_id != plain.token_id || mask.allowed()[plain.token_id]);
+                    let top_k = filter.is_some_and(|mask| {
+                        host.token_id != plain.token_id || mask.allowed()[plain.token_id]
+                    });
                     let tolerance = if top_k {
                         TOP_K_TOLERANCE
                     } else {
@@ -1085,6 +1107,31 @@ mod tests {
                 }
             }
         }
+
+        // non-finite class logits: a low -inf under a finite max, the max at +inf, a
+        // NaN, a -inf beside a blank max, which the filter itself skips, and fewer
+        // finite classes than K
+        let mut rows = filter_fixture(&masks[0], bins, 7);
+        let finite = blank / 2;
+        rows[0][3] = f32::NEG_INFINITY;
+        rows[1][finite] = f32::INFINITY;
+        rows[2][finite] = f32::NAN;
+        rows[3][blank] = 50.0;
+        rows[3][3] = f32::NEG_INFINITY;
+        rows[4][..blank].fill(f32::NEG_INFINITY);
+        rows[4][finite..finite + 10].fill(1.0);
+        let decided = decide_once(&runtime, &decoder, &mut ws, &rows, Some(&masks[0]));
+        for (row, logits) in rows.iter().enumerate().take(5) {
+            assert!(
+                decide_from_logits(&policies[0], logits, Some(&masks[0])).is_err(),
+                "row {row}: the host rule accepted a non-finite logit"
+            );
+            assert_ne!(decided.faults[row], 0, "non-finite row {row} did not fault");
+        }
+        assert!(
+            decoder.output(&runtime, &ws).is_err(),
+            "faulted rows reached the output"
+        );
 
         // the fixture must reach every branch of the filter, not only the argmax
         println!("{retargeted} retargeted, {rescored} rescored, {outside} outside the top K");
