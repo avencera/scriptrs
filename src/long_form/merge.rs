@@ -1,5 +1,8 @@
 use crate::decode::RawTranscription;
 
+/// Most encoder frames apart two tokens can be and still count as the same token
+const MAX_MATCH_FRAMES: usize = 25;
+
 pub(crate) fn merge_overlapping_windows(windows: Vec<RawTranscription>) -> RawTranscription {
     let mut iter = windows.into_iter();
     let Some(mut merged) = iter.next() else {
@@ -20,12 +23,15 @@ fn merge_pair(left: RawTranscription, right: RawTranscription) -> RawTranscripti
         return left;
     }
 
-    let matches = contiguous_matches(&left, &right);
+    // `left` is everything merged so far; only its tail can reach `right`, so the
+    // searches start there rather than rescanning the whole transcript per window
+    let left_start = first_reachable(&left, &right);
+    let matches = contiguous_matches(&left, left_start, &right);
     if !matches.is_empty() {
         return merge_using_matches(left, right, &matches);
     }
 
-    let matches = lcs_matches(&left, &right);
+    let matches = lcs_matches(&left, left_start, &right);
     if !matches.is_empty() {
         return merge_using_matches(left, right, &matches);
     }
@@ -33,9 +39,25 @@ fn merge_pair(left: RawTranscription, right: RawTranscription) -> RawTranscripti
     merge_by_midpoint(left, right)
 }
 
-fn contiguous_matches(left: &RawTranscription, right: &RawTranscription) -> Vec<(usize, usize)> {
+/// Index of the first `left` token within match distance of any `right` frame; no
+/// earlier token can match, so skipping them changes no match
+fn first_reachable(left: &RawTranscription, right: &RawTranscription) -> usize {
+    let Some(right_first) = right.frame_indices.iter().copied().min() else {
+        return left.token_ids.len();
+    };
+    left.frame_indices
+        .iter()
+        .position(|frame| frame + MAX_MATCH_FRAMES >= right_first)
+        .unwrap_or(left.token_ids.len())
+}
+
+fn contiguous_matches(
+    left: &RawTranscription,
+    left_start: usize,
+    right: &RawTranscription,
+) -> Vec<(usize, usize)> {
     let mut best = Vec::new();
-    for left_idx in 0..left.token_ids.len() {
+    for left_idx in left_start..left.token_ids.len() {
         for right_idx in 0..right.token_ids.len() {
             if !tokens_match(left, left_idx, right, right_idx) {
                 continue;
@@ -59,11 +81,19 @@ fn contiguous_matches(left: &RawTranscription, right: &RawTranscription) -> Vec<
     best
 }
 
-fn lcs_matches(left: &RawTranscription, right: &RawTranscription) -> Vec<(usize, usize)> {
-    let mut dp = vec![vec![0usize; right.token_ids.len() + 1]; left.token_ids.len() + 1];
-    for left_idx in 1..=left.token_ids.len() {
+/// Longest common subsequence of `left[left_start..]` and `right`; rows before
+/// `left_start` would all be zero, so the table and its traceback start there
+fn lcs_matches(
+    left: &RawTranscription,
+    left_start: usize,
+    right: &RawTranscription,
+) -> Vec<(usize, usize)> {
+    let left_len = left.token_ids.len() - left_start;
+    let matches_at = |row: usize, col: usize| tokens_match(left, left_start + row, right, col);
+    let mut dp = vec![vec![0usize; right.token_ids.len() + 1]; left_len + 1];
+    for left_idx in 1..=left_len {
         for right_idx in 1..=right.token_ids.len() {
-            if tokens_match(left, left_idx - 1, right, right_idx - 1) {
+            if matches_at(left_idx - 1, right_idx - 1) {
                 dp[left_idx][right_idx] = dp[left_idx - 1][right_idx - 1] + 1;
             } else {
                 dp[left_idx][right_idx] =
@@ -73,11 +103,11 @@ fn lcs_matches(left: &RawTranscription, right: &RawTranscription) -> Vec<(usize,
     }
 
     let mut matches = Vec::new();
-    let mut left_idx = left.token_ids.len();
+    let mut left_idx = left_len;
     let mut right_idx = right.token_ids.len();
     while left_idx > 0 && right_idx > 0 {
-        if tokens_match(left, left_idx - 1, right, right_idx - 1) {
-            matches.push((left_idx - 1, right_idx - 1));
+        if matches_at(left_idx - 1, right_idx - 1) {
+            matches.push((left_start + left_idx - 1, right_idx - 1));
             left_idx -= 1;
             right_idx -= 1;
             continue;
@@ -99,7 +129,7 @@ fn tokens_match(
     right_idx: usize,
 ) -> bool {
     left.token_ids[left_idx] == right.token_ids[right_idx]
-        && left.frame_indices[left_idx].abs_diff(right.frame_indices[right_idx]) <= 25
+        && left.frame_indices[left_idx].abs_diff(right.frame_indices[right_idx]) <= MAX_MATCH_FRAMES
 }
 
 fn merge_using_matches(
