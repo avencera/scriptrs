@@ -72,4 +72,6 @@ objc2-foundation = { version = "0.3", features = [
 approx = "0.5.1"
 eyre = "0.6.12"
 hound = "3.5.1"
+memmap2 = "0.9"
+safetensors = "0.8"
 tempfile = "3.23.0"

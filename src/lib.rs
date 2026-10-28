@@ -145,6 +145,8 @@ mod models;
 mod pipeline;
 #[cfg(feature = "long-form")]
 mod preprocessing;
+#[cfg(test)]
+mod test_support;
 mod types;
 mod vocab;
 
