@@ -13,8 +13,10 @@
 //! (seconds) override the overlap plan and `--batch` the windows per model call;
 //! at batch 1 the windows run one at a time on one worker, and above it the
 //! default workers prepare windows ahead of the model. `--language <code>` decodes
-//! with that language's filter instead of automatic language selection, and
-//! `--fp32` runs the encoder GEMMs in FP32 instead of TF32
+//! with that language's filter instead of automatic language selection,
+//! `--fp32` runs the encoder GEMMs in FP32 instead of TF32, and `--vad` (with the
+//! `vad` feature) plans long recordings from Silero speech regions instead of
+//! overlap windows over the whole recording, at `--vad-threshold <p>` if given
 //!
 //! ```sh
 //! cargo run --release --features cuda,long-form --example cuda_bench -- \
@@ -50,6 +52,8 @@ struct Args {
     batch: Option<usize>,
     language: LanguageSelection,
     precision: Precision,
+    vad: bool,
+    vad_threshold: Option<f32>,
 }
 
 struct Utterance {
@@ -88,6 +92,8 @@ fn run() -> Result<()> {
         "version": version,
         "bs": batch,
         "long": !args.long.is_empty(),
+        "vad": args.vad,
+        "vad_threshold": args.vad_threshold,
         "n_utts": texts.len(),
         "audio_s": audio_s,
         "walls_s": walls,
@@ -175,6 +181,13 @@ fn bench_long(bundle: ModelBundle, paths: &[PathBuf], args: &Args) -> Result<Ben
     if let Some(overlap_s) = args.overlap_s {
         config.overlap.overlap_seconds = overlap_s;
     }
+    #[cfg(feature = "vad")]
+    if args.vad {
+        config.mode = scriptrs::LongFormMode::Vad;
+        if let Some(threshold) = args.vad_threshold {
+            config.vad.default_threshold = threshold;
+        }
+    }
     let pipeline = LongFormTranscriptionPipeline::from_bundle(bundle)?;
     let recordings = long_recordings(paths)?;
     let Some(first) = recordings.first() else {
@@ -241,6 +254,8 @@ fn parse_args() -> Result<Args> {
     let mut batch = None;
     let mut language = LanguageSelection::Auto;
     let mut precision = Precision::default();
+    let mut vad = false;
+    let mut vad_threshold = None;
     let mut args = env::args().skip(1);
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| eyre!("{flag} needs a value"));
@@ -267,8 +282,18 @@ fn parse_args() -> Result<Args> {
                 language = LanguageSelection::Language(parsed);
             }
             "--fp32" => precision = Precision::Fp32,
+            "--vad" if cfg!(feature = "vad") => vad = true,
+            "--vad" => return Err(eyre!("--vad needs the `vad` feature")),
+            "--vad-threshold" => vad_threshold = Some(value()?.parse()?),
             other => return Err(eyre!("unknown argument {other}")),
         }
+    }
+
+    if vad && long.is_empty() {
+        return Err(eyre!("--vad only applies to --long recordings"));
+    }
+    if vad_threshold.is_some() && !vad {
+        return Err(eyre!("--vad-threshold needs --vad"));
     }
 
     Ok(Args {
@@ -283,6 +308,8 @@ fn parse_args() -> Result<Args> {
         batch,
         language,
         precision,
+        vad,
+        vad_threshold,
     })
 }
 

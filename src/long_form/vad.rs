@@ -1,16 +1,20 @@
 #[cfg(target_os = "macos")]
-use crate::constants::{VAD_CONTEXT_SAMPLES, VAD_STATE_SIZE, VAD_WINDOW_SAMPLES};
+use crate::constants::VAD_STATE_SIZE;
+#[cfg(any(target_os = "macos", feature = "cuda", test))]
+use crate::constants::{VAD_CONTEXT_SAMPLES, VAD_WINDOW_SAMPLES};
 #[cfg(target_os = "macos")]
 use crate::coreml::SileroVadCoreMlModel;
 use crate::error::TranscriptionError;
 use crate::long_form::planner::VadConfig;
 use crate::models::{ModelBundle, RuntimeBundle};
+#[cfg(feature = "cuda")]
+use crate::native::silero::{SileroModel, SileroState};
 use crate::preprocessing::TranscriptionControl;
 
 /// Silero VAD owner: window chunking, context carry-over, tail padding, and
 /// per-recording recurrent state reset
 ///
-/// Runtimes only classify one prepared window and advance the opaque state.
+/// Runtimes only classify prepared windows and advance the opaque state.
 #[derive(Debug, Clone)]
 pub(crate) struct SileroVad {
     model: VadModelInner,
@@ -36,9 +40,12 @@ impl SileroVad {
 enum VadModelInner {
     #[cfg(target_os = "macos")]
     CoreMl(SileroVadCoreMlModel),
-    // no VAD runtime outside Core ML; keeps the matches below compiling
-    #[cfg(not(target_os = "macos"))]
-    #[expect(dead_code, reason = "from_bundle never builds a VAD model off macOS")]
+    #[cfg(feature = "cuda")]
+    Native(SileroModel),
+    // no VAD runtime without Core ML or the native weights; keeps the matches
+    // below compiling
+    #[cfg(not(any(target_os = "macos", feature = "cuda")))]
+    #[expect(dead_code, reason = "from_bundle never builds a VAD model here")]
     Unsupported,
 }
 
@@ -61,10 +68,13 @@ impl VadModelInner {
                     Err(TranscriptionError::UnsupportedPlatform)
                 }
             }
-            // no native VAD runtime yet; the pipeline treats this like a bundle
-            // without a VAD model
             #[cfg(feature = "cuda")]
-            RuntimeBundle::Native(_) => Ok(None),
+            RuntimeBundle::Native(layout) => {
+                if !layout.vad_path().exists() {
+                    return Ok(None);
+                }
+                Ok(Some(Self::Native(SileroModel::open(layout.vad_path())?)))
+            }
         }
     }
 
@@ -75,14 +85,31 @@ impl VadModelInner {
     ) -> Result<Vec<f32>, TranscriptionError> {
         match self {
             #[cfg(target_os = "macos")]
-            Self::CoreMl(model) => process_windows(audio, control, |window, state| {
-                let (hidden_state, cell_state) = state.split_at_mut(VAD_STATE_SIZE);
-                let outputs = model.run(window, hidden_state, cell_state)?;
-                copy_state_vec(&outputs.hidden_state, hidden_state)?;
-                copy_state_vec(&outputs.cell_state, cell_state)?;
-                Ok(outputs.probability)
-            }),
-            #[cfg(not(target_os = "macos"))]
+            Self::CoreMl(model) => {
+                let mut state = vec![0.0f32; 2 * VAD_STATE_SIZE];
+                process_blocks(audio, control, 1, |window, probabilities| {
+                    let (hidden_state, cell_state) = state.split_at_mut(VAD_STATE_SIZE);
+                    let outputs = model.run(window, hidden_state, cell_state)?;
+                    copy_state_vec(&outputs.hidden_state, hidden_state)?;
+                    copy_state_vec(&outputs.cell_state, cell_state)?;
+                    probabilities.push(outputs.probability);
+                    Ok(())
+                })
+            }
+            #[cfg(feature = "cuda")]
+            Self::Native(model) => {
+                let mut state = SileroState::new();
+                process_blocks(
+                    audio,
+                    control,
+                    model.block_windows(),
+                    |windows, probabilities| {
+                        model.classify(windows, &mut state, probabilities);
+                        Ok(())
+                    },
+                )
+            }
+            #[cfg(not(any(target_os = "macos", feature = "cuda")))]
             Self::Unsupported => {
                 let _ = audio;
                 let _ = control;
@@ -92,46 +119,62 @@ impl VadModelInner {
     }
 }
 
-/// Run one classifier over every window of a recording
+/// Model input width: the carried context, then one chunk
+#[cfg(any(target_os = "macos", feature = "cuda", test))]
+const WINDOW_INPUT_SAMPLES: usize = VAD_CONTEXT_SAMPLES + VAD_WINDOW_SAMPLES;
+
+/// Run one classifier over every window of a recording, `block_windows` at a time
 ///
-/// The recurrent state starts at zero for each recording. Each window is
-/// `VAD_CONTEXT_SAMPLES` from the previous chunk followed by one chunk of
-/// `VAD_WINDOW_SAMPLES`; a short final chunk is padded with its last sample.
-#[cfg(target_os = "macos")]
-fn process_windows(
+/// The caller starts the recurrent state at zero for each recording, and
+/// `classify` pushes one probability per window, in order. Each window is
+/// `VAD_CONTEXT_SAMPLES` from the previous chunk (zeros for the first) followed by
+/// one chunk of `VAD_WINDOW_SAMPLES`; a short final chunk is padded with its last
+/// sample. Cancellation is checked before each block
+#[cfg(any(target_os = "macos", feature = "cuda", test))]
+fn process_blocks(
     audio: &[f32],
     control: &TranscriptionControl,
-    mut classify: impl FnMut(&[f32], &mut [f32]) -> Result<f32, TranscriptionError>,
+    block_windows: usize,
+    mut classify: impl FnMut(&[f32], &mut Vec<f32>) -> Result<(), TranscriptionError>,
 ) -> Result<Vec<f32>, TranscriptionError> {
-    if audio.is_empty() {
-        return Ok(Vec::new());
-    }
+    let count = audio.len().div_ceil(VAD_WINDOW_SAMPLES);
+    let block_windows = block_windows.max(1);
+    let mut probabilities = Vec::with_capacity(count);
+    let mut inputs = vec![0.0f32; block_windows.min(count) * WINDOW_INPUT_SAMPLES];
 
-    let mut probabilities = Vec::with_capacity(audio.len().div_ceil(VAD_WINDOW_SAMPLES));
-    let mut state = vec![0.0f32; 2 * VAD_STATE_SIZE];
-    let mut context = vec![0.0f32; VAD_CONTEXT_SAMPLES];
-    let mut chunk = vec![0.0f32; VAD_WINDOW_SAMPLES];
-    let mut model_input = vec![0.0f32; VAD_WINDOW_SAMPLES + VAD_CONTEXT_SAMPLES];
-
-    for chunk_start in (0..audio.len()).step_by(VAD_WINDOW_SAMPLES) {
+    for first in (0..count).step_by(block_windows) {
         control.check()?;
-        let chunk_end = (chunk_start + VAD_WINDOW_SAMPLES).min(audio.len());
-        let chunk_len = chunk_end - chunk_start;
-        chunk[..chunk_len].copy_from_slice(&audio[chunk_start..chunk_end]);
-
-        if chunk_len < VAD_WINDOW_SAMPLES {
-            let last = chunk[chunk_len.saturating_sub(1)];
-            chunk[chunk_len..].fill(last);
+        let windows = block_windows.min(count - first);
+        let inputs = &mut inputs[..windows * WINDOW_INPUT_SAMPLES];
+        for (offset, input) in inputs.chunks_exact_mut(WINDOW_INPUT_SAMPLES).enumerate() {
+            fill_window(audio, first + offset, input);
         }
 
-        model_input[..VAD_CONTEXT_SAMPLES].copy_from_slice(&context);
-        model_input[VAD_CONTEXT_SAMPLES..].copy_from_slice(&chunk);
-
-        probabilities.push(classify(&model_input, &mut state)?);
-        context.copy_from_slice(&chunk[VAD_WINDOW_SAMPLES - VAD_CONTEXT_SAMPLES..]);
+        let before = probabilities.len();
+        classify(inputs, &mut probabilities)?;
+        debug_assert_eq!(probabilities.len(), before + windows);
     }
 
     Ok(probabilities)
+}
+
+/// Write model window `index` of `audio` into `input`
+///
+/// Every chunk but the last is full, so the context is always the
+/// `VAD_CONTEXT_SAMPLES` of audio just before the chunk
+#[cfg(any(target_os = "macos", feature = "cuda", test))]
+fn fill_window(audio: &[f32], index: usize, input: &mut [f32]) {
+    let start = index * VAD_WINDOW_SAMPLES;
+    let (context, chunk) = input.split_at_mut(VAD_CONTEXT_SAMPLES);
+    match start.checked_sub(VAD_CONTEXT_SAMPLES) {
+        Some(context_start) => context.copy_from_slice(&audio[context_start..start]),
+        None => context.fill(0.0),
+    }
+
+    let end = (start + VAD_WINDOW_SAMPLES).min(audio.len());
+    let len = end - start;
+    chunk[..len].copy_from_slice(&audio[start..end]);
+    chunk[len..].fill(audio[end - 1]);
 }
 
 #[cfg(target_os = "macos")]
@@ -146,68 +189,88 @@ fn copy_state_vec(values: &[f32], state: &mut [f32]) -> Result<(), Transcription
     Ok(())
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
-    use super::process_windows;
-    use crate::constants::{VAD_CONTEXT_SAMPLES, VAD_STATE_SIZE, VAD_WINDOW_SAMPLES};
+    use super::{WINDOW_INPUT_SAMPLES, process_blocks};
+    use crate::constants::{VAD_CONTEXT_SAMPLES, VAD_WINDOW_SAMPLES};
     use crate::preprocessing::TranscriptionControl;
 
     fn control() -> TranscriptionControl {
         TranscriptionControl::internal_unbounded()
     }
 
+    /// Every window the classifier sees, in order, with `block_windows` per call
+    fn windows_seen(audio: &[f32], block_windows: usize) -> Vec<Vec<f32>> {
+        let mut seen = Vec::new();
+        let probabilities = process_blocks(audio, &control(), block_windows, |inputs, out| {
+            assert!(inputs.len() <= block_windows * WINDOW_INPUT_SAMPLES);
+            for input in inputs.chunks_exact(WINDOW_INPUT_SAMPLES) {
+                seen.push(input.to_vec());
+                out.push(seen.len() as f32);
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(probabilities.len(), seen.len());
+        seen
+    }
+
     #[test]
-    fn windows_carry_context_pad_the_tail_and_start_from_zero_state() {
+    fn windows_carry_context_and_pad_the_tail() {
         let mut audio = vec![0.0f32; VAD_WINDOW_SAMPLES + 10];
         audio[VAD_WINDOW_SAMPLES - 1] = 0.5;
         audio[VAD_WINDOW_SAMPLES + 9] = 0.25;
 
-        let mut seen = Vec::new();
-        let probabilities = process_windows(&audio, &control(), |window, state| {
-            seen.push((window.to_vec(), state.to_vec()));
-            state[0] += 1.0;
-            Ok(state[0] / 10.0)
-        })
-        .unwrap();
-
-        assert_eq!(probabilities, vec![0.1, 0.2]);
+        let seen = windows_seen(&audio, 1);
         assert_eq!(seen.len(), 2);
-        assert_eq!(seen[0].1, vec![0.0; 2 * VAD_STATE_SIZE]);
-        assert_eq!(seen[1].1[0], 1.0);
 
         // first window has zero context followed by the first chunk
-        assert!(seen[0].0[..VAD_CONTEXT_SAMPLES].iter().all(|v| *v == 0.0));
-        assert_eq!(seen[0].0[VAD_CONTEXT_SAMPLES + VAD_WINDOW_SAMPLES - 1], 0.5);
+        assert!(seen[0][..VAD_CONTEXT_SAMPLES].iter().all(|v| *v == 0.0));
+        assert_eq!(seen[0][VAD_CONTEXT_SAMPLES + VAD_WINDOW_SAMPLES - 1], 0.5);
 
         // second window starts with the last context samples of the first chunk
-        assert_eq!(seen[1].0[VAD_CONTEXT_SAMPLES - 1], 0.5);
+        assert_eq!(seen[1][VAD_CONTEXT_SAMPLES - 1], 0.5);
 
         // short tail is padded with its own last sample
         assert!(
-            seen[1].0[VAD_CONTEXT_SAMPLES + 9..]
+            seen[1][VAD_CONTEXT_SAMPLES + 9..]
                 .iter()
                 .all(|v| *v == 0.25)
         );
     }
 
     #[test]
+    fn block_size_does_not_change_the_windows() {
+        let audio: Vec<f32> = (0..VAD_WINDOW_SAMPLES * 7 + 100)
+            .map(|index| (index as f32 * 0.01).sin())
+            .collect();
+
+        let one_at_a_time = windows_seen(&audio, 1);
+        assert_eq!(one_at_a_time.len(), 8);
+        // 3 does not divide 8, so the last block is short
+        assert_eq!(windows_seen(&audio, 3), one_at_a_time);
+        assert_eq!(windows_seen(&audio, 64), one_at_a_time);
+    }
+
+    #[test]
     fn empty_audio_never_invokes_the_classifier() {
         let probabilities =
-            process_windows(&[], &control(), |_, _| panic!("classifier must not run")).unwrap();
+            process_blocks(&[], &control(), 4, |_, _| panic!("classifier must not run")).unwrap();
         assert!(probabilities.is_empty());
     }
 
     #[test]
-    fn cancellation_is_checked_before_each_classifier_call() {
-        let audio = vec![0.0f32; VAD_WINDOW_SAMPLES * 3];
+    fn cancellation_is_checked_before_each_block() {
+        let audio = vec![0.0f32; VAD_WINDOW_SAMPLES * 6];
         let control = control();
         let mut calls = 0;
-        let error = process_windows(&audio, &control, |_, _| {
+        let error = process_blocks(&audio, &control, 2, |inputs, out| {
             calls += 1;
             if calls == 1 {
                 control.cancel();
             }
-            Ok(0.1)
+            out.extend(inputs.chunks_exact(WINDOW_INPUT_SAMPLES).map(|_| 0.1));
+            Ok(())
         })
         .expect_err("cancelled scan");
 

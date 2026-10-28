@@ -99,7 +99,7 @@ models/
 
 The `cuda` feature runs Parakeet on an NVIDIA GPU with no ONNX Runtime or
 PyTorch. It is built from this repository only for now. It supports the v3
-language filter; VAD is not supported yet.
+language filter and, with `vad`, VAD-backed long-form planning.
 
 It loads native weights rather than Core ML models:
 
@@ -111,6 +111,8 @@ models/
   parakeet-v3/
     model.safetensors
     parakeet_vocab.json
+  vad/
+    silero-vad-v5.safetensors    # with `vad`
 ```
 
 ```rust,ignore
