@@ -127,7 +127,7 @@ shorter overlaps lose accuracy on long recordings.
 
 On an RTX 5090, v3 runs LibriSpeech test-clean one utterance at a time at 719x
 real time with 1.93 % WER, the same WER as NeMo's FP32 greedy decode at 410x.
-On all 44 Earnings-21 calls (39 h), long-form with the defaults runs at 1260x
+On all 44 Earnings-21 calls (39 h), long-form with the defaults runs at 1590x
 with 8.25 % pooled WER; NeMo transcribing each whole call with local attention
 scores 9.58 %.
 
