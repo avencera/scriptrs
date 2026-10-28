@@ -500,6 +500,9 @@ impl LongFormTranscriptionPipeline {
                     });
                 }
                 drop(sender);
+                // a panic in the model call unwinds past the cleanup below, and the
+                // scope would then wait on workers parked at the gate
+                let _stop_on_panic = StopOnPanic(&lookahead);
 
                 // windows arrive in any order; batches are cut in plan order, and an
                 // error surfaces when its window is reached, as on the serial path
@@ -964,7 +967,7 @@ impl Lookahead {
     }
 }
 
-/// Closes a [`Lookahead`] when the thread holding it unwinds
+/// Closes a [`Lookahead`] when the code holding it unwinds
 struct StopOnPanic<'a>(&'a Lookahead);
 
 impl Drop for StopOnPanic<'_> {
@@ -1570,13 +1573,16 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{path:?} run failed: {error}"));
 
             let mut observed = observed_hooks(&hook);
-            observed.sort_unstable();
+            // only the serial path runs the windows in plan order
+            if !matches!(path, ExecutionPath::Serial) {
+                observed.sort_unstable();
+            }
             assert_eq!(observed, planned, "{path:?} preprocessed windows");
         }
     }
 
-    /// Once the deadline passes, the parallel and batched paths stop before the
-    /// remaining windows and report the deadline
+    /// Once the deadline passes, every long-form path stops before the remaining
+    /// windows and reports the deadline
     #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "needs a CUDA GPU and the native weights; `just gpu-parity` runs it on gpu0"]
@@ -1604,11 +1610,16 @@ mod tests {
         let (pipeline, base) = native_pipeline();
         let audio = vec![0.0; LONG_AUDIO_SAMPLES];
 
-        for path in [ExecutionPath::Parallel, ExecutionPath::Batched] {
+        for path in [
+            ExecutionPath::Serial,
+            ExecutionPath::Parallel,
+            ExecutionPath::Batched,
+        ] {
             let config = path.config(&base);
             let planned = planned_windows(audio.len(), &config).len();
             let hook = OutlastingHook(RecordingHook(Arc::new(Mutex::new(Vec::new()))));
-            // long enough for the parallel workers to load their models first
+            // usually long enough for the parallel workers to load their models
+            // first
             let control = TranscriptionControl::new(
                 TranscriptionDeadline::from_now(std::time::Duration::from_secs(10)),
                 WindowLimit::new(planned).expect("the plan has windows"),
@@ -1628,10 +1639,14 @@ mod tests {
                 "{path:?} returned {error}"
             );
             let observed = observed_hooks(&hook.0).len();
-            assert!(
-                observed > 0,
-                "{path:?} started no window before the deadline"
-            );
+            // parallel workers load their models inside the run, and a slow load
+            // may correctly use up the whole deadline before any window
+            if !matches!(path, ExecutionPath::Parallel) {
+                assert!(
+                    observed > 0,
+                    "{path:?} started no window before the deadline"
+                );
+            }
             assert!(
                 observed < planned,
                 "{path:?} preprocessed all {planned} windows past the deadline"
@@ -1645,6 +1660,8 @@ mod tests {
     #[test]
     #[ignore = "needs a CUDA GPU and the native weights; `just gpu-parity` runs it on gpu0"]
     fn gpu_cancellation_stops_workers() {
+        /// Cancels on window 1 only, so the other workers must notice the shared
+        /// cancellation rather than stop on a failure of their own
         struct CancellingHook(RecordingHook);
 
         impl WindowPreprocessor for CancellingHook {
@@ -1656,7 +1673,9 @@ mod tests {
                 control: &TranscriptionControl,
             ) -> Result<(), Self::Error> {
                 self.0.process(window, control)?;
-                control.cancel();
+                if window.index().get() == 1 {
+                    control.cancel();
+                }
                 Ok(())
             }
         }
@@ -1693,6 +1712,9 @@ mod tests {
     #[test]
     #[ignore = "needs a CUDA GPU and the native weights; `just gpu-parity` runs it on gpu0"]
     fn gpu_workers_join_after_the_first_preprocessor_error() {
+        /// Fails window 1 only, so the other workers keep succeeding and must be
+        /// stopped by the run; on the batched path they would otherwise park at the
+        /// look-ahead gate and hang the join
         struct FailingHook(RecordingHook);
 
         impl WindowPreprocessor for FailingHook {
@@ -1704,7 +1726,10 @@ mod tests {
                 control: &TranscriptionControl,
             ) -> Result<(), Self::Error> {
                 self.0.process(window, control)?;
-                Err(HookError)
+                if window.index().get() == 1 {
+                    return Err(HookError);
+                }
+                Ok(())
             }
         }
 
@@ -1769,18 +1794,24 @@ mod tests {
             "the batched path needs other workers"
         );
 
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            pipeline.run_with_preprocessor(
-                &audio,
-                &config,
-                &recording_control(planned),
-                &PanickingHook,
-            )
-        }));
+        // a regression parks the run forever, so it runs on its own thread and the
+        // test fails after a bound instead of blocking the rest of the suite
+        let (done, outcome) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pipeline.run_with_preprocessor(
+                    &audio,
+                    &config,
+                    &recording_control(planned),
+                    &PanickingHook,
+                )
+            }));
+            let _ = done.send(result.is_err());
+        });
 
-        assert!(
-            outcome.is_err(),
-            "the batched run should raise the worker's panic"
-        );
+        let panicked = outcome
+            .recv_timeout(std::time::Duration::from_secs(120))
+            .expect("the batched run should end after a worker panics, not hang");
+        assert!(panicked, "the batched run should raise the worker's panic");
     }
 }
