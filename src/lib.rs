@@ -5,9 +5,8 @@
 //!
 //! `scriptrs` is currently a narrow transcription crate:
 //!
-//! - CoreML on macOS by default
-//! - ONNX Runtime with the CUDA execution provider behind the `onnx-cuda`
-//!   feature, using a local manifest-described bundle
+//! - CoreML on macOS, and experimental CUDA on Linux behind the `cuda` feature
+//!   (see `ModelBundle::from_native_dir`)
 //! - Parakeet TDT v2 and v3
 //! - mono 16kHz `&[f32]` input
 //!
@@ -66,30 +65,6 @@
 //!
 //! - `SCRIPTRS_MODELS_DIR=/path/to/models`
 //!
-//! # ONNX/CUDA bundles
-//!
-//! With the `onnx-bundle` feature, validate a local bundle with
-//! [`validate_onnx_bundle`]. With the `onnx-cuda` feature, open it with
-//! [`OnnxCudaBundle::open`] and pass it to [`ModelBundle::from_onnx_cuda`].
-//! The bundle directory holds `manifest.json` plus exactly the graphs and
-//! tokenizer the manifest declares; see `docs/onnx-cuda-bundle.md` for the
-//! manifest schema and graph tensor contract. Opening never downloads
-//! anything and never falls back to the CPU provider:
-//!
-//! ```no_run
-//! # #[cfg(feature = "onnx-cuda")]
-//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! use scriptrs::{CudaDevice, ModelBundle, OnnxCudaBundle, ParakeetDeployment, TranscriptionPipeline};
-//!
-//! let bundle = OnnxCudaBundle::open("bundles/parakeet-v3", ParakeetDeployment::v3(), CudaDevice::new(0))?;
-//! let pipeline = TranscriptionPipeline::from_bundle(ModelBundle::from_onnx_cuda(bundle))?;
-//! # let _ = pipeline;
-//! # Ok(())
-//! # }
-//! # #[cfg(not(feature = "onnx-cuda"))]
-//! # fn main() {}
-//! ```
-//!
 //! # Input requirements
 //!
 //! `scriptrs` expects mono 16kHz audio samples as `&[f32]`. File decoding stays
@@ -100,10 +75,11 @@
 //! Single-chunk transcription:
 //!
 //! ```no_run
+//! # #[cfg(feature = "online")]
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! use scriptrs::TranscriptionPipeline;
 //!
 //! # fn load_audio() -> Vec<f32> { Vec::new() }
-//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let audio = load_audio();
 //! let pipeline = TranscriptionPipeline::from_pretrained()?;
 //! let result = pipeline.run(&audio)?;
@@ -111,6 +87,8 @@
 //! println!("{}", result.text);
 //! # Ok(())
 //! # }
+//! # #[cfg(not(feature = "online"))]
+//! # fn main() {}
 //! ```
 //!
 //! Long-form transcription:
@@ -155,8 +133,11 @@
 //! # fn main() {}
 //! ```
 
+mod backend;
 mod config;
 mod constants;
+#[cfg(feature = "cuda")]
+mod cuda;
 mod decode;
 mod deployment;
 mod error;
@@ -165,9 +146,13 @@ mod language;
 mod model;
 mod model_io;
 mod models;
+#[cfg(feature = "cuda")]
+mod native;
 mod pipeline;
 #[cfg(feature = "long-form")]
 mod preprocessing;
+#[cfg(test)]
+mod test_support;
 mod types;
 mod vocab;
 
@@ -177,9 +162,6 @@ mod coreml;
 #[cfg(feature = "long-form")]
 mod long_form;
 
-#[cfg(feature = "onnx-bundle")]
-mod onnx;
-
 pub use config::TranscriptionConfig;
 pub use deployment::{
     DecoderDimensions, DecoderIo, EncoderIo, FrontendSpec, JointIo, ModelIo, ModelLayout,
@@ -187,8 +169,8 @@ pub use deployment::{
 };
 pub use error::TranscriptionError;
 pub use language::{
-    FilteredToken, LanguageSelection, ParakeetLanguage, Script, V3_LANGUAGES,
-    detect_language_from_tokens, filter_top_k_language, select_language_from_logits,
+    FilteredToken, LanguageSelection, ParakeetLanguage, Script, TopKCandidates, TopKPair,
+    V3_LANGUAGES, detect_language_from_tokens, filter_top_k_language, select_language_from_logits,
 };
 #[cfg(feature = "long-form")]
 pub use long_form::{
@@ -200,17 +182,8 @@ pub use model_io::{DecodedJointStep, EncoderOutputs, JointOutputs, decode_joint_
 pub use models::ModelBundle;
 #[cfg(feature = "online")]
 pub use models::ModelManager;
-#[cfg(feature = "onnx-bundle")]
-pub use onnx::{
-    BundlePath, BundlePathError, DigestParseError, ExportIdentity, FileAsset, GitRevision,
-    GitRevisionParseError, GraphAsset, GraphKind, MANIFEST_FILE_NAME, ManifestDeployment,
-    ManifestSchema, OnnxBundleError, OnnxBundleManifest, OnnxBundleValidation,
-    PARAKEET_BUNDLE_SCHEMA, ParakeetGraphContract, ParakeetGraphs, Sha256Digest,
-    SileroGraphContract, SourceCheckpoint, TokenizerAsset, TokenizerFormat, VadAsset,
-    validate_onnx_bundle,
-};
-#[cfg(feature = "onnx-cuda")]
-pub use onnx::{CudaDevice, OnnxCudaBundle};
+#[cfg(feature = "cuda")]
+pub use models::Precision;
 pub use pipeline::TranscriptionPipeline;
 #[cfg(feature = "long-form")]
 pub use preprocessing::{

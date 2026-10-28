@@ -69,11 +69,13 @@ impl StftWorkspace {
         r2c: &Arc<dyn RealToComplex<f32>>,
         window: &[f32],
         start: usize,
-        available: usize,
     ) -> Result<(), TranscriptionError> {
+        // torch.stft centers a window shorter than n_fft inside the frame
+        let offset = (self.input.len() - window.len()) / 2;
         self.input.fill(0.0);
-        for (window_idx, window_value) in window.iter().take(available).copied().enumerate() {
-            self.input[window_idx] = self.padded[start + window_idx] * window_value;
+        for (window_idx, window_value) in window.iter().copied().enumerate() {
+            self.input[offset + window_idx] =
+                self.padded[start + offset + window_idx] * window_value;
         }
 
         let input = &mut self.input;
@@ -124,19 +126,17 @@ impl ParakeetFeatureExtractor {
         let pad_amount = self.config.n_fft / 2;
         workspace.prepare_padded_audio(pad_amount);
 
-        let num_frames = (workspace.padded.len() - self.config.n_fft) / self.config.hop_length + 1;
+        // NeMo counts `len / hop` valid frames; the STFT's extra trailing frame is
+        // padding that NeMo masks out and leaves out of normalization. One frame
+        // is kept for audio shorter than a hop so the encoder has an input
+        let num_frames = (audio.len() / self.config.hop_length).max(1);
         let freq_bins = self.config.n_fft / 2 + 1;
         let mut spectrogram = Array2::<f32>::zeros((freq_bins, num_frames));
 
         // reuse the FFT plan and temporary buffers across chunk extractions
         for frame_idx in 0..num_frames {
             let start = frame_idx * self.config.hop_length;
-            let available = self
-                .config
-                .win_length
-                .min(workspace.padded.len().saturating_sub(start));
-
-            workspace.process_frame(&self.r2c, &self.window, start, available)?;
+            workspace.process_frame(&self.r2c, &self.window, start)?;
 
             for bin in 0..freq_bins {
                 spectrogram[[bin, frame_idx]] = workspace.output[bin].norm_sqr();
@@ -228,11 +228,12 @@ fn normalize_columns(features: &mut Array2<f32>) {
     for feature_idx in 0..num_features {
         let mut column = features.column_mut(feature_idx);
         let mean = column.iter().sum::<f32>() / num_frames as f32;
+        // unbiased, as NeMo's per-feature normalization; a single frame has zero spread
         let variance = column
             .iter()
             .map(|value| (*value - mean).powi(2))
             .sum::<f32>()
-            / (num_frames as f32 - 1.0);
+            / num_frames.saturating_sub(1).max(1) as f32;
         let std = variance.sqrt() + 1e-5;
         for value in &mut column {
             *value = (*value - mean) / std;
@@ -297,5 +298,54 @@ mod tests {
         let column = features.column(0);
         let mean = column.iter().sum::<f32>() / column.len() as f32;
         assert_abs_diff_eq!(mean, 0.0, epsilon = 1e-4);
+    }
+
+    /// Frontend output against NeMo's `mel` for the same audio, over NeMo's valid frames
+    fn assert_matches_nemo_mel(version: crate::deployment::ParakeetVersion) {
+        use crate::deployment::ParakeetDeployment;
+        use crate::test_support::NemoReference;
+
+        let reference = NemoReference::open(version, "b1");
+        let audio = reference.f32("audio");
+        let audio_len = reference.i64("audio_len")[0] as usize;
+        let mel = reference.f32("mel");
+        let mel_len = reference.i64("mel_len")[0] as usize;
+
+        let deployment = match version {
+            crate::deployment::ParakeetVersion::V2 => ParakeetDeployment::v2(),
+            crate::deployment::ParakeetVersion::V3 => ParakeetDeployment::v3(),
+        };
+        let extractor =
+            ParakeetFeatureExtractor::new(&TranscriptionConfig::from_deployment(&deployment));
+        let samples: Vec<f32> = audio.iter().take(audio_len).copied().collect();
+        let features = extractor.extract(&samples).unwrap();
+
+        // NeMo's tensor carries one padded frame past `mel_len`; the frontend must stop at it
+        assert_eq!(features.nrows(), mel_len, "frame count");
+        assert_eq!(features.ncols(), mel.shape()[1], "mel features");
+        let mut max_abs = 0.0f32;
+        for frame in 0..mel_len {
+            for bin in 0..features.ncols() {
+                let value = features[[frame, bin]];
+                assert!(value.is_finite(), "frame {frame} bin {bin} is {value}");
+                max_abs = max_abs.max((value - mel[[0, bin, frame]]).abs());
+            }
+        }
+        assert!(
+            max_abs < 1e-4,
+            "max abs mel difference {max_abs} over {mel_len} frames"
+        );
+    }
+
+    #[test]
+    #[ignore = "reads NeMo references from /shared/datasets/parakeet-ref"]
+    fn nemo_parity_v2_mel() {
+        assert_matches_nemo_mel(crate::deployment::ParakeetVersion::V2);
+    }
+
+    #[test]
+    #[ignore = "reads NeMo references from /shared/datasets/parakeet-ref"]
+    fn nemo_parity_v3_mel() {
+        assert_matches_nemo_mel(crate::deployment::ParakeetVersion::V3);
     }
 }

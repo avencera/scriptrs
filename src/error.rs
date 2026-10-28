@@ -88,18 +88,24 @@ pub enum TranscriptionError {
     /// Model output shapes or dtypes were unexpected
     #[error("{0}")]
     InvalidModelOutput(String),
+    /// A native weight file was malformed or does not match its deployment
+    #[error("invalid model weights: {0}")]
+    InvalidWeights(String),
+    /// The CUDA driver, a CUDA library or a kernel launch failed
+    #[cfg(feature = "cuda")]
+    #[error("CUDA: {0}")]
+    Cuda(#[from] cudakit::Error),
     /// CoreML model loading or prediction failed
     #[error("{0}")]
     CoreMl(String),
-    /// An ONNX bundle failed startup validation or session creation
-    #[cfg(feature = "onnx-bundle")]
-    #[error(transparent)]
-    OnnxBundle(#[from] crate::onnx::OnnxBundleError),
-    /// ONNX Runtime inference failed after the bundle was opened
-    #[cfg(feature = "onnx-cuda")]
-    #[error("{0}")]
-    Onnx(String),
     /// The current platform does not support native CoreML inference
     #[error("native CoreML transcription is only supported on macOS")]
     UnsupportedPlatform,
+}
+
+#[cfg(feature = "cuda")]
+impl From<cudakit::cudarc::driver::DriverError> for TranscriptionError {
+    fn from(error: cudakit::cudarc::driver::DriverError) -> Self {
+        Self::Cuda(error.into())
+    }
 }

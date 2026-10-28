@@ -3,3 +3,4 @@
 /fixtures/models
 /.venv
 /**/__pycache__
+/crates/*/target

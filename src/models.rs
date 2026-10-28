@@ -2,8 +2,6 @@ use std::path::{Path, PathBuf};
 
 use crate::deployment::ParakeetDeployment;
 use crate::error::TranscriptionError;
-#[cfg(feature = "onnx-cuda")]
-use crate::onnx::OnnxCudaBundle;
 use crate::vocab::Vocabulary;
 
 #[cfg(feature = "online")]
@@ -11,16 +9,20 @@ use hf_hub::{Repo, RepoType};
 
 #[cfg(feature = "vad")]
 const VAD_DIR: &str = "vad/silero-vad.mlmodelc";
+/// Longest single input for native bundles, 40 s at 16 kHz; the CUDA encoder has no
+/// fixed input width, and full attention over 40 s still fits easily in memory
+#[cfg(feature = "cuda")]
+const NATIVE_HARD_SAMPLE_MAX: usize = 640_000;
 #[cfg(feature = "online")]
 const SCRIPTRS_MODELS_DIR_ENV: &str = "SCRIPTRS_MODELS_DIR";
 
 /// Resolved model bundle for `scriptrs`
 ///
 /// A bundle pairs one [`ParakeetDeployment`] with one runtime layout. Core ML
-/// bundles are resolved from a directory with [`Self::from_dir`]; ONNX/CUDA
-/// bundles are opened and validated with [`OnnxCudaBundle::open`] and then
-/// converted with [`Self::from_onnx_cuda`]. The runtime is never inferred
-/// from file extensions or the host platform.
+/// bundles are resolved from a directory with [`Self::from_dir`], and native
+/// weight bundles for the CUDA backend with `Self::from_native_dir` (the `cuda`
+/// feature). The runtime is never inferred from file extensions or the host
+/// platform.
 ///
 /// Most callers will use `TranscriptionPipeline::from_pretrained` or
 /// `TranscriptionPipeline::from_dir` instead of constructing this directly.
@@ -32,14 +34,67 @@ pub struct ModelBundle {
 }
 
 /// Runtime-specific asset layout behind a [`ModelBundle`]
-///
-/// The ONNX bundle carries its manifest and session handles, so it is boxed
-/// to keep the Core ML layout small.
 #[derive(Debug, Clone)]
 pub(crate) enum RuntimeBundle {
     CoreMl(CoreMlLayout),
-    #[cfg(feature = "onnx-cuda")]
-    OnnxCuda(Box<OnnxCudaBundle>),
+    #[cfg(feature = "cuda")]
+    Native(NativeLayout),
+}
+
+/// Arithmetic precision of the CUDA backend's encoder matrix multiplies
+///
+/// The weights, activations and accumulation stay FP32 either way; decoding always
+/// runs in FP32
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum Precision {
+    /// TF32 tensor-core multiplies (10-bit mantissa) on Ampere and newer GPUs; cuBLAS
+    /// runs them as FP32 on older GPUs
+    #[default]
+    Tf32,
+    /// Full FP32 multiplies, matching NeMo's FP32 decode token for token
+    Fp32,
+}
+
+/// Native fp32 weights and vocabulary for one deployment, as
+/// `dev-tools/nemo/export_native.py` writes them
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
+pub(crate) struct NativeLayout {
+    weights_path: PathBuf,
+    vocab_path: PathBuf,
+    precision: Precision,
+}
+
+#[cfg(feature = "cuda")]
+impl NativeLayout {
+    fn resolve(root: &Path, deployment: &ParakeetDeployment) -> Self {
+        Self {
+            weights_path: root.join(deployment.native_weights_path()),
+            vocab_path: root.join(deployment.layout().vocab()),
+            precision: Precision::default(),
+        }
+    }
+
+    fn validate_base(&self) -> Result<(), TranscriptionError> {
+        // a sibling deployment's weights are caught when the weight file's config is
+        // checked against the deployment
+        let missing = [&self.weights_path, &self.vocab_path]
+            .into_iter()
+            .find(|path| !path.exists());
+        match missing {
+            Some(path) => Err(TranscriptionError::MissingModelAsset { path: path.clone() }),
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn weights_path(&self) -> &Path {
+        &self.weights_path
+    }
+
+    pub(crate) fn precision(&self) -> Precision {
+        self.precision
+    }
 }
 
 /// Compiled Core ML asset paths for one deployment
@@ -94,14 +149,17 @@ impl CoreMlLayout {
         })
     }
 
+    #[cfg(any(test, target_os = "macos"))]
     pub(crate) fn encoder_dir(&self) -> &Path {
         &self.encoder_dir
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn decoder_dir(&self) -> &Path {
         &self.decoder_dir
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn joint_decision_dir(&self) -> &Path {
         &self.joint_decision_dir
     }
@@ -135,17 +193,38 @@ impl ModelBundle {
         }
     }
 
-    /// Wrap an already validated ONNX/CUDA bundle
+    /// Resolve native fp32 weights for the CUDA backend from a local directory
     ///
-    /// The bundle carried its own validation when it was opened, so
-    /// [`Self::validate_base`] has nothing left to check for this runtime.
-    #[cfg(feature = "onnx-cuda")]
-    pub fn from_onnx_cuda(bundle: OnnxCudaBundle) -> Self {
+    /// The directory holds `parakeet-v2/` or `parakeet-v3/` with `model.safetensors`
+    /// and the vocabulary, as `dev-tools/nemo/export_native.py` writes them. This
+    /// only resolves paths; [`Self::validate_base`] checks they exist, and loading
+    /// checks the weights against the deployment.
+    ///
+    /// The CUDA encoder takes inputs of any length, so a native bundle raises the
+    /// deployment's single-input limit to 40 s, enough for whole LibriSpeech
+    /// utterances. Longer audio goes through the long-form pipeline.
+    #[cfg(feature = "cuda")]
+    pub fn from_native_dir(models_dir: impl Into<PathBuf>, deployment: ParakeetDeployment) -> Self {
+        let root = models_dir.into();
+        let deployment = deployment.with_hard_sample_max(NATIVE_HARD_SAMPLE_MAX);
+        let runtime = RuntimeBundle::Native(NativeLayout::resolve(&root, &deployment));
         Self {
-            root: bundle.root().to_path_buf(),
-            deployment: bundle.deployment().clone(),
-            runtime: RuntimeBundle::OnnxCuda(Box::new(bundle)),
+            root,
+            deployment,
+            runtime,
         }
+    }
+
+    /// Set the precision of the CUDA encoder's matrix multiplies, TF32 by default
+    ///
+    /// [`Precision::Fp32`] gives up the tensor-core speedup for output that matches
+    /// NeMo's FP32 decode exactly. Core ML bundles ignore it
+    #[cfg(feature = "cuda")]
+    pub fn with_precision(mut self, precision: Precision) -> Self {
+        if let RuntimeBundle::Native(layout) = &mut self.runtime {
+            layout.precision = precision;
+        }
+        self
     }
 
     /// Deployment that owns this bundle's model semantics and limits
@@ -157,8 +236,8 @@ impl ModelBundle {
     pub fn validate_base(&self) -> Result<(), TranscriptionError> {
         match &self.runtime {
             RuntimeBundle::CoreMl(layout) => layout.validate_base(&self.root, &self.deployment),
-            #[cfg(feature = "onnx-cuda")]
-            RuntimeBundle::OnnxCuda(_) => Ok(()),
+            #[cfg(feature = "cuda")]
+            RuntimeBundle::Native(layout) => layout.validate_base(),
         }
     }
 
@@ -173,10 +252,8 @@ impl ModelBundle {
                 })
             }
             RuntimeBundle::CoreMl(_) => Ok(()),
-            #[cfg(feature = "onnx-cuda")]
-            RuntimeBundle::OnnxCuda(bundle) if !bundle.has_vad() => Err(self.missing_vad_error()),
-            #[cfg(feature = "onnx-cuda")]
-            RuntimeBundle::OnnxCuda(_) => Ok(()),
+            #[cfg(feature = "cuda")]
+            RuntimeBundle::Native(_) => Err(self.missing_vad_error()),
         }
     }
 
@@ -188,8 +265,8 @@ impl ModelBundle {
     pub(crate) fn vocab_path(&self) -> &Path {
         match &self.runtime {
             RuntimeBundle::CoreMl(layout) => &layout.vocab_path,
-            #[cfg(feature = "onnx-cuda")]
-            RuntimeBundle::OnnxCuda(_) => panic!("ONNX bundles retain parsed vocabulary bytes"),
+            #[cfg(feature = "cuda")]
+            RuntimeBundle::Native(layout) => &layout.vocab_path,
         }
     }
 
@@ -198,8 +275,10 @@ impl ModelBundle {
             RuntimeBundle::CoreMl(layout) => {
                 Vocabulary::load_for_deployment(&layout.vocab_path, &self.deployment)
             }
-            #[cfg(feature = "onnx-cuda")]
-            RuntimeBundle::OnnxCuda(bundle) => Ok(bundle.vocabulary().clone()),
+            #[cfg(feature = "cuda")]
+            RuntimeBundle::Native(layout) => {
+                Vocabulary::load_for_deployment(&layout.vocab_path, &self.deployment)
+            }
         }
     }
 
@@ -210,11 +289,10 @@ impl ModelBundle {
             RuntimeBundle::CoreMl(layout) => TranscriptionError::MissingModelAsset {
                 path: layout.vad_dir.clone(),
             },
-            #[cfg(feature = "onnx-cuda")]
-            RuntimeBundle::OnnxCuda(bundle) => crate::onnx::OnnxBundleError::MissingVad {
-                manifest: bundle.manifest_path(),
-            }
-            .into(),
+            #[cfg(feature = "cuda")]
+            RuntimeBundle::Native(_) => TranscriptionError::InvalidConfiguration(
+                "voice activity detection is not available for native bundles yet".to_owned(),
+            ),
         }
     }
 
@@ -261,13 +339,6 @@ impl ModelBundle {
             return Ok(Self::from_dir_with_deployment(models_dir, deployment));
         }
         ModelManager::new()?.ensure_with_deployment(deployment, true)
-    }
-}
-
-#[cfg(feature = "onnx-cuda")]
-impl From<OnnxCudaBundle> for ModelBundle {
-    fn from(bundle: OnnxCudaBundle) -> Self {
-        Self::from_onnx_cuda(bundle)
     }
 }
 
@@ -443,8 +514,8 @@ mod tests {
     fn coreml_layout(bundle: &ModelBundle) -> &CoreMlLayout {
         match bundle.runtime() {
             RuntimeBundle::CoreMl(layout) => layout,
-            #[cfg(feature = "onnx-cuda")]
-            RuntimeBundle::OnnxCuda(_) => panic!("directory bundles resolve Core ML layouts"),
+            #[cfg(feature = "cuda")]
+            RuntimeBundle::Native(_) => panic!("expected a Core ML bundle"),
         }
     }
 

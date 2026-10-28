@@ -1,11 +1,15 @@
+#[cfg(any(test, target_os = "macos"))]
 use ndarray::Array3;
 
 use crate::deployment::ParakeetDeployment;
 use crate::error::TranscriptionError;
-use crate::language::{LanguageSelection, filter_top_k_language, validate_candidate_logits};
+use crate::language::{
+    LanguageSelection, TopKCandidates, filter_top_k_language, validate_candidate_logits,
+};
 use crate::vocab::Vocabulary;
 
-/// Prediction-network outputs for one token step, shared by every runtime
+/// Prediction-network outputs for one token step, shared by every step runtime
+#[cfg(any(test, target_os = "macos"))]
 #[derive(Debug, Clone)]
 pub(crate) struct DecoderStepOutputs {
     /// Projected decoder output in `[1, hidden, 1]` order
@@ -50,13 +54,26 @@ pub struct JointOutputs {
     pub token_prob: f32,
     /// Duration bin from the joint head
     pub duration_bin: usize,
-    /// Optional top-K token ids
-    pub top_k_ids: Option<Vec<usize>>,
-    /// Optional top-K logits, parallel to `top_k_ids`
-    pub top_k_logits: Option<Vec<f32>>,
+    /// Optional nonempty top-K id/logit pairs
+    pub top_k: Option<TopKCandidates>,
 }
 
 impl JointOutputs {
+    /// Bind optional parallel top-K tensors into one typed candidate list
+    #[cfg(target_os = "macos")]
+    pub(crate) fn bind_top_k(
+        ids: Option<Vec<usize>>,
+        logits: Option<Vec<f32>>,
+    ) -> Result<Option<TopKCandidates>, TranscriptionError> {
+        match (ids, logits) {
+            (None, None) => Ok(None),
+            (Some(ids), Some(logits)) => TopKCandidates::from_parallel(ids, logits).map(Some),
+            _ => Err(TranscriptionError::InvalidModelOutput(
+                "joint top-k ids and logits must both be present".to_owned(),
+            )),
+        }
+    }
+
     /// Reject tensors that cannot come from a well-formed joint head
     ///
     /// Every token id, including top-K candidates, must be at most the RNNT
@@ -69,22 +86,12 @@ impl JointOutputs {
             )));
         }
 
-        if let (Some(top_k_ids), Some(top_k_logits)) =
-            (self.top_k_ids.as_deref(), self.top_k_logits.as_deref())
-            && top_k_ids.len() != top_k_logits.len()
+        if let Some(top_k) = &self.top_k
+            && let Some(bad) = top_k.pairs().iter().find(|pair| pair.token_id > blank_id)
         {
             return Err(TranscriptionError::InvalidModelOutput(format!(
-                "joint top-k id/logit length mismatch: ids={} logits={}",
-                top_k_ids.len(),
-                top_k_logits.len()
-            )));
-        }
-
-        if let Some(top_k_ids) = self.top_k_ids.as_deref()
-            && let Some(bad) = top_k_ids.iter().find(|id| **id > blank_id)
-        {
-            return Err(TranscriptionError::InvalidModelOutput(format!(
-                "joint top-k id {bad} exceeded blank id {blank_id}"
+                "joint top-k id {} exceeded blank id {blank_id}",
+                bad.token_id
             )));
         }
 
@@ -117,18 +124,20 @@ pub fn decode_joint_outputs(
     let mut token_id = outputs.token_id;
     let mut confidence = outputs.token_prob.clamp(0.0, 1.0);
 
-    if let Some(top_k_logits) = outputs.top_k_logits.as_deref() {
-        validate_candidate_logits(top_k_logits)?;
+    if let Some(top_k) = &outputs.top_k {
+        validate_candidate_logits(
+            &top_k
+                .pairs()
+                .iter()
+                .map(|pair| pair.logit)
+                .collect::<Vec<_>>(),
+        )?;
     }
 
     if token_id != blank_id
         && let Some(selected) = language.explicit()
-        && let (Some(top_k_ids), Some(top_k_logits)) = (
-            outputs.top_k_ids.as_deref(),
-            outputs.top_k_logits.as_deref(),
-        )
-        && let Some(filtered) =
-            filter_top_k_language(top_k_ids, top_k_logits, vocabulary, selected, blank_id)?
+        && let Some(top_k) = &outputs.top_k
+        && let Some(filtered) = filter_top_k_language(top_k, vocabulary, selected, blank_id)?
     {
         token_id = filtered.token_id;
         confidence = filtered.probability;
@@ -146,11 +155,15 @@ mod tests {
     use super::{JointOutputs, decode_joint_outputs};
     use crate::deployment::ParakeetDeployment;
     use crate::error::TranscriptionError;
-    use crate::language::{LanguageSelection, ParakeetLanguage};
+    use crate::language::{LanguageSelection, ParakeetLanguage, TopKCandidates};
     use crate::vocab::Vocabulary;
 
     fn vocab() -> Vocabulary {
         Vocabulary::from_tokens(&["<unk>", "cat", "кот", "<pl>", "<blk>"])
+    }
+
+    fn top_k(ids: &[usize], logits: &[f32]) -> TopKCandidates {
+        TopKCandidates::from_parallel(ids.to_vec(), logits.to_vec()).unwrap()
     }
 
     #[test]
@@ -159,8 +172,7 @@ mod tests {
             token_id: 1,
             token_prob: 0.9,
             duration_bin: 3,
-            top_k_ids: None,
-            top_k_logits: None,
+            top_k: None,
         };
         let decoded = decode_joint_outputs(
             &outputs,
@@ -179,8 +191,7 @@ mod tests {
             token_id: 2,
             token_prob: 0.95,
             duration_bin: 1,
-            top_k_ids: Some(vec![2, 1, 3]),
-            top_k_logits: Some(vec![4.0, 3.0, 0.5]),
+            top_k: Some(top_k(&[2, 1, 3], &[4.0, 3.0, 0.5])),
         };
         let decoded = decode_joint_outputs(
             &outputs,
@@ -199,8 +210,7 @@ mod tests {
             token_id: 2,
             token_prob: 0.95,
             duration_bin: 1,
-            top_k_ids: Some(vec![2, 1]),
-            top_k_logits: Some(vec![f32::NAN, 3.0]),
+            top_k: Some(top_k(&[2, 1], &[f32::NAN, 3.0])),
         };
         let error = decode_joint_outputs(
             &outputs,
@@ -219,8 +229,7 @@ mod tests {
             token_id: 2,
             token_prob: 0.95,
             duration_bin: 1,
-            top_k_ids: Some(vec![2, 1]),
-            top_k_logits: Some(vec![3.0, f32::INFINITY]),
+            top_k: Some(top_k(&[2, 1], &[3.0, f32::INFINITY])),
         };
         assert!(matches!(
             decode_joint_outputs(
@@ -240,8 +249,7 @@ mod tests {
             token_id: 5,
             token_prob: 0.9,
             duration_bin: 1,
-            top_k_ids: None,
-            top_k_logits: None,
+            top_k: None,
         };
         let error = decode_joint_outputs(
             &outputs,
@@ -260,8 +268,7 @@ mod tests {
             token_id: 2,
             token_prob: 0.9,
             duration_bin: 1,
-            top_k_ids: Some(vec![2, 9]),
-            top_k_logits: Some(vec![1.0, 0.5]),
+            top_k: Some(top_k(&[2, 9], &[1.0, 0.5])),
         };
         assert!(matches!(
             decode_joint_outputs(
@@ -277,26 +284,14 @@ mod tests {
 
     #[test]
     fn joint_decode_rejects_mismatched_top_k_lengths() {
-        let outputs = JointOutputs {
-            token_id: 2,
-            token_prob: 0.95,
-            duration_bin: 1,
-            top_k_ids: Some(vec![2, 1]),
-            top_k_logits: Some(vec![3.0]),
-        };
-
-        let error = decode_joint_outputs(
-            &outputs,
-            &ParakeetDeployment::v3(),
-            &vocab(),
-            LanguageSelection::Language(ParakeetLanguage::Polish),
-        )
-        .expect_err("parallel top-k tensors must have the same length");
+        let error = TopKCandidates::from_parallel(vec![2, 1], vec![3.0])
+            .expect_err("parallel top-k tensors must have the same length");
 
         assert!(matches!(
             error,
             TranscriptionError::InvalidModelOutput(message)
                 if message.contains("top-k id/logit length mismatch")
         ));
+        assert!(TopKCandidates::from_parallel(vec![], vec![]).is_err());
     }
 }

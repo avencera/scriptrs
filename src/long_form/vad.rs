@@ -1,11 +1,11 @@
+#[cfg(target_os = "macos")]
 use crate::constants::{VAD_CONTEXT_SAMPLES, VAD_STATE_SIZE, VAD_WINDOW_SAMPLES};
 #[cfg(target_os = "macos")]
 use crate::coreml::SileroVadCoreMlModel;
 use crate::error::TranscriptionError;
 use crate::long_form::planner::VadConfig;
 use crate::models::{ModelBundle, RuntimeBundle};
-#[cfg(feature = "onnx-cuda")]
-use crate::onnx::SileroOnnxModel;
+use crate::preprocessing::TranscriptionControl;
 
 /// Silero VAD owner: window chunking, context carry-over, tail padding, and
 /// per-recording recurrent state reset
@@ -26,8 +26,9 @@ impl SileroVad {
         &self,
         audio: &[f32],
         _config: &VadConfig,
+        control: &TranscriptionControl,
     ) -> Result<Vec<f32>, TranscriptionError> {
-        self.model.process(audio)
+        self.model.process(audio, control)
     }
 }
 
@@ -35,9 +36,9 @@ impl SileroVad {
 enum VadModelInner {
     #[cfg(target_os = "macos")]
     CoreMl(SileroVadCoreMlModel),
-    #[cfg(feature = "onnx-cuda")]
-    Onnx(SileroOnnxModel),
-    #[cfg(not(any(target_os = "macos", feature = "onnx-cuda")))]
+    // no VAD runtime outside Core ML; keeps the matches below compiling
+    #[cfg(not(target_os = "macos"))]
+    #[expect(dead_code, reason = "from_bundle never builds a VAD model off macOS")]
     Unsupported,
 }
 
@@ -60,26 +61,31 @@ impl VadModelInner {
                     Err(TranscriptionError::UnsupportedPlatform)
                 }
             }
-            #[cfg(feature = "onnx-cuda")]
-            RuntimeBundle::OnnxCuda(onnx) => Ok(onnx.vad_model().map(Self::Onnx)),
+            // no native VAD runtime yet; the pipeline treats this like a bundle
+            // without a VAD model
+            #[cfg(feature = "cuda")]
+            RuntimeBundle::Native(_) => Ok(None),
         }
     }
 
-    fn process(&self, audio: &[f32]) -> Result<Vec<f32>, TranscriptionError> {
+    fn process(
+        &self,
+        audio: &[f32],
+        control: &TranscriptionControl,
+    ) -> Result<Vec<f32>, TranscriptionError> {
         match self {
             #[cfg(target_os = "macos")]
-            Self::CoreMl(model) => process_windows(audio, |window, state| {
+            Self::CoreMl(model) => process_windows(audio, control, |window, state| {
                 let (hidden_state, cell_state) = state.split_at_mut(VAD_STATE_SIZE);
                 let outputs = model.run(window, hidden_state, cell_state)?;
                 copy_state_vec(&outputs.hidden_state, hidden_state)?;
                 copy_state_vec(&outputs.cell_state, cell_state)?;
                 Ok(outputs.probability)
             }),
-            #[cfg(feature = "onnx-cuda")]
-            Self::Onnx(model) => process_windows(audio, |window, state| model.run(window, state)),
-            #[cfg(not(any(target_os = "macos", feature = "onnx-cuda")))]
+            #[cfg(not(target_os = "macos"))]
             Self::Unsupported => {
                 let _ = audio;
+                let _ = control;
                 Err(TranscriptionError::UnsupportedPlatform)
             }
         }
@@ -91,9 +97,10 @@ impl VadModelInner {
 /// The recurrent state starts at zero for each recording. Each window is
 /// `VAD_CONTEXT_SAMPLES` from the previous chunk followed by one chunk of
 /// `VAD_WINDOW_SAMPLES`; a short final chunk is padded with its last sample.
-#[cfg(any(target_os = "macos", feature = "onnx-cuda"))]
+#[cfg(target_os = "macos")]
 fn process_windows(
     audio: &[f32],
+    control: &TranscriptionControl,
     mut classify: impl FnMut(&[f32], &mut [f32]) -> Result<f32, TranscriptionError>,
 ) -> Result<Vec<f32>, TranscriptionError> {
     if audio.is_empty() {
@@ -107,6 +114,7 @@ fn process_windows(
     let mut model_input = vec![0.0f32; VAD_WINDOW_SAMPLES + VAD_CONTEXT_SAMPLES];
 
     for chunk_start in (0..audio.len()).step_by(VAD_WINDOW_SAMPLES) {
+        control.check()?;
         let chunk_end = (chunk_start + VAD_WINDOW_SAMPLES).min(audio.len());
         let chunk_len = chunk_end - chunk_start;
         chunk[..chunk_len].copy_from_slice(&audio[chunk_start..chunk_end]);
@@ -138,10 +146,15 @@ fn copy_state_vec(values: &[f32], state: &mut [f32]) -> Result<(), Transcription
     Ok(())
 }
 
-#[cfg(all(test, any(target_os = "macos", feature = "onnx-cuda")))]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::process_windows;
     use crate::constants::{VAD_CONTEXT_SAMPLES, VAD_STATE_SIZE, VAD_WINDOW_SAMPLES};
+    use crate::preprocessing::TranscriptionControl;
+
+    fn control() -> TranscriptionControl {
+        TranscriptionControl::internal_unbounded()
+    }
 
     #[test]
     fn windows_carry_context_pad_the_tail_and_start_from_zero_state() {
@@ -150,7 +163,7 @@ mod tests {
         audio[VAD_WINDOW_SAMPLES + 9] = 0.25;
 
         let mut seen = Vec::new();
-        let probabilities = process_windows(&audio, |window, state| {
+        let probabilities = process_windows(&audio, &control(), |window, state| {
             seen.push((window.to_vec(), state.to_vec()));
             state[0] += 1.0;
             Ok(state[0] / 10.0)
@@ -179,7 +192,26 @@ mod tests {
 
     #[test]
     fn empty_audio_never_invokes_the_classifier() {
-        let probabilities = process_windows(&[], |_, _| panic!("classifier must not run")).unwrap();
+        let probabilities =
+            process_windows(&[], &control(), |_, _| panic!("classifier must not run")).unwrap();
         assert!(probabilities.is_empty());
+    }
+
+    #[test]
+    fn cancellation_is_checked_before_each_classifier_call() {
+        let audio = vec![0.0f32; VAD_WINDOW_SAMPLES * 3];
+        let control = control();
+        let mut calls = 0;
+        let error = process_windows(&audio, &control, |_, _| {
+            calls += 1;
+            if calls == 1 {
+                control.cancel();
+            }
+            Ok(0.1)
+        })
+        .expect_err("cancelled scan");
+
+        assert_eq!(calls, 1);
+        assert!(matches!(error, crate::error::TranscriptionError::Cancelled));
     }
 }

@@ -1,6 +1,7 @@
 use crate::constants::{
     DECODER_HIDDEN_SIZE, DECODER_LAYERS, DEFAULT_HARD_SAMPLE_MAX, DURATION_BINS,
-    ENCODER_HIDDEN_SIZE, MEL_HOP_SAMPLES, SAMPLE_RATE, SAMPLES_PER_ENCODER_FRAME,
+    ENCODER_HIDDEN_SIZE, LANGUAGE_FILTER_TOP_K, MEL_HOP_SAMPLES, SAMPLE_RATE,
+    SAMPLES_PER_ENCODER_FRAME,
 };
 use crate::error::TranscriptionError;
 use crate::language::{LanguageSelection, ParakeetLanguage, V3_LANGUAGES};
@@ -15,6 +16,12 @@ const V3_ENCODER: &str = "parakeet-v3/encoder.mlmodelc";
 const V3_DECODER: &str = "parakeet-v3/decoder.mlmodelc";
 const V3_JOINT: &str = "parakeet-v3/joint-decision.mlmodelc";
 const V3_VOCAB: &str = "parakeet-v3/parakeet_vocab.json";
+
+// native weights sit beside the vocabulary, written by dev-tools/nemo/export_native.py
+#[cfg(feature = "cuda")]
+const V2_NATIVE_WEIGHTS: &str = "parakeet-v2/model.safetensors";
+#[cfg(feature = "cuda")]
+const V3_NATIVE_WEIGHTS: &str = "parakeet-v3/model.safetensors";
 
 pub(crate) const V2_BLANK_ID: usize = 1_024;
 pub(crate) const V2_VOCAB_TOKEN_COUNT: usize = V2_BLANK_ID + 1;
@@ -304,6 +311,7 @@ pub struct ParakeetDeployment {
     blank_id: usize,
     hard_sample_max: usize,
     duration_bins: &'static [usize],
+    language_filter_top_k: Option<usize>,
     model_io: ModelIo,
 }
 
@@ -325,6 +333,7 @@ impl ParakeetDeployment {
             blank_id: V2_BLANK_ID,
             hard_sample_max: DEFAULT_HARD_SAMPLE_MAX,
             duration_bins: &DURATION_BINS,
+            language_filter_top_k: None,
             model_io: ModelIo::v2(),
         }
     }
@@ -346,6 +355,7 @@ impl ParakeetDeployment {
             blank_id: V3_BLANK_ID,
             hard_sample_max: DEFAULT_HARD_SAMPLE_MAX,
             duration_bins: &DURATION_BINS,
+            language_filter_top_k: Some(LANGUAGE_FILTER_TOP_K),
             model_io: ModelIo::v3(),
         }
     }
@@ -437,9 +447,23 @@ impl ParakeetDeployment {
         self.hard_sample_max
     }
 
+    /// The same deployment with a runtime's longest single model input
+    #[cfg(feature = "cuda")]
+    pub(crate) const fn with_hard_sample_max(mut self, samples: usize) -> Self {
+        self.hard_sample_max = samples;
+        self
+    }
+
     /// Duration bin mapping owned by this deployment
     pub const fn duration_bins(&self) -> &'static [usize] {
         self.duration_bins
+    }
+
+    /// Joint top-K width that explicit-language filtering searches
+    ///
+    /// `None` when the deployment has no language filter (v2 is English-only).
+    pub const fn language_filter_top_k(&self) -> Option<usize> {
+        self.language_filter_top_k
     }
 
     /// Core ML tensor names for this deployment
@@ -480,6 +504,15 @@ impl ParakeetDeployment {
                 bin,
                 len: self.duration_bins.len(),
             })
+    }
+
+    /// Native fp32 weight file, relative to the bundle root
+    #[cfg(feature = "cuda")]
+    pub(crate) fn native_weights_path(&self) -> &'static str {
+        match self.version {
+            ParakeetVersion::V2 => V2_NATIVE_WEIGHTS,
+            ParakeetVersion::V3 => V3_NATIVE_WEIGHTS,
+        }
     }
 
     pub(crate) fn sibling_vocab_path(&self) -> &'static str {

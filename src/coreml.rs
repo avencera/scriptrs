@@ -29,6 +29,8 @@ use objc2_core_ml::{MLComputeUnits, MLFeatureProvider, MLModel};
 #[cfg(target_os = "macos")]
 use objc2_foundation::{NSArray, NSMutableDictionary, NSNumber, NSString};
 
+#[cfg(target_os = "macos")]
+use crate::backend::StepRuntime;
 #[cfg(all(target_os = "macos", feature = "vad"))]
 use crate::constants::{VAD_CONTEXT_SAMPLES, VAD_STATE_SIZE, VAD_WINDOW_SAMPLES};
 #[cfg(target_os = "macos")]
@@ -38,7 +40,7 @@ use crate::deployment::{DecoderDimensions, ModelIo};
 #[cfg(target_os = "macos")]
 use crate::error::TranscriptionError;
 #[cfg(target_os = "macos")]
-use crate::model_io::JointOutputs;
+use crate::model_io::{DecoderStepOutputs, JointOutputs};
 
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone)]
@@ -203,6 +205,54 @@ impl ParakeetSplitCoreMlModel {
     }
 }
 
+#[cfg(target_os = "macos")]
+impl StepRuntime for ParakeetSplitCoreMlModel {
+    fn run_encoder(
+        &self,
+        input: &[f32],
+        feature_size: usize,
+        target_frames: usize,
+        feature_frames: usize,
+    ) -> Result<(Array3<f32>, usize), TranscriptionError> {
+        ParakeetSplitCoreMlModel::run_encoder(
+            self,
+            input,
+            feature_size,
+            target_frames,
+            &[feature_frames as i32],
+        )
+    }
+
+    fn run_decoder(
+        &self,
+        targets: &Array2<i32>,
+        target_length: &Array1<i32>,
+        hidden_state: &Array3<f32>,
+        cell_state: &Array3<f32>,
+    ) -> Result<DecoderStepOutputs, TranscriptionError> {
+        let output = ParakeetSplitCoreMlModel::run_decoder(
+            self,
+            targets,
+            target_length,
+            hidden_state,
+            cell_state,
+        )?;
+        Ok(DecoderStepOutputs {
+            decoder_step: output.decoder_step,
+            hidden_state: output.hidden_state,
+            cell_state: output.cell_state,
+        })
+    }
+
+    fn run_joint(
+        &self,
+        encoder_step: &Array3<f32>,
+        decoder_step: &Array3<f32>,
+    ) -> Result<JointOutputs, TranscriptionError> {
+        ParakeetSplitCoreMlModel::run_joint(self, encoder_step, decoder_step)
+    }
+}
+
 #[cfg(all(target_os = "macos", feature = "vad"))]
 impl SileroVadCoreMlModel {
     pub(crate) fn new(path: &Path) -> Result<Self, TranscriptionError> {
@@ -243,9 +293,12 @@ impl SileroVadCoreMlModel {
             ],
             |output| {
                 Ok(SileroVadOutput {
-                    probability: scalar_f32(output, &self.probability_output)?,
-                    hidden_state: vector_f32(output, &self.hidden_output)?,
-                    cell_state: vector_f32(output, &self.cell_output)?,
+                    probability: vad_probability(scalar_f32(output, &self.probability_output)?)?,
+                    hidden_state: vad_state_vector(
+                        vector_f32(output, &self.hidden_output)?,
+                        "h_out",
+                    )?,
+                    cell_state: vad_state_vector(vector_f32(output, &self.cell_output)?, "c_out")?,
                 })
             },
         )
@@ -398,8 +451,7 @@ impl JointDecisionCoreMlModel {
                     token_id: scalar_usize(output, &self.token_id_output)?,
                     token_prob: scalar_f32(output, &self.token_prob_output)?,
                     duration_bin: scalar_usize(output, &self.duration_output)?,
-                    top_k_ids,
-                    top_k_logits,
+                    top_k: JointOutputs::bind_top_k(top_k_ids, top_k_logits)?,
                 })
             },
         )
@@ -688,6 +740,41 @@ fn vector_usize(
         .into_iter()
         .map(|value| f32_to_usize(value, key.name))
         .collect()
+}
+
+#[cfg(all(target_os = "macos", feature = "vad"))]
+fn vad_probability(value: f32) -> Result<f32, TranscriptionError> {
+    if !value.is_finite() {
+        return Err(TranscriptionError::InvalidModelOutput(format!(
+            "VAD probability was not finite: {value}"
+        )));
+    }
+    if !(0.0..=1.0).contains(&value) {
+        return Err(TranscriptionError::InvalidModelOutput(format!(
+            "VAD probability {value} is outside [0, 1]"
+        )));
+    }
+
+    Ok(value)
+}
+
+#[cfg(all(target_os = "macos", feature = "vad"))]
+fn vad_state_vector(values: Vec<f32>, name: &str) -> Result<Vec<f32>, TranscriptionError> {
+    if values.len() != VAD_STATE_SIZE {
+        return Err(TranscriptionError::InvalidModelOutput(format!(
+            "VAD state `{name}` length {} is not {VAD_STATE_SIZE}",
+            values.len()
+        )));
+    }
+    for (index, value) in values.iter().copied().enumerate() {
+        if !value.is_finite() {
+            return Err(TranscriptionError::InvalidModelOutput(format!(
+                "VAD state `{name}`[{index}] was not finite: {value}"
+            )));
+        }
+    }
+
+    Ok(values)
 }
 
 #[cfg(target_os = "macos")]

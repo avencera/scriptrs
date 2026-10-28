@@ -1,0 +1,32 @@
+# NeMo parity oracle for the native backends: weight export and reference tensors
+#
+# Pinned to the stack the 2026-10-23 Parakeet profile measured (NeMo 3.0.0,
+# torch 2.14.1+cu130) so reference dumps stay comparable with /shared/datasets/parakeet-ref
+[project]
+name = "scriptrs-nemo-tools"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "nemo-toolkit[asr]==3.0.0",
+    "torch==2.14.1",
+    "torchaudio",
+    "safetensors",
+    "soundfile",
+    "numpy",
+    "jiwer",
+    "whisper-normalizer",
+    "silero-vad==5.1.2",
+    "huggingface-hub",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchaudio = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

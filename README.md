@@ -1,15 +1,18 @@
 # scriptrs
 
-**Work in progress**
+Fast [NVIDIA Parakeet TDT](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) speech-to-text in Rust.
 
-`scriptrs` is early and intentionally narrow right now:
+- Parakeet TDT 0.6B v2 (English) and v3 (25 European languages)
+- Core ML on macOS
+- Native CUDA on Linux, with no ONNX Runtime or PyTorch (experimental, `cuda` feature)
+- Long-form transcription of hour-long recordings, with optional VAD
+- Token-level timestamps and confidences
 
-- Apple CoreML on macOS by default
-- ONNX Runtime with the CUDA execution provider behind the `onnx-cuda` feature, from a local validated bundle
-- Parakeet TDT v2 and v3
-- no other backends
+On an RTX 5090, the CUDA backend transcribes LibriSpeech test-clean at 948x real
+time, twice as fast as NVIDIA NeMo and 3.7x as fast as parakeet-rs, at the same
+word error rate. See [CUDA](#cuda-experimental) for the numbers.
 
-Rust transcription with native CoreML Parakeet v2 and v3 inference.
+`scriptrs` is early: the public API is still moving.
 
 The base crate exposes a single-chunk `TranscriptionPipeline`. Fast long-audio chunking lives behind the `long-form` feature via `LongFormTranscriptionPipeline`. VAD-backed speech region planning lives behind the `vad` feature, which also enables `long-form`.
 
@@ -19,6 +22,7 @@ The base crate exposes a single-chunk `TranscriptionPipeline`. Fast long-audio c
 - Optional fast long-form pipeline with overlap chunking
 - Optional VAD-backed long-form region planning
 - Native CoreML inference on macOS
+- Experimental CUDA inference on Linux (`cuda` feature)
 - Hugging Face download support with optional local model loading
 
 ## What it does not do yet
@@ -27,44 +31,6 @@ The base crate exposes a single-chunk `TranscriptionPipeline`. Fast long-audio c
 - Other ASR models
 - Streaming transcription
 - Stable public guarantees around model layout or long-form behavior
-
-## ONNX Runtime on CUDA
-
-The `onnx-cuda` feature adds a second runtime behind the same model boundary.
-It loads a local bundle described by `manifest.json`, verifies every file
-digest, checks each graph against the split-graph tensor contract, and runs
-the graphs with the ONNX Runtime CUDA execution provider. The frontend,
-greedy TDT decoder, language filtering, long-form planner, and VAD chunking
-are shared with the CoreML path.
-
-```toml
-[dependencies]
-scriptrs = { version = "0.2.0", default-features = false, features = ["onnx-cuda", "vad"] }
-```
-
-```rust
-use scriptrs::{CudaDevice, ModelBundle, OnnxCudaBundle, ParakeetDeployment, TranscriptionPipeline};
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let bundle = OnnxCudaBundle::open("bundles/parakeet-v3", ParakeetDeployment::v3(), CudaDevice::new(0))?;
-    let pipeline = TranscriptionPipeline::from_bundle(ModelBundle::from_onnx_cuda(bundle))?;
-    let result = pipeline.run(&load_mono_16khz_audio())?;
-
-    println!("{}", result.text);
-    Ok(())
-}
-
-fn load_mono_16khz_audio() -> Vec<f32> {
-    Vec::new()
-}
-```
-
-Opening a bundle never downloads anything and never falls back to the CPU
-provider; a host without a usable CUDA runtime fails at `open`. The manifest
-schema and the exact graph tensor contract are in
-[`docs/onnx-cuda-bundle.md`](docs/onnx-cuda-bundle.md). The feature pins
-`ort = "=2.0.0-rc.12"` (ONNX Runtime 1.24) so it can share one runtime with
-SpeakRS, and it needs Rust 1.88 because of that crate.
 
 ## Install
 
@@ -126,6 +92,62 @@ With `vad`, add:
 models/
   vad/
     silero-vad.mlmodelc/
+```
+
+
+## CUDA (experimental)
+
+The `cuda` feature runs Parakeet on an NVIDIA GPU with no ONNX Runtime or
+PyTorch. It is built from this repository only for now. It supports the v3
+language filter; VAD is not supported yet.
+
+It loads native weights rather than Core ML models:
+
+```text
+models/
+  parakeet-v2/
+    model.safetensors
+    vocab.txt
+  parakeet-v3/
+    model.safetensors
+    parakeet_vocab.json
+```
+
+```rust,ignore
+use scriptrs::{ModelBundle, ParakeetDeployment, TranscriptionPipeline};
+
+let bundle = ModelBundle::from_native_dir("models", ParakeetDeployment::v3());
+let pipeline = TranscriptionPipeline::from_bundle(bundle)?;
+let result = pipeline.run(&audio)?;
+```
+
+A native bundle accepts single inputs up to 40 s; longer audio goes through
+`LongFormTranscriptionPipeline`. For native bundles, long-form defaults to 30 s
+windows with 8 s overlap, run 16 at a time through one model. Longer windows or
+shorter overlaps lose accuracy on long recordings.
+
+On an RTX 5090, Parakeet v3 on LibriSpeech test-clean (5.4 h), one utterance at a
+time:
+
+| | Speed (x real time) | WER |
+|---|---|---|
+| scriptrs | 948x | 1.93 % |
+| NVIDIA NeMo | 477x | 1.93 % |
+| parakeet-rs 0.4.3 (ONNX Runtime) | 253x | 1.92 % |
+
+On all 44 Earnings-21 calls (39 h), long-form with the defaults runs at 2500x with
+8.24 % pooled WER; NeMo transcribing each whole call with local attention scores
+9.58 %.
+
+The encoder's matrix multiplies use TF32 tensor cores on Ampere and newer GPUs.
+Older GPUs run them in FP32. For output that matches NeMo's FP32 decode token for
+token, set FP32 on any GPU:
+
+```rust,ignore
+use scriptrs::{ModelBundle, ParakeetDeployment, Precision};
+
+let bundle = ModelBundle::from_native_dir("models", ParakeetDeployment::v3())
+    .with_precision(Precision::Fp32);
 ```
 
 ## Usage
@@ -195,7 +217,7 @@ fn load_mono_16khz_audio() -> Vec<f32> {
 }
 ```
 
-`LongFormConfig` defaults to the fast overlap-chunking path with `4` workers. You can tune the worker count when you want less or more parallelism:
+`LongFormConfig` defaults to the fast overlap-chunking path with `4` workers, each loading its own model. On native CUDA bundles, windows instead run `batch_size` at a time (16 by default) through the pipeline's one model, and the workers prepare windows on the CPU ahead of it; Core ML bundles ignore `batch_size`. `LongFormConfig::for_bundle(&bundle)` gives a bundle's defaults to start from when you change one setting. You can tune the worker count when you want less or more parallelism:
 
 ```rust
 use scriptrs::{LongFormConfig, LongFormTranscriptionPipeline};

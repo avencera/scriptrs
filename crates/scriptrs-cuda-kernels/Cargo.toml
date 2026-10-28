@@ -1,0 +1,23 @@
+[package]
+name = "scriptrs-cuda-kernels"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "cuda-oxide device kernels for the scriptrs CUDA backend, compiled offline to PTX"
+license = "Apache-2.0"
+
+# standalone: cuda-oxide needs a pinned nightly and Linux with CUDA 13, so this crate
+# stays out of the scriptrs build and is only compiled by `just cuda-kernels`
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+# one feature per area: each area is compiled on its own into one PTX file
+[features]
+decode = []
+encoder = []
+
+[dependencies]
+# keep the rev in sync with speakrs and cudakit until cudakit-build owns the pin
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "918bbde123671153b29a89542f1781f1c7494c14" }
