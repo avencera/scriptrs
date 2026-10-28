@@ -5,13 +5,14 @@ edition = "2024"
 rust-version = "1.85"
 exclude = ["fixtures/", "dev-tools/", "crates/"]
 authors = ["Praveen Perera"]
-description = "Rust transcription with native CoreML Parakeet v2 and v3 inference"
+description = "Fast NVIDIA Parakeet TDT v2 and v3 speech-to-text in Rust, on Core ML (macOS) and native CUDA (Linux)"
 license = "Apache-2.0"
 repository = "https://github.com/avencera/scriptrs"
 homepage = "https://github.com/avencera/scriptrs"
 documentation = "https://docs.rs/scriptrs"
 readme = "README.md"
-keywords = ["asr", "transcription", "speech", "coreml", "macos"]
+keywords = ["parakeet", "speech-to-text", "asr", "cuda", "coreml"]
+categories = ["multimedia::audio"]
 
 [features]
 default = ["online"]

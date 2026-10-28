@@ -1,14 +1,19 @@
 # scriptrs
 
-**Work in progress**
+Fast [NVIDIA Parakeet TDT](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) speech-to-text in Rust.
 
-`scriptrs` is early and intentionally narrow right now:
+- Parakeet TDT 0.6B v2 (English) and v3 (25 European languages)
+- Core ML on macOS
+- Native CUDA on Linux, with no ONNX Runtime or PyTorch (experimental, `cuda` feature)
+- Long-form transcription of hour-long recordings, with optional VAD
+- Token-level timestamps and confidences
 
-- Apple CoreML on macOS
-- NVIDIA CUDA on Linux, experimental, behind the `cuda` feature
-- Parakeet TDT v2 and v3
+On an RTX 5090, the CUDA backend transcribes LibriSpeech test-clean at 725x real
+time in FP32 and 948x in TF32, against 477x for NVIDIA NeMo and 253x for
+parakeet-rs, all at the same word error rate. See [CUDA](#cuda-experimental) for
+the numbers.
 
-Rust transcription with native CoreML Parakeet v2 and v3 inference.
+`scriptrs` is early: the public API is still moving.
 
 The base crate exposes a single-chunk `TranscriptionPipeline`. Fast long-audio chunking lives behind the `long-form` feature via `LongFormTranscriptionPipeline`. VAD-backed speech region planning lives behind the `vad` feature, which also enables `long-form`.
 
@@ -18,7 +23,7 @@ The base crate exposes a single-chunk `TranscriptionPipeline`. Fast long-audio c
 - Optional fast long-form pipeline with overlap chunking
 - Optional VAD-backed long-form region planning
 - Native CoreML inference on macOS
-- Experimental FP32 CUDA inference on Linux (`cuda` feature)
+- Experimental CUDA inference on Linux (`cuda` feature), in FP32 or TF32
 - Hugging Face download support with optional local model loading
 
 ## What it does not do yet
@@ -125,12 +130,6 @@ A native bundle accepts single inputs up to 40 s; longer audio goes through
 windows with 8 s overlap, run 16 at a time through one model. Longer windows or
 shorter overlaps lose accuracy on long recordings.
 
-On an RTX 5090, v3 runs LibriSpeech test-clean one utterance at a time at 729x
-real time with 1.93 % WER, the same WER as NeMo's FP32 greedy decode at 410x.
-On all 44 Earnings-21 calls (39 h), long-form with the defaults runs at 1660x
-with 8.25 % pooled WER; NeMo transcribing each whole call with local attention
-scores 9.58 %.
-
 FP32 is the default. On Ampere and newer GPUs, the encoder's matrix multiplies
 can run on TF32 tensor cores instead; decoding stays FP32:
 
@@ -141,9 +140,22 @@ let bundle = ModelBundle::from_native_dir("models", ParakeetDeployment::v3())
     .with_precision(Precision::Tf32);
 ```
 
-On the same RTX 5090, TF32 runs LibriSpeech test-clean at 954x with the same
-1.93 % WER, and the 44 Earnings-21 calls at 2500x with 8.24 % WER. A few
-transcripts differ from FP32 by a word.
+TF32 changes the transcript of about one utterance in 500, by a word, with no
+change in WER.
+
+On an RTX 5090, Parakeet v3 on LibriSpeech test-clean (5.4 h), one utterance at a
+time:
+
+| | Speed (x real time) | WER |
+|---|---|---|
+| scriptrs CUDA, TF32 | 948x | 1.93 % |
+| scriptrs CUDA, FP32 | 725x | 1.93 % |
+| NVIDIA NeMo, FP32 greedy decode | 477x | 1.93 % |
+| parakeet-rs 0.4.3, ONNX Runtime CUDA | 253x | 1.92 % |
+
+On all 44 Earnings-21 calls (39 h), long-form with the defaults runs at 1660x in
+FP32 and 2500x in TF32, with 8.25 % and 8.24 % pooled WER; NeMo transcribing each
+whole call with local attention scores 9.58 %.
 
 ## Usage
 
