@@ -48,12 +48,12 @@ pub(crate) enum RuntimeBundle {
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Precision {
-    /// Full FP32 multiplies, the precision NeMo's reference decode uses
+    /// TF32 tensor-core multiplies (10-bit mantissa) on Ampere and newer GPUs; cuBLAS
+    /// runs them as FP32 on older GPUs
     #[default]
-    Fp32,
-    /// TF32 tensor-core multiplies (10-bit mantissa) on Ampere and newer GPUs,
-    /// faster at a small cost in numerical agreement with FP32
     Tf32,
+    /// Full FP32 multiplies, matching NeMo's FP32 decode token for token
+    Fp32,
 }
 
 /// Native fp32 weights and vocabulary for one deployment, as
@@ -72,7 +72,7 @@ impl NativeLayout {
         Self {
             weights_path: root.join(deployment.native_weights_path()),
             vocab_path: root.join(deployment.layout().vocab()),
-            precision: Precision::Fp32,
+            precision: Precision::default(),
         }
     }
 
@@ -212,10 +212,10 @@ impl ModelBundle {
         }
     }
 
-    /// Set the precision of the CUDA encoder's matrix multiplies, FP32 by default
+    /// Set the precision of the CUDA encoder's matrix multiplies, TF32 by default
     ///
-    /// [`Precision::Tf32`] trades a little agreement with NeMo's FP32 decode for
-    /// speed on Ampere and newer GPUs. Core ML bundles ignore it
+    /// [`Precision::Fp32`] gives up the tensor-core speedup for output that matches
+    /// NeMo's FP32 decode exactly. Core ML bundles ignore it
     #[cfg(feature = "cuda")]
     pub fn with_precision(mut self, precision: Precision) -> Self {
         if let RuntimeBundle::Native(layout) = &mut self.runtime {

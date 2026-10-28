@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
-use crate::deployment::ParakeetVersion;
+use crate::deployment::{ParakeetDeployment, ParakeetVersion};
+use crate::models::{ModelBundle, Precision};
 use crate::native::weights::WeightFile;
 
 /// Directory of the exported native weights; set `SCRIPTRS_NATIVE_MODELS` to use a
@@ -9,6 +10,12 @@ pub(crate) fn native_root() -> PathBuf {
     std::env::var_os("SCRIPTRS_NATIVE_MODELS")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/shared/models/scriptrs-native"))
+}
+
+/// Native bundle from [`native_root`] in FP32, the precision the NeMo references
+/// were decoded in; the TF32 default only stays near them
+pub(crate) fn nemo_parity_bundle(deployment: ParakeetDeployment) -> ModelBundle {
+    ModelBundle::from_native_dir(native_root(), deployment).with_precision(Precision::Fp32)
 }
 
 /// Exported native weights for `version`, from [`native_root`]

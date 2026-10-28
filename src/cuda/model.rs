@@ -308,7 +308,7 @@ mod tests {
     use super::CudaModel;
     use crate::backend::{DecodePolicy, EncoderChunk};
     use crate::config::TranscriptionConfig;
-    use crate::cuda::test_support::native_root;
+    use crate::cuda::test_support::{native_root, nemo_parity_bundle};
     use crate::decode::RawTranscription;
     use crate::deployment::{ParakeetDeployment, ParakeetVersion};
     use crate::frontend::ParakeetFeatureExtractor;
@@ -417,7 +417,7 @@ mod tests {
     fn gpu_batched_long_form_matches_serial_windows() {
         use crate::long_form::{LongFormConfig, LongFormTranscriptionPipeline};
 
-        let bundle = ModelBundle::from_native_dir(native_root(), ParakeetDeployment::v3());
+        let bundle = nemo_parity_bundle(ParakeetDeployment::v3());
         let batched = LongFormConfig::for_bundle(&bundle);
         assert!(batched.batch_size >= 6, "the windows must share one batch");
         let serial = LongFormConfig {
@@ -450,14 +450,13 @@ mod tests {
     #[test]
     #[ignore = "needs a CUDA GPU, the native weights and the NeMo references; `just gpu-parity` runs it on gpu0"]
     fn gpu_pipeline_transcribes_like_nemo() {
-        let root = native_root();
         for version in [ParakeetVersion::V2, ParakeetVersion::V3] {
             let deployment = match version {
                 ParakeetVersion::V2 => ParakeetDeployment::v2(),
                 ParakeetVersion::V3 => ParakeetDeployment::v3(),
             };
             let pipeline =
-                TranscriptionPipeline::from_bundle(ModelBundle::from_native_dir(&root, deployment))
+                TranscriptionPipeline::from_bundle(nemo_parity_bundle(deployment))
                     .expect("pipeline");
 
             for set in ["b1", "b8"] {
@@ -488,7 +487,7 @@ mod tests {
     #[test]
     #[ignore = "needs a CUDA GPU, the native weights and the NeMo references; `just gpu-parity` runs it on gpu0"]
     fn gpu_english_filter_keeps_the_automatic_tokens() {
-        let bundle = ModelBundle::from_native_dir(native_root(), ParakeetDeployment::v3());
+        let bundle = nemo_parity_bundle(ParakeetDeployment::v3());
         let deployment = bundle.deployment().clone();
         let vocab = bundle.vocabulary().expect("vocabulary");
         let pipeline = TranscriptionPipeline::from_bundle(bundle).expect("pipeline");

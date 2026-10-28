@@ -14,7 +14,7 @@
 //! at batch 1 the windows run one at a time on one worker, and above it the
 //! default workers prepare windows ahead of the model. `--language <code>` decodes
 //! with that language's filter instead of automatic language selection, and
-//! `--tf32` runs the encoder GEMMs in TF32
+//! `--fp32` runs the encoder GEMMs in FP32 instead of TF32
 //!
 //! ```sh
 //! cargo run --release --features cuda,long-form --example cuda_bench -- \
@@ -240,7 +240,7 @@ fn parse_args() -> Result<Args> {
     let mut overlap_s = None;
     let mut batch = None;
     let mut language = LanguageSelection::Auto;
-    let mut precision = Precision::Fp32;
+    let mut precision = Precision::default();
     let mut args = env::args().skip(1);
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| eyre!("{flag} needs a value"));
@@ -266,7 +266,7 @@ fn parse_args() -> Result<Args> {
                     .ok_or_else(|| eyre!("unknown language {code}"))?;
                 language = LanguageSelection::Language(parsed);
             }
-            "--tf32" => precision = Precision::Tf32,
+            "--fp32" => precision = Precision::Fp32,
             other => return Err(eyre!("unknown argument {other}")),
         }
     }

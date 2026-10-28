@@ -1199,9 +1199,9 @@ mod tests {
         parallel_worker_count, prepare_window_samples,
     };
     #[cfg(feature = "cuda")]
-    use super::{LongFormTranscriptionPipeline, ModelBundle};
+    use super::LongFormTranscriptionPipeline;
     #[cfg(feature = "cuda")]
-    use crate::cuda::test_support::native_root;
+    use crate::cuda::test_support::nemo_parity_bundle;
     use crate::deployment::ParakeetDeployment;
     #[cfg(feature = "cuda")]
     use crate::error::TranscriptionError;
@@ -1481,7 +1481,7 @@ mod tests {
     /// native 8 s overlap is capped at half a window, which `validate_for` accepts
     #[cfg(feature = "cuda")]
     fn native_pipeline() -> (LongFormTranscriptionPipeline, LongFormConfig) {
-        let bundle = ModelBundle::from_native_dir(native_root(), ParakeetDeployment::v3());
+        let bundle = nemo_parity_bundle(ParakeetDeployment::v3());
         let mut config = LongFormConfig {
             mode: LongFormMode::Fast,
             ..LongFormConfig::for_bundle(&bundle)
