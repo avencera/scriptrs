@@ -472,6 +472,10 @@ impl LongFormTranscriptionPipeline {
                     let sender = sender.clone();
                     let (next_task, lookahead, tasks) = (&next_task, &lookahead, &tasks);
                     scope.spawn(move || {
+                        // a panicking worker closes the gate, so the others stop and
+                        // drop their senders, the model side sees the channel close,
+                        // and the scope's join raises the panic instead of hanging
+                        let _stop_on_panic = StopOnPanic(lookahead);
                         let preparer = TranscriptionPipeline::chunk_preparer(&config.transcription);
                         let preparation = PreparationContext {
                             audio,
@@ -957,6 +961,17 @@ impl Lookahead {
     fn stop(&self) {
         self.state.lock().unwrap_or_else(PoisonError::into_inner).1 = true;
         self.changed.notify_all();
+    }
+}
+
+/// Closes a [`Lookahead`] when the thread holding it unwinds
+struct StopOnPanic<'a>(&'a Lookahead);
+
+impl Drop for StopOnPanic<'_> {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            self.0.stop();
+        }
     }
 }
 
