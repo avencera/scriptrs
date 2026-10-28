@@ -5,8 +5,8 @@
 `scriptrs` is early and intentionally narrow right now:
 
 - Apple CoreML on macOS
+- NVIDIA CUDA on Linux, experimental, behind the `cuda` feature
 - Parakeet TDT v2 and v3
-- no other backends
 
 Rust transcription with native CoreML Parakeet v2 and v3 inference.
 
@@ -18,6 +18,7 @@ The base crate exposes a single-chunk `TranscriptionPipeline`. Fast long-audio c
 - Optional fast long-form pipeline with overlap chunking
 - Optional VAD-backed long-form region planning
 - Native CoreML inference on macOS
+- Experimental FP32 CUDA inference on Linux (`cuda` feature)
 - Hugging Face download support with optional local model loading
 
 ## What it does not do yet
@@ -88,6 +89,39 @@ models/
   vad/
     silero-vad.mlmodelc/
 ```
+
+
+## CUDA (experimental)
+
+The `cuda` feature runs Parakeet on an NVIDIA GPU, in FP32, with no ONNX Runtime
+or PyTorch. On NeMo reference inputs (LibriSpeech utterances and a two-minute
+Earnings-21 excerpt) its tokens and timestamps match NVIDIA NeMo's greedy decode
+exactly. It is built from this
+repository only for now, and does not yet support the v3 language filter, top-K
+candidates or VAD.
+
+It loads native weights rather than Core ML models:
+
+```text
+models/
+  parakeet-v2/
+    model.safetensors
+    vocab.txt
+  parakeet-v3/
+    model.safetensors
+    parakeet_vocab.json
+```
+
+```rust,ignore
+use scriptrs::{ModelBundle, ParakeetDeployment, TranscriptionPipeline};
+
+let bundle = ModelBundle::from_native_dir("models", ParakeetDeployment::v3());
+let pipeline = TranscriptionPipeline::from_bundle(bundle)?;
+let result = pipeline.run(&audio)?;
+```
+
+A native bundle accepts single inputs up to 40 s; longer audio goes through
+`LongFormTranscriptionPipeline`.
 
 ## Usage
 

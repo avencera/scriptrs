@@ -59,6 +59,10 @@ impl VadModelInner {
                     Err(TranscriptionError::UnsupportedPlatform)
                 }
             }
+            // no native VAD runtime yet; the pipeline treats this like a bundle
+            // without a VAD model
+            #[cfg(feature = "cuda")]
+            RuntimeBundle::Native(_) => Ok(None),
         }
     }
 

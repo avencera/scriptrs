@@ -72,6 +72,8 @@ enum ParakeetModelInner {
         model: Box<crate::coreml::ParakeetSplitCoreMlModel>,
         host: HostLoop,
     },
+    #[cfg(feature = "cuda")]
+    Cuda(crate::cuda::model::CudaModel),
     #[cfg(not(target_os = "macos"))]
     Unsupported,
 }
@@ -105,6 +107,11 @@ impl ParakeetModelInner {
                     Err(TranscriptionError::UnsupportedPlatform)
                 }
             }
+            #[cfg(feature = "cuda")]
+            RuntimeBundle::Native(layout) => Ok(Self::Cuda(crate::cuda::model::CudaModel::load(
+                layout.weights_path(),
+                bundle.deployment(),
+            )?)),
         }
     }
 
@@ -118,6 +125,8 @@ impl ParakeetModelInner {
             Self::SplitCoreMl { model, host } => {
                 host.transcribe_chunks(model.as_ref(), chunks, policy)
             }
+            #[cfg(feature = "cuda")]
+            Self::Cuda(model) => model.transcribe_chunks(chunks, policy),
             #[cfg(not(target_os = "macos"))]
             Self::Unsupported => {
                 let _ = (chunks, policy);

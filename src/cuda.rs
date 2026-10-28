@@ -6,6 +6,7 @@
 pub(crate) mod decoder;
 pub(crate) mod encoder;
 pub(crate) mod kernels;
+pub(crate) mod model;
 #[cfg(test)]
 pub(crate) mod test_support;
 

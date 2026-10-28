@@ -5,7 +5,8 @@
 //!
 //! `scriptrs` is currently a narrow transcription crate:
 //!
-//! - CoreML on macOS
+//! - CoreML on macOS, and experimental CUDA on Linux behind the `cuda` feature
+//!   (see `ModelBundle::from_native_dir`)
 //! - Parakeet TDT v2 and v3
 //! - mono 16kHz `&[f32]` input
 //!

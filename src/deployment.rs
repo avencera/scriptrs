@@ -17,6 +17,12 @@ const V3_DECODER: &str = "parakeet-v3/decoder.mlmodelc";
 const V3_JOINT: &str = "parakeet-v3/joint-decision.mlmodelc";
 const V3_VOCAB: &str = "parakeet-v3/parakeet_vocab.json";
 
+// native weights sit beside the vocabulary, written by dev-tools/nemo/export_native.py
+#[cfg(feature = "cuda")]
+const V2_NATIVE_WEIGHTS: &str = "parakeet-v2/model.safetensors";
+#[cfg(feature = "cuda")]
+const V3_NATIVE_WEIGHTS: &str = "parakeet-v3/model.safetensors";
+
 pub(crate) const V2_BLANK_ID: usize = 1_024;
 pub(crate) const V2_VOCAB_TOKEN_COUNT: usize = V2_BLANK_ID + 1;
 pub(crate) const V3_BLANK_ID: usize = 8_192;
@@ -441,6 +447,13 @@ impl ParakeetDeployment {
         self.hard_sample_max
     }
 
+    /// The same deployment with a runtime's longest single model input
+    #[cfg(feature = "cuda")]
+    pub(crate) const fn with_hard_sample_max(mut self, samples: usize) -> Self {
+        self.hard_sample_max = samples;
+        self
+    }
+
     /// Duration bin mapping owned by this deployment
     pub const fn duration_bins(&self) -> &'static [usize] {
         self.duration_bins
@@ -491,6 +504,15 @@ impl ParakeetDeployment {
                 bin,
                 len: self.duration_bins.len(),
             })
+    }
+
+    /// Native fp32 weight file, relative to the bundle root
+    #[cfg(feature = "cuda")]
+    pub(crate) fn native_weights_path(&self) -> &'static str {
+        match self.version {
+            ParakeetVersion::V2 => V2_NATIVE_WEIGHTS,
+            ParakeetVersion::V3 => V3_NATIVE_WEIGHTS,
+        }
     }
 
     pub(crate) fn sibling_vocab_path(&self) -> &'static str {

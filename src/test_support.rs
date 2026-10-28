@@ -18,6 +18,9 @@ const DEFAULT_REFERENCE_DIR: &str = "/shared/datasets/parakeet-ref";
 /// One reference set (`b1` or `b8`) for one Parakeet version
 pub(crate) struct NemoReference {
     mmap: Mmap,
+    /// The set's `.json` metadata, with NeMo's transcript per utterance
+    #[cfg(feature = "cuda")]
+    meta_path: PathBuf,
 }
 
 impl NemoReference {
@@ -34,7 +37,30 @@ impl NemoReference {
         let file = File::open(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
         // SAFETY: reference files are written once and only read while tests run
         let mmap = unsafe { Mmap::map(&file) }.expect("reference file should map");
-        Self { mmap }
+        Self {
+            mmap,
+            #[cfg(feature = "cuda")]
+            meta_path: dir.join(format!("{set}.json")),
+        }
+    }
+
+    /// NeMo's transcript of each utterance in the set
+    #[cfg(feature = "cuda")]
+    pub(crate) fn nemo_texts(&self) -> Vec<String> {
+        let text = std::fs::read_to_string(&self.meta_path)
+            .unwrap_or_else(|error| panic!("{}: {error}", self.meta_path.display()));
+        let meta: serde_json::Value = serde_json::from_str(&text).expect("reference metadata");
+        meta["utterances"]
+            .as_array()
+            .expect("utterances")
+            .iter()
+            .map(|utterance| {
+                utterance["nemo_text"]
+                    .as_str()
+                    .expect("nemo_text")
+                    .to_owned()
+            })
+            .collect()
     }
 
     fn tensors(&self) -> SafeTensors<'_> {
@@ -55,6 +81,7 @@ impl NemoReference {
         ArrayD::from_shape_vec(IxDyn(view.shape()), values).expect("shape should match data")
     }
 
+    #[cfg(feature = "cuda")]
     pub(crate) fn i32(&self, key: &str) -> Vec<i32> {
         let tensors = self.tensors();
         let view = tensors

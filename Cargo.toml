@@ -18,7 +18,7 @@ default = ["online"]
 online = ["dep:hf-hub", "hf-hub/ureq", "hf-hub/native-tls"]
 long-form = []
 vad = ["long-form"]
-# native engine work in progress; not usable for transcription yet
+# experimental FP32 CUDA backend on native weights (ModelBundle::from_native_dir)
 cuda = ["dep:memmap2", "dep:safetensors", "dep:cudakit", "cudakit/libraries"]
 
 [dependencies]
