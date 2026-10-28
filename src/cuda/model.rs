@@ -101,15 +101,18 @@ impl ShapeCache {
     }
 }
 
-/// Held while any engine in the process captures a graph or is torn down
+/// Held while any engine in the process captures a graph or frees device resources:
+/// its teardown, a failed load's runtime, and a shape cache's additions and evictions
 ///
 /// Each engine opens its own runtime, but all of them share device 0's primary
 /// context, and tearing one down while another thread captures fails that capture
 /// with `CUBLAS_STATUS_INTERNAL_ERROR`, `CUBLAS_STATUS_EXECUTION_FAILED` or
 /// `CUDA_ERROR_STREAM_CAPTURE_INVALIDATED`. Parallel long-form workers each load an
 /// engine, and the first to finish drops it while another may still be capturing
-/// the last window's shape. Eager runs, replays and loads overlap a teardown or a
-/// capture without failing, so they stay outside it
+/// the last window's shape. Shape changes free only graphs and stream-ordered
+/// buffers, which should leave a capture intact, but they are rare enough to hold
+/// apart for nothing, so every free is covered. Eager runs, replays and successful
+/// loads overlap a teardown or a capture without failing, so they stay outside it
 static CAPTURE_OR_TEARDOWN: Mutex<()> = Mutex::new(());
 
 fn capture_or_teardown() -> MutexGuard<'static, ()> {
@@ -184,10 +187,23 @@ impl CudaModel {
         let file = WeightFile::open(weights)?;
         let spec = file.parakeet_spec(deployment)?;
         let runtime = CudaRuntime::open(0, Options::default())?;
-        runtime.prepare(Library::Cublas)?;
-        let encoder = CudaEncoder::load(&runtime, &file, spec.encoder, math(precision))?;
-        let decoder = CudaDecoder::load(&runtime, &file, &spec)?;
-        let (free, _) = runtime.stream().context().mem_get_info()?;
+        let loaded = (|| -> Result<_, TranscriptionError> {
+            runtime.prepare(Library::Cublas)?;
+            let encoder = CudaEncoder::load(&runtime, &file, spec.encoder, math(precision))?;
+            let decoder = CudaDecoder::load(&runtime, &file, &spec)?;
+            let (free, _) = runtime.stream().context().mem_get_info()?;
+            Ok((encoder, decoder, free))
+        })();
+        let (encoder, decoder, free) = match loaded {
+            Ok(parts) => parts,
+            Err(error) => {
+                // the runtime holds the cuBLAS handle and kernel modules, so a failed
+                // load tears down the same things an engine's drop does
+                let _teardown = capture_or_teardown();
+                drop(runtime);
+                return Err(error);
+            }
+        };
         Ok(Self(Arc::new(ExclusiveTeardown(ManuallyDrop::new(
             Engine {
                 shapes: Mutex::new(ShapeCache::new(free / CACHE_SHARE_DIVISOR)),
@@ -246,6 +262,9 @@ impl CudaModel {
         })?;
         let key = (batch, mel_frames);
         if !shapes.shapes.contains_key(&key) {
+            // adding a shape may free others' graphs and buffers, by eviction or by the
+            // retry below, and a failed allocation frees what it had made
+            let _teardown = capture_or_teardown();
             let shape = match engine.shape(batch, mel_frames) {
                 Ok(shape) => shape,
                 // the allocation may have failed on memory cached shapes hold: free
