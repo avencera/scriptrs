@@ -127,7 +127,7 @@ shorter overlaps lose accuracy on long recordings.
 
 On an RTX 5090, v3 runs LibriSpeech test-clean one utterance at a time at 719x
 real time with 1.93 % WER, the same WER as NeMo's FP32 greedy decode at 410x.
-On all 44 Earnings-21 calls (39 h), long-form with the defaults runs at 1650x
+On all 44 Earnings-21 calls (39 h), long-form with the defaults runs at 1680x
 with 8.25 % pooled WER; NeMo transcribing each whole call with local attention
 scores 9.58 %.
 
@@ -198,7 +198,7 @@ fn load_mono_16khz_audio() -> Vec<f32> {
 }
 ```
 
-`LongFormConfig` defaults to the fast overlap-chunking path with `4` workers, each loading its own model. On native CUDA bundles, windows instead run `batch_size` at a time (16 by default) through the pipeline's one model; Core ML bundles ignore `batch_size`. `LongFormConfig::for_bundle(&bundle)` gives a bundle's defaults to start from when you change one setting. You can tune the worker count when you want less or more parallelism:
+`LongFormConfig` defaults to the fast overlap-chunking path with `4` workers, each loading its own model. On native CUDA bundles, windows instead run `batch_size` at a time (16 by default) through the pipeline's one model, and the workers prepare windows on the CPU ahead of it; Core ML bundles ignore `batch_size`. `LongFormConfig::for_bundle(&bundle)` gives a bundle's defaults to start from when you change one setting. You can tune the worker count when you want less or more parallelism:
 
 ```rust
 use scriptrs::{LongFormConfig, LongFormTranscriptionPipeline};

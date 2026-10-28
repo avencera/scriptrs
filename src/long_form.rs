@@ -73,7 +73,8 @@ pub struct LongFormConfig {
     /// Long-form planning mode
     pub mode: LongFormMode,
     /// Parallel chunk workers used for long-form transcription, each with its own
-    /// model; unused when windows run in batches
+    /// model; when windows run in batches, the threads that prepare them for the
+    /// pipeline's one model instead
     pub worker_count: usize,
     /// Windows per model call on backends that batch on the device (native CUDA);
     /// above 1, windows run in batches through the pipeline's one model instead of
@@ -445,9 +446,10 @@ impl LongFormTranscriptionPipeline {
 
     /// Runs the plan's windows `batch_size` at a time through the pipeline's model
     ///
-    /// A second thread prepares the next batch on the CPU while the model runs the
-    /// current one; on a 1 h recording preparation was 30 % of the wall time when
-    /// it ran in between
+    /// `worker_count` threads prepare windows on the CPU ahead of the model, so the
+    /// next batch is ready while the model runs the current one; on a 1 h recording
+    /// preparation was 30 % of the wall time when it ran in between, and the first
+    /// batch still waits on it
     fn run_batched_plan<P: WindowPreprocessor + ?Sized>(
         &self,
         audio: &[f32],
@@ -458,33 +460,62 @@ impl LongFormTranscriptionPipeline {
     ) -> Result<TranscriptionResult, PreprocessedTranscriptionError<P::Error>> {
         let LongFormExecutionPlan { tasks, regions } = execution_plan;
         let batch_size = config.batch_size;
+        let worker_count = parallel_worker_count(tasks.len(), config.worker_count);
+        let next_task = AtomicUsize::new(0);
 
         let raw_tasks = thread::scope(
             |scope| -> Result<Vec<_>, PreprocessedTranscriptionError<P::Error>> {
-                // one batch waits while the next is prepared, which bounds host memory
-                let (sender, receiver) = sync_channel(1);
-                let tasks = &tasks;
-                scope.spawn(move || {
-                    let preparer = TranscriptionPipeline::chunk_preparer(&config.transcription);
-                    let preparation = PreparationContext {
-                        audio,
-                        control,
-                        preprocessor,
-                    };
-                    for (batch_idx, batch) in tasks.chunks(batch_size).enumerate() {
-                        let windows =
-                            prepare_batch(&preparation, &preparer, batch, batch_idx * batch_size);
-                        let failed = windows.is_err();
-                        // a closed channel means the model side has already failed
-                        if sender.send(windows).is_err() || failed {
-                            break;
+                // at most a batch waits beyond those in progress, which bounds host
+                // memory while the model runs
+                let (sender, receiver) = sync_channel(batch_size);
+                for _ in 0..worker_count {
+                    let sender = sender.clone();
+                    let next_task = &next_task;
+                    let tasks = &tasks;
+                    scope.spawn(move || {
+                        let preparer = TranscriptionPipeline::chunk_preparer(&config.transcription);
+                        let preparation = PreparationContext {
+                            audio,
+                            control,
+                            preprocessor,
+                        };
+                        loop {
+                            let task_idx = next_task.fetch_add(1, Ordering::Relaxed);
+                            let Some(task) = tasks.get(task_idx) else {
+                                break;
+                            };
+                            let window = prepare_window(&preparation, &preparer, task, task_idx);
+                            let failed = window.is_err();
+                            // a closed channel means the model side has stopped
+                            if sender.send((task_idx, window)).is_err() || failed {
+                                break;
+                            }
+                        }
+                    });
+                }
+                drop(sender);
+
+                // windows arrive in any order; batches are cut in plan order, and an
+                // error surfaces when its window is reached, as on the serial path
+                let mut ready = BTreeMap::new();
+                let mut raw_tasks = Vec::with_capacity(tasks.len());
+                for batch_start in (0..tasks.len()).step_by(batch_size) {
+                    let batch_end = (batch_start + batch_size).min(tasks.len());
+                    let mut windows = Vec::with_capacity(batch_end - batch_start);
+                    for task_idx in batch_start..batch_end {
+                        while !ready.contains_key(&task_idx) {
+                            let (done_idx, window) = receiver.recv().map_err(|_| {
+                                TranscriptionError::InvalidModelOutput(format!(
+                                    "long-form window {task_idx} was never prepared"
+                                ))
+                            })?;
+                            ready.insert(done_idx, window);
+                        }
+                        if let Some(window) = ready.remove(&task_idx) {
+                            windows.push(window?);
                         }
                     }
-                });
 
-                let mut raw_tasks = Vec::with_capacity(tasks.len());
-                for windows in receiver {
-                    let windows = windows?;
                     control.check()?;
                     let raws = self
                         .inner
@@ -896,26 +927,19 @@ fn transcribe_task<P: WindowPreprocessor + ?Sized>(
     Ok(raw)
 }
 
-/// Prepares one batch of windows, the first being window `first_index` of the plan
-fn prepare_batch<P: WindowPreprocessor + ?Sized>(
+/// Prepares window `task_idx` of the plan for the model
+fn prepare_window<P: WindowPreprocessor + ?Sized>(
     context: &PreparationContext<'_, P>,
     preparer: &ChunkPreparer,
-    batch: &[ChunkTask],
-    first_index: usize,
-) -> Result<Vec<PreparedWindow>, PreprocessedTranscriptionError<P::Error>> {
-    batch
-        .iter()
-        .enumerate()
-        .map(|(offset, task)| {
-            let samples =
-                prepare_window_samples(context, task, WindowIndex::new(first_index + offset))?;
-            Ok(PreparedWindow {
-                prepared: preparer.prepare(&samples)?,
-                global_sample_offset: task.global_sample_offset,
-                context_samples: task.context_samples,
-            })
-        })
-        .collect()
+    task: &ChunkTask,
+    task_idx: usize,
+) -> Result<PreparedWindow, PreprocessedTranscriptionError<P::Error>> {
+    let samples = prepare_window_samples(context, task, WindowIndex::new(task_idx))?;
+    Ok(PreparedWindow {
+        prepared: preparer.prepare(&samples)?,
+        global_sample_offset: task.global_sample_offset,
+        context_samples: task.context_samples,
+    })
 }
 
 fn prepare_window_samples<P: WindowPreprocessor + ?Sized>(

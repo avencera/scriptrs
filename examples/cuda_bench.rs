@@ -11,7 +11,8 @@
 //! defaults; the timed region excludes reading the files, and transcripts are keyed
 //! by file stem for `dev-tools/nemo/long_wer.py`. `--window` and `--overlap`
 //! (seconds) override the overlap plan and `--batch` the windows per model call;
-//! at batch 1 the windows run one at a time on one worker
+//! at batch 1 the windows run one at a time on one worker, and above it the
+//! default workers prepare windows ahead of the model
 //!
 //! ```sh
 //! cargo run --release --features cuda,long-form --example cuda_bench -- \
@@ -142,13 +143,13 @@ fn bench_manifest(bundle: ModelBundle, manifest: &Path, repeats: usize) -> Resul
 }
 
 fn bench_long(bundle: ModelBundle, paths: &[PathBuf], args: &Args) -> Result<Bench> {
-    // one worker, because each worker of the unbatched plan loads its own model
-    let mut config = LongFormConfig {
-        worker_count: 1,
-        ..LongFormConfig::for_bundle(&bundle)
-    };
+    let mut config = LongFormConfig::for_bundle(&bundle);
     if let Some(batch) = args.batch {
         config.batch_size = batch;
+    }
+    if config.batch_size == 1 {
+        // each worker of the unbatched plan loads its own model
+        config.worker_count = 1;
     }
     if let Some(window_s) = args.window_s {
         config.overlap.max_model_samples = (window_s * 16_000.0) as usize;
