@@ -775,18 +775,26 @@ mod tests {
 
     /// Relative L2 error and max abs difference over the valid frames of `[batch,
     /// frames, d_model]` outputs
+    ///
+    /// Panics on a non-finite value in either side, which `f64::max` would skip
     fn compare(ours: &[f32], reference: &ArrayD<f32>, lens: &[usize]) -> (f64, f64) {
         let reference = reference
             .view()
             .into_dimensionality::<Ix3>()
             .expect("[batch, frames, d]");
+        assert_eq!(ours.len(), reference.len(), "output size");
         let (frames, width) = (reference.shape()[1], reference.shape()[2]);
         let (mut error, mut norm, mut max_abs) = (0f64, 0f64, 0f64);
         for (b, row) in reference.axis_iter(Axis(0)).enumerate() {
             for t in 0..lens[b] {
                 for c in 0..width {
                     let expected = f64::from(row[[t, c]]);
-                    let diff = f64::from(ours[(b * frames + t) * width + c]) - expected;
+                    let value = f64::from(ours[(b * frames + t) * width + c]);
+                    assert!(
+                        value.is_finite() && expected.is_finite(),
+                        "row {b} frame {t} channel {c}: {value} against {expected}"
+                    );
+                    let diff = value - expected;
                     error += diff * diff;
                     norm += expected * expected;
                     max_abs = max_abs.max(diff.abs());
@@ -797,12 +805,26 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "row 0 frame 1")]
+    fn compare_rejects_nan_output() {
+        let reference = ArrayD::from_elem(vec![1, 2, 2], 1.0f32);
+        compare(&[1.0, 1.0, f32::NAN, 1.0], &reference, &[2]);
+    }
+
+    #[test]
     #[ignore = "reads NeMo references from /shared/datasets/parakeet-ref"]
     fn nemo_parity_relative_positions() {
         let reference = NemoReference::open(ParakeetVersion::V2, "b8");
         let table = reference.f32("encoder.layers.0.self_attn.linear_pos.in");
         let positions = table.shape()[1];
         let ours = relative_positions(positions.div_ceil(2), table.shape()[2]);
+        assert_eq!(ours.len(), table.len(), "table size");
+        assert!(
+            ours.iter()
+                .chain(table.iter())
+                .all(|value| value.is_finite()),
+            "non-finite relative position"
+        );
         let max_abs = ours
             .iter()
             .zip(table.iter())

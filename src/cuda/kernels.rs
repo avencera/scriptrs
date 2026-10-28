@@ -1,14 +1,16 @@
 //! Kernel registry and typed launchers for `crates/scriptrs-cuda-kernels`
 //!
 //! cuda-oxide passes every slice parameter as a device pointer followed by its `u64`
-//! length, so each launcher pushes both, in the kernel's parameter order
+//! length, so each launcher pushes both, in the kernel's parameter order. Kernels write
+//! through unchecked indexes, so every launcher first checks that each buffer holds
+//! exactly the elements its shape implies
 
 use cudakit::cudarc::driver::{
     CudaFunction, CudaStream, CudaView, CudaViewMut, LaunchConfig, PushKernelArg,
 };
 use cudakit::{
     AreaPtx, EmbeddedPtx, Error, ExtraSymbols, KernelArea, LibraryPolicy, LoadedKernels, Profile,
-    PtxTier, Runtime, TierSet,
+    PtxTier, Runtime, TierSet, check_len, element_count,
 };
 
 /// Build-wide CUDA policy: cuBLAS is allowed while the encoder is library-first, and
@@ -84,6 +86,11 @@ fn u32_of(context: &'static str, value: usize) -> Result<u32, Error> {
     u32::try_from(value).map_err(|_| Error::DimensionOverflow { context, value })
 }
 
+/// Elements in `shape`, failing on overflow
+fn count(context: &'static str, shape: &[usize]) -> Result<usize, Error> {
+    element_count(context, shape)
+}
+
 fn len<T>(view: &CudaView<'_, T>) -> u64 {
     view.len() as u64
 }
@@ -99,6 +106,42 @@ pub(crate) struct Heads {
     pub frames: usize,
     pub heads: usize,
     pub head_dim: usize,
+}
+
+impl Heads {
+    /// Elements in one `[batch, heads, frames, head_dim]` tensor
+    fn len(self) -> Result<usize, Error> {
+        count(
+            "attention heads",
+            &[self.batch, self.frames, self.heads, self.head_dim],
+        )
+    }
+}
+
+/// Checks the buffers of a 3x3 subsampling convolution against its output map
+fn check_subsampling(
+    input: FeatureMap,
+    output: FeatureMap,
+    lens: usize,
+    weight: usize,
+    bias: usize,
+    out: usize,
+) -> Result<(), Error> {
+    if input.batch != output.batch {
+        return Err(Error::BufferLength {
+            context: "subsampling batch",
+            expected: output.batch,
+            actual: input.batch,
+        });
+    }
+    check_len("subsampling lengths", output.batch, lens)?;
+    check_len(
+        "subsampling weight",
+        count("subsampling weight", &[output.channels, 9])?,
+        weight,
+    )?;
+    check_len("subsampling bias", output.channels, bias)?;
+    check_len("subsampling output", output.len(), out)
 }
 
 /// A subsampling feature map `[batch, channels, frames, features]`
@@ -166,6 +209,16 @@ impl EncoderKernels {
         width: usize,
         eps: f32,
     ) -> Result<(), Error> {
+        if width == 0 || x.len() % width != 0 {
+            return Err(Error::BufferLength {
+                context: "layer norm input",
+                expected: width.max(1) * x.len().div_ceil(width.max(1)),
+                actual: x.len(),
+            });
+        }
+        check_len("layer norm gamma", width, gamma.len())?;
+        check_len("layer norm beta", width, beta.len())?;
+        check_len("layer norm output", x.len(), out.len())?;
         let config = rows(x.len() / width)?;
         let lens = [len(x), len(gamma), len(beta), len_mut(out)];
         let width = u32_of("layer norm width", width)?;
@@ -216,7 +269,15 @@ impl EncoderKernels {
         v: &mut CudaViewMut<'_, f32>,
         shape: Heads,
     ) -> Result<(), Error> {
-        let config = elements(shape.batch * shape.frames * shape.heads * shape.head_dim)?;
+        let n = shape.len()?;
+        let width = count("qkv width", &[shape.heads, shape.head_dim])?;
+        check_len("qkv input", count("qkv input", &[3, n])?, qkv.len())?;
+        check_len("pos_bias_u", width, bias_u.len())?;
+        check_len("pos_bias_v", width, bias_v.len())?;
+        for (context, buffer) in [("q + u", &*q_u), ("q + v", &*q_v), ("k", &*k), ("v", &*v)] {
+            check_len(context, n, buffer.len())?;
+        }
+        let config = elements(n)?;
         let lens = [
             len(qkv),
             len(bias_u),
@@ -269,7 +330,10 @@ impl EncoderKernels {
         heads: usize,
         head_dim: usize,
     ) -> Result<(), Error> {
-        let config = elements(rows_count * heads * head_dim)?;
+        let n = count("split heads", &[rows_count, heads, head_dim])?;
+        check_len("split heads input", n, x.len())?;
+        check_len("split heads output", n, out.len())?;
+        let config = elements(n)?;
         let lens = [len(x), len_mut(out)];
         let dims = [
             u32_of("rows", rows_count)?,
@@ -292,7 +356,10 @@ impl EncoderKernels {
         out: &mut CudaViewMut<'_, f32>,
         shape: Heads,
     ) -> Result<(), Error> {
-        let config = elements(shape.batch * shape.frames * shape.heads * shape.head_dim)?;
+        let n = shape.len()?;
+        check_len("merge heads input", n, x.len())?;
+        check_len("merge heads output", n, out.len())?;
+        let config = elements(n)?;
         let lens = [len(x), len_mut(out)];
         let dims = [
             u32_of("batch", shape.batch)?,
@@ -321,7 +388,22 @@ impl EncoderKernels {
         lens_frames: &CudaView<'_, u32>,
         shape: Heads,
     ) -> Result<(), Error> {
-        let config = rows(shape.batch * shape.heads * shape.frames)?;
+        let (batch, heads, frames) = (shape.batch, shape.heads, shape.frames);
+        let score_rows = count("score rows", &[batch, heads, frames])?;
+        check_len(
+            "scores",
+            count("scores", &[score_rows, frames])?,
+            scores.len(),
+        )?;
+        // one row of 2T - 1 relative positions per query
+        let positions = (2 * frames).saturating_sub(1);
+        check_len(
+            "position scores",
+            count("position scores", &[score_rows, positions])?,
+            bd.len(),
+        )?;
+        check_len("frame lengths", batch, lens_frames.len())?;
+        let config = rows(score_rows)?;
         let lens = [len_mut(scores), len(bd), len(lens_frames)];
         let dims = [
             u32_of("batch", shape.batch)?,
@@ -368,7 +450,22 @@ impl EncoderKernels {
         channels: usize,
         kernel_size: usize,
     ) -> Result<(), Error> {
-        let config = elements(batch * frames * channels)?;
+        let n = count("conv module", &[batch, frames, channels])?;
+        check_len(
+            "conv pw1 output",
+            count("conv pw1 output", &[2, n])?,
+            pw1.len(),
+        )?;
+        check_len("frame lengths", batch, lens_frames.len())?;
+        check_len(
+            "depthwise weight",
+            count("depthwise weight", &[channels, kernel_size])?,
+            weight.len(),
+        )?;
+        check_len("batch norm scale", channels, scale.len())?;
+        check_len("batch norm shift", channels, shift.len())?;
+        check_len("conv module output", n, out.len())?;
+        let config = elements(n)?;
         let lens = [
             len(pw1),
             len(lens_frames),
@@ -415,6 +512,13 @@ impl EncoderKernels {
         bias: &CudaView<'_, f32>,
         out: &mut CudaViewMut<'_, f32>,
     ) -> Result<(), Error> {
+        if bias.is_empty() || out.len() % bias.len() != 0 {
+            return Err(Error::BufferLength {
+                context: "fill rows output",
+                expected: bias.len().max(1) * out.len().div_ceil(bias.len().max(1)),
+                actual: out.len(),
+            });
+        }
         let config = elements(out.len())?;
         let lens = [len(bias), len_mut(out)];
         let width = u32_of("bias width", bias.len())?;
@@ -447,6 +551,24 @@ impl EncoderKernels {
         input: FeatureMap,
         output: FeatureMap,
     ) -> Result<(), Error> {
+        // the first convolution reads one channel
+        check_len(
+            "subsampling input",
+            count(
+                "subsampling input",
+                &[input.batch, input.frames, input.features],
+            )?,
+            mel.len(),
+        )?;
+        check_subsampling(
+            input,
+            output,
+            in_lens.len(),
+            weight.len(),
+            bias.len(),
+            out.len(),
+        )?;
+        check_len("input lengths", output.batch, out_lens.len())?;
         let config = elements(output.len())?;
         let lens = [
             len(mel),
@@ -503,6 +625,15 @@ impl EncoderKernels {
         input: FeatureMap,
         output: FeatureMap,
     ) -> Result<(), Error> {
+        check_len("depthwise input", input.len(), x.len())?;
+        check_subsampling(
+            input,
+            output,
+            out_lens.len(),
+            weight.len(),
+            bias.len(),
+            out.len(),
+        )?;
         let config = elements(output.len())?;
         let lens = [len(x), len(out_lens), len(weight), len(bias), len_mut(out)];
         let dims = [
@@ -540,6 +671,9 @@ impl EncoderKernels {
         lens_frames: &CudaView<'_, u32>,
         map: FeatureMap,
     ) -> Result<(), Error> {
+        check_len("pointwise output", map.len(), x.len())?;
+        check_len("pointwise bias", map.channels, bias.len())?;
+        check_len("frame lengths", map.batch, lens_frames.len())?;
         let config = elements(map.len())?;
         let lens = [len_mut(x), len(bias), len(lens_frames)];
         let dims = [
@@ -570,6 +704,8 @@ impl EncoderKernels {
         out: &mut CudaViewMut<'_, f32>,
         map: FeatureMap,
     ) -> Result<(), Error> {
+        check_len("flatten input", map.len(), x.len())?;
+        check_len("flatten output", map.len(), out.len())?;
         let config = elements(map.len())?;
         let lens = [len(x), len_mut(out)];
         let dims = [
@@ -584,5 +720,39 @@ impl EncoderKernels {
         // kernel
         unsafe { launch.launch(config) }?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cudakit::{Error, Options};
+
+    use super::{CudaRuntime, EncoderKernels};
+
+    /// A buffer one row short must fail on the host, before the kernel's unchecked
+    /// writes run past it
+    #[test]
+    #[ignore = "needs a CUDA GPU; `just gpu-parity` runs it on gpu0"]
+    fn gpu_launchers_reject_short_buffers() {
+        let runtime = CudaRuntime::open(0, Options::default()).expect("CUDA runtime");
+        let kernels = EncoderKernels::load(&runtime).expect("kernels");
+        let stream = runtime.stream();
+        let x = stream.alloc_zeros::<f32>(2 * 4).expect("alloc");
+        let gamma = stream.alloc_zeros::<f32>(4).expect("alloc");
+        let mut out = stream.alloc_zeros::<f32>(4).expect("alloc");
+
+        let result = kernels.layer_norm(
+            stream,
+            &x.slice(..),
+            &gamma.slice(..),
+            &gamma.slice(..),
+            &mut out.slice_mut(..),
+            4,
+            1e-5,
+        );
+        assert!(
+            matches!(result, Err(Error::BufferLength { .. })),
+            "{result:?}"
+        );
     }
 }
