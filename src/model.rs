@@ -48,6 +48,13 @@ impl ParakeetModel {
         }
         Ok(decoded)
     }
+
+    /// Whether one call runs a batch of chunks together on the device, rather than
+    /// one chunk after another on the host
+    #[cfg(feature = "long-form")]
+    pub(crate) fn batches_on_device(&self) -> bool {
+        self.inner.batches_on_device()
+    }
 }
 
 /// Runtime behind [`ParakeetModel`]
@@ -102,6 +109,18 @@ impl ParakeetModelInner {
                 layout.weights_path(),
                 bundle.deployment(),
             )?)),
+        }
+    }
+
+    #[cfg(feature = "long-form")]
+    fn batches_on_device(&self) -> bool {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::SplitCoreMl { .. } => false,
+            #[cfg(feature = "cuda")]
+            Self::Cuda(_) => true,
+            #[cfg(not(target_os = "macos"))]
+            Self::Unsupported => false,
         }
     }
 

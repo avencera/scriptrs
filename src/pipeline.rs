@@ -155,6 +155,12 @@ impl TranscriptionPipeline {
         Ok(raws.remove(0))
     }
 
+    /// Whether the model runs a batch of windows together on the device
+    #[cfg(feature = "long-form")]
+    pub(crate) fn batches_on_device(&self) -> bool {
+        self.model.batches_on_device()
+    }
+
     /// Transcribes windows in one model call, each placed on the recording's timeline
     pub(crate) fn transcribe_prepared_batch(
         &self,

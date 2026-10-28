@@ -73,10 +73,11 @@ pub struct LongFormConfig {
     /// Long-form planning mode
     pub mode: LongFormMode,
     /// Parallel chunk workers used for long-form transcription, each with its own
-    /// model; unused when `batch_size` is above 1
+    /// model; unused when windows run in batches
     pub worker_count: usize,
-    /// Windows per model call; above 1, windows run in batches through the
-    /// pipeline's one model instead of on parallel workers
+    /// Windows per model call on backends that batch on the device (native CUDA);
+    /// above 1, windows run in batches through the pipeline's one model instead of
+    /// on parallel workers. Core ML runs one window per call and ignores it
     pub batch_size: usize,
     /// Single-chunk transcription settings
     pub transcription: TranscriptionConfig,
@@ -392,7 +393,9 @@ impl LongFormTranscriptionPipeline {
         if execution_plan.tasks.is_empty() {
             return Ok(TranscriptionResult::empty(duration_seconds(audio.len())));
         }
-        if config.batch_size > 1 {
+        // a host-loop backend runs a batch one window at a time with no control
+        // checks between them, so it stays on the per-window paths
+        if config.batch_size > 1 && self.inner.batches_on_device() {
             return self.run_batched_plan(audio, execution_plan, config, control, preprocessor);
         }
         let worker_count = parallel_worker_count(execution_plan.tasks.len(), config.worker_count);
