@@ -24,7 +24,7 @@ cuda = ["dep:memmap2", "dep:safetensors", "dep:cudakit", "cudakit/libraries"]
 
 [dependencies]
 # pinned by git until cudakit is on crates.io
-cudakit = { git = "https://github.com/avencera/cudakit", rev = "9dfb1acb294e3c299ba5d639a7a4f4af613830ad", optional = true }
+cudakit = { git = "https://github.com/avencera/cudakit", rev = "414713603a2cf721283e71ded88cd10014efdf45", optional = true }
 hf-hub = { version = "0.5", optional = true, default-features = false }
 memmap2 = { version = "0.9", optional = true }
 ndarray = "0.17.2"

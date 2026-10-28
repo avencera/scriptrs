@@ -19,8 +19,9 @@ pub(crate) static PROFILE: Profile = Profile {
     consumer: "scriptrs",
     compiled: TierSet::of(&[PtxTier::Sm75]),
     shipped: TierSet::of(&[PtxTier::Sm75]),
-    // one feature builds every tier until per-tier kernels exist
-    tier_features: ["cuda", "cuda", "cuda", "cuda"],
+    // only `cuda` embeds PTX, and only sm75; naming it for a higher tier would tell a
+    // user who already enabled `cuda` to enable it, so those get cudakit's generic hint
+    tier_features: &[(PtxTier::Sm75, "cuda")],
     libraries: LibraryPolicy::Allowed,
     extra_symbols: ExtraSymbols::NONE,
 };
