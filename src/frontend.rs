@@ -10,7 +10,7 @@ use crate::error::TranscriptionError;
 
 pub(crate) struct ParakeetFeatureExtractor {
     config: TranscriptionConfig,
-    mel_filterbank: Array2<f32>,
+    mel_filterbank: MelFilterbank,
     window: Vec<f32>,
     r2c: Arc<dyn RealToComplex<f32>>,
     stft_workspace: RefCell<StftWorkspace>,
@@ -40,6 +40,8 @@ impl Clone for ParakeetFeatureExtractor {
 struct StftWorkspace {
     preemphasized: Vec<f32>,
     padded: Vec<f32>,
+    /// Power spectrum, frame-major `[frames, freq_bins]`
+    power: Vec<f32>,
     input: Vec<f32>,
     output: Vec<Complex<f32>>,
     scratch: Vec<Complex<f32>>,
@@ -50,6 +52,7 @@ impl StftWorkspace {
         Self {
             preemphasized: Vec::new(),
             padded: Vec::new(),
+            power: Vec::new(),
             input: r2c.make_input_vec(),
             output: r2c.make_output_vec(),
             scratch: r2c.make_scratch_vec(),
@@ -92,11 +95,11 @@ impl ParakeetFeatureExtractor {
         let r2c = planner.plan_fft_forward(config.n_fft);
         Self {
             config: config.clone(),
-            mel_filterbank: create_mel_filterbank(
+            mel_filterbank: MelFilterbank::new(&create_mel_filterbank(
                 config.n_fft,
                 config.feature_size,
                 config.sample_rate,
-            ),
+            )),
             window: hann_window(config.win_length),
             stft_workspace: RefCell::new(StftWorkspace::new(&r2c)),
             r2c,
@@ -108,19 +111,35 @@ impl ParakeetFeatureExtractor {
             return Err(TranscriptionError::EmptyAudio);
         }
 
-        let spectrogram = self.stft(audio)?;
-        let mel_spectrogram = self.mel_filterbank.dot(&spectrogram);
+        let mut workspace = self.stft_workspace.borrow_mut();
+        let num_frames = self.power_spectrum(&mut workspace, audio)?;
+        let freq_bins = self.config.n_fft / 2 + 1;
+        let mut features = Array2::<f32>::zeros((num_frames, self.mel_filterbank.mels()));
+        let rows = workspace
+            .power
+            .chunks_exact(freq_bins)
+            .zip(features.rows_mut());
         let log_zero_guard = 2.0f32.powi(-24);
-        let mut features = mel_spectrogram
-            .mapv(|value| (value + log_zero_guard).ln())
-            .t()
-            .to_owned();
+        for (power, mut mels) in rows {
+            let mels = mels
+                .as_slice_mut()
+                .expect("a fresh standard-layout array has contiguous rows");
+            self.mel_filterbank.apply(power, mels);
+            for value in mels {
+                *value = (*value + log_zero_guard).ln();
+            }
+        }
         normalize_columns(&mut features);
         Ok(features)
     }
 
-    fn stft(&self, audio: &[f32]) -> Result<Array2<f32>, TranscriptionError> {
-        let mut workspace = self.stft_workspace.borrow_mut();
+    /// Fills `workspace.power` with the frame-major power spectrum of `audio` and
+    /// returns its frame count
+    fn power_spectrum(
+        &self,
+        workspace: &mut StftWorkspace,
+        audio: &[f32],
+    ) -> Result<usize, TranscriptionError> {
         apply_preemphasis_into(audio, self.config.preemphasis, &mut workspace.preemphasized);
 
         let pad_amount = self.config.n_fft / 2;
@@ -131,19 +150,28 @@ impl ParakeetFeatureExtractor {
         // is kept for audio shorter than a hop so the encoder has an input
         let num_frames = (audio.len() / self.config.hop_length).max(1);
         let freq_bins = self.config.n_fft / 2 + 1;
-        let mut spectrogram = Array2::<f32>::zeros((freq_bins, num_frames));
+        workspace.power.clear();
+        workspace.power.reserve(num_frames * freq_bins);
 
         // reuse the FFT plan and temporary buffers across chunk extractions
         for frame_idx in 0..num_frames {
             let start = frame_idx * self.config.hop_length;
             workspace.process_frame(&self.r2c, &self.window, start)?;
-
-            for bin in 0..freq_bins {
-                spectrogram[[bin, frame_idx]] = workspace.output[bin].norm_sqr();
-            }
+            let StftWorkspace { output, power, .. } = &mut *workspace;
+            power.extend(output[..freq_bins].iter().map(Complex::norm_sqr));
         }
 
-        Ok(spectrogram)
+        Ok(num_frames)
+    }
+
+    #[cfg(test)]
+    fn stft(&self, audio: &[f32]) -> Result<Array2<f32>, TranscriptionError> {
+        let mut workspace = self.stft_workspace.borrow_mut();
+        let num_frames = self.power_spectrum(&mut workspace, audio)?;
+        let freq_bins = self.config.n_fft / 2 + 1;
+        let power = Array2::from_shape_vec((num_frames, freq_bins), workspace.power.clone())
+            .expect("the power spectrum holds frames * bins values");
+        Ok(power.reversed_axes())
     }
 }
 
@@ -222,20 +250,124 @@ fn create_mel_filterbank(n_fft: usize, n_mels: usize, sample_rate: usize) -> Arr
     filterbank
 }
 
+/// Slaney mel filters kept as the band of bins each one weights
+///
+/// Each triangular filter covers a few of the 257 bins, so the dense product did 65x
+/// the needed work. A filter's band is accumulated in bin order with a fused
+/// multiply-add, which is what matrixmultiply's FMA kernel does for each output, so
+/// the features stay bit-identical to the dense `filterbank · spectrum` on CPUs with
+/// FMA: the skipped zero weights add exactly nothing to a non-negative power sum
+#[derive(Debug, Clone)]
+struct MelFilterbank {
+    /// First weighted bin and the weights from it, per mel
+    filters: Vec<(usize, Vec<f32>)>,
+}
+
+impl MelFilterbank {
+    /// Trims each `[n_mels, freq_bins]` row to its nonzero band
+    fn new(dense: &Array2<f32>) -> Self {
+        let filters = dense
+            .rows()
+            .into_iter()
+            .map(|row| {
+                let first = row.iter().position(|weight| *weight != 0.0);
+                let last = row.iter().rposition(|weight| *weight != 0.0);
+                match (first, last) {
+                    (Some(first), Some(last)) => (
+                        first,
+                        row.iter()
+                            .skip(first)
+                            .take(last + 1 - first)
+                            .copied()
+                            .collect(),
+                    ),
+                    // an empty filter sums to zero, as its dense row did
+                    _ => (0, Vec::new()),
+                }
+            })
+            .collect();
+        Self { filters }
+    }
+
+    fn mels(&self) -> usize {
+        self.filters.len()
+    }
+
+    /// Writes the mel energies of one frame's power spectrum into `out`
+    ///
+    /// Each energy rounds exactly as the dense `matrixmultiply` product this
+    /// replaced: its kernels add bins in order, fused on x86-64 with FMA and on
+    /// aarch64, and as a separate multiply and add elsewhere
+    fn apply(&self, power: &[f32], out: &mut [f32]) {
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("fma") {
+            // SAFETY: the CPU supports FMA, checked just above
+            unsafe { self.apply_fma(power, out) };
+            return;
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        self.apply_with(power, out, f32::mul_add);
+        #[cfg(not(target_arch = "aarch64"))]
+        self.apply_with(power, out, |weight, bin, sum| sum + weight * bin);
+    }
+
+    /// # Safety
+    ///
+    /// The CPU must support FMA. The function is `unsafe` rather than a safe
+    /// `#[target_feature]` function, which needs Rust 1.86
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "fma")]
+    unsafe fn apply_fma(&self, power: &[f32], out: &mut [f32]) {
+        // `mul_add` is one instruction here; without the feature it would call a
+        // slow software fallback
+        self.apply_with(power, out, f32::mul_add);
+    }
+
+    /// Folds each filter over its bins in order with `step(weight, bin, sum)`
+    #[inline(always)]
+    fn apply_with(&self, power: &[f32], out: &mut [f32], step: impl Fn(f32, f32, f32) -> f32) {
+        for ((first, weights), slot) in self.filters.iter().zip(out) {
+            let bins = &power[*first..*first + weights.len()];
+            *slot = weights
+                .iter()
+                .zip(bins)
+                .fold(0.0, |sum, (weight, bin)| step(*weight, *bin, sum));
+        }
+    }
+}
+
+/// Normalizes each feature column of `[frames, features]` to zero mean and unit
+/// (unbiased) deviation
+///
+/// Sums run row by row into one accumulator per column, which adds each column's
+/// values in the same frame order as a column-wise pass, without striding through
+/// memory
 fn normalize_columns(features: &mut Array2<f32>) {
-    let num_frames = features.shape()[0];
-    let num_features = features.shape()[1];
-    for feature_idx in 0..num_features {
-        let mut column = features.column_mut(feature_idx);
-        let mean = column.iter().sum::<f32>() / num_frames as f32;
-        // unbiased, as NeMo's per-feature normalization; a single frame has zero spread
-        let variance = column
-            .iter()
-            .map(|value| (*value - mean).powi(2))
-            .sum::<f32>()
-            / num_frames.saturating_sub(1).max(1) as f32;
-        let std = variance.sqrt() + 1e-5;
-        for value in &mut column {
+    let num_frames = features.nrows();
+    let num_features = features.ncols();
+    let mut sums = vec![0.0f32; num_features];
+    for row in features.rows() {
+        for (sum, value) in sums.iter_mut().zip(row) {
+            *sum += *value;
+        }
+    }
+    let means: Vec<f32> = sums.iter().map(|sum| sum / num_frames as f32).collect();
+
+    let mut squares = vec![0.0f32; num_features];
+    for row in features.rows() {
+        for ((sum, value), mean) in squares.iter_mut().zip(row).zip(&means) {
+            *sum += (*value - mean).powi(2);
+        }
+    }
+    // unbiased, as NeMo's per-feature normalization; a single frame has zero spread
+    let stds: Vec<f32> = squares
+        .iter()
+        .map(|sum| (sum / num_frames.saturating_sub(1).max(1) as f32).sqrt() + 1e-5)
+        .collect();
+
+    for mut row in features.rows_mut() {
+        for ((value, mean), std) in row.iter_mut().zip(&means).zip(&stds) {
             *value = (*value - mean) / std;
         }
     }
@@ -245,7 +377,9 @@ fn normalize_columns(features: &mut Array2<f32>) {
 mod tests {
     use approx::assert_abs_diff_eq;
 
-    use super::{ParakeetFeatureExtractor, TranscriptionConfig};
+    use super::{
+        Array2, MelFilterbank, ParakeetFeatureExtractor, TranscriptionConfig, create_mel_filterbank,
+    };
 
     fn sine_wave(frequency_hz: f32, sample_rate: usize, num_samples: usize) -> Vec<f32> {
         (0..num_samples)
@@ -279,6 +413,38 @@ mod tests {
             }
         }
         assert!(correct_frames > 90);
+    }
+
+    #[test]
+    fn sparse_filterbank_matches_the_dense_product() {
+        let config = TranscriptionConfig::default();
+        let dense = create_mel_filterbank(config.n_fft, config.feature_size, config.sample_rate);
+        let filterbank = MelFilterbank::new(&dense);
+        // non-negative like a power spectrum and different in every bin, with frames
+        // spread over several orders of magnitude so rounding differs between them
+        let frames = 64;
+        let power = Array2::from_shape_fn((dense.ncols(), frames), |(bin, frame)| {
+            let scale = 10f32.powi(frame as i32 % 8 - 4);
+            scale * (1.0 + (bin as f32 * 0.37 + frame as f32).sin().abs() * bin as f32)
+        });
+        // the dense product the sparse filterbank replaced, on this CPU's kernels
+        let expected = dense.dot(&power);
+
+        assert_eq!(filterbank.mels(), dense.nrows());
+        let mut mels = vec![0.0f32; filterbank.mels()];
+        for (frame, spectrum) in power.columns().into_iter().enumerate() {
+            let spectrum: Vec<f32> = spectrum.to_vec();
+            filterbank.apply(&spectrum, &mut mels);
+            for (mel, sparse) in mels.iter().enumerate() {
+                let expected = expected[[mel, frame]];
+                assert!(expected > 0.0, "mel {mel} weights no bin");
+                assert_eq!(
+                    sparse.to_bits(),
+                    expected.to_bits(),
+                    "mel {mel} frame {frame}: {sparse} vs {expected}"
+                );
+            }
+        }
     }
 
     #[test]

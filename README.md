@@ -8,9 +8,10 @@ Fast [NVIDIA Parakeet TDT](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) s
 - Long-form transcription of hour-long recordings, with optional VAD
 - Token-level timestamps and confidences
 
-On an RTX 5090, the CUDA backend transcribes LibriSpeech test-clean at 1108x real
-time, 2.3x as fast as NVIDIA NeMo and 4.4x as fast as parakeet-rs, at the same
-word error rate. See [CUDA](#cuda) for the numbers.
+On an RTX 5090, the CUDA backend transcribes LibriSpeech test-clean at 1176x real
+time, 2.5x as fast as NVIDIA NeMo and 4.6x as fast as parakeet-rs, at the same
+word error rate. Through the batching queue it runs at 3370x. See [CUDA](#cuda)
+for the numbers.
 
 `scriptrs` is early: the public API is still moving.
 
@@ -21,6 +22,7 @@ The base crate exposes a single-chunk `TranscriptionPipeline`. Fast long-audio c
 - Base pipeline for short audio
 - Optional fast long-form pipeline with overlap chunking
 - Optional VAD-backed long-form region planning
+- Background queue for many short inputs, batched on CUDA
 - Native CoreML inference on macOS
 - CUDA inference on Linux (`cuda` feature)
 - Hugging Face download support with optional local model loading
@@ -133,11 +135,16 @@ time:
 
 | | Speed (x real time) | vs parakeet-rs | WER |
 |---|---|---|---|
-| scriptrs | 1108x | 4.4x | 1.93 % |
+| scriptrs | 1176x | 4.6x | 1.93 % |
 | NVIDIA NeMo | 477x | 1.9x | 1.93 % |
 | parakeet-rs 0.4.3 (ONNX Runtime) | 253x | 1x | 1.93 % |
 
-On all 44 Earnings-21 calls (39 h), long-form with the defaults runs at 2500x with
+Through the [queue](#many-short-inputs), which prepares the next inputs on the CPU
+while the GPU runs, the same set runs at 1305x one at a time with identical
+transcripts, and at 3370x in batches of up to 16 (the default). Batching changes 4
+of the 2620 transcripts by one word or punctuation mark, for 1.92 % WER.
+
+On all 44 Earnings-21 calls (39 h), long-form with the defaults runs at 2600x with
 8.24 % pooled WER; NeMo transcribing each whole call with local attention scores
 9.58 %.
 
@@ -231,6 +238,61 @@ fn load_mono_16khz_audio() -> Vec<f32> {
     Vec::new()
 }
 ```
+
+### Many short inputs
+
+To transcribe many independent inputs, such as utterances or clips, move the
+pipeline onto a background queue. A preparation thread computes the next inputs'
+features while the model runs, and on CUDA the model transcribes up to
+`QueueConfig::max_batch` waiting inputs in one pass. Results come back in the order
+the queue accepted the requests, each under the id you gave it:
+
+```rust,no_run
+use std::time::Duration;
+
+use scriptrs::{QueueError, QueuedTranscriptionRequest, TranscriptionPipeline};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let pipeline = TranscriptionPipeline::from_dir("models")?;
+    let (sender, receiver) = pipeline.into_queued()?;
+
+    let producer = std::thread::spawn(move || -> Result<(), QueueError> {
+        for (id, audio) in load_clips() {
+            let mut request = QueuedTranscriptionRequest::new(id, audio);
+            loop {
+                match sender.try_push(request) {
+                    Ok(_) => break,
+                    // the queue is at capacity; retry once the model catches up
+                    Err(QueueError::Full(rejected)) => {
+                        request = rejected;
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        // dropping the sender closes the queue once every request is done
+        Ok(())
+    });
+
+    for queued in receiver {
+        let queued = queued?;
+        println!("{}: {}", queued.id, queued.result?.text);
+    }
+    producer.join().expect("producer panicked")?;
+    Ok(())
+}
+
+fn load_clips() -> Vec<(String, Vec<f32>)> {
+    Vec::new()
+}
+```
+
+`QueueConfig` sets the queue's capacity (64 by default) and the largest batch (16
+by default); pass it with `into_queued_with_config`. At `max_batch: 1` each result
+is exactly what `run` gives. A failed batch reruns its inputs one at a time, so a
+bad input fails only its own request. Core ML bundles run a batch's inputs one
+after another.
 
 ### Long audio
 

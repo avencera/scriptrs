@@ -14,7 +14,7 @@ use crate::cuda::kernels::{
     CudaRuntime, DecodeFilter, DecodeKernels, DecodeOutput, DecodeShape, DecodeState,
     EncoderKernels, LstmInput, LstmState, LstmWeights, MAX_FILTER_TOP_K, Projection,
 };
-use crate::cuda::{linear, upload, upload_host, zeros};
+use crate::cuda::{Direction, HostStaging, linear, upload, upload_host, zeros};
 use crate::decode::RawTranscription;
 use crate::error::TranscriptionError;
 use crate::native::spec::ParakeetSpec;
@@ -45,6 +45,9 @@ pub(crate) struct CudaDecoder {
     /// Joint outputs: classes, then one logit per duration
     outputs: usize,
     max_symbols: usize,
+    /// Most frames one step moves a cursor: the longest duration, or 1, which a
+    /// blank or a frame's last symbol always moves
+    max_advance: usize,
     embed: DeviceTensor,
     lstm: Vec<LstmLayer>,
     joint_enc: Linear,
@@ -88,6 +91,18 @@ pub(crate) struct DecodeWorkspace {
     /// `[1]`, the language filter's top-K width, 0 for none; a buffer rather than a
     /// launch argument so captured graphs follow [`CudaDecoder::set_language`]
     filter_top_k: CudaSlice<u32>,
+    host: DecodeReadback,
+}
+
+/// Pinned host copies of the cursors and outputs the host reads back
+struct DecodeReadback {
+    frame: HostStaging<u32>,
+    counts: HostStaging<u32>,
+    faults: HostStaging<u32>,
+    tokens: HostStaging<u32>,
+    token_frames: HostStaging<u32>,
+    token_durations: HostStaging<u32>,
+    confidences: HostStaging<f32>,
 }
 
 impl DecodeWorkspace {
@@ -167,6 +182,7 @@ impl CudaDecoder {
                     bias: upload(runtime, file, &format!("{prefix}.bias"), &[out])?,
                 })
             };
+        let max_advance = spec.durations.iter().copied().max().unwrap_or(0).max(1);
         let durations: Vec<u32> = spec
             .durations
             .iter()
@@ -184,6 +200,7 @@ impl CudaDecoder {
             classes,
             outputs: spec.joint.outputs,
             max_symbols: spec.max_symbols,
+            max_advance,
             embed: upload(
                 runtime,
                 file,
@@ -210,6 +227,7 @@ impl CudaDecoder {
         let capacity = frames.max(1) * self.max_symbols;
         let state = |len: usize| zeros::<u32>(stream, len);
         let lstm_state = batch * self.lstm.len() * self.hidden;
+        let readback = |len: usize| HostStaging::<u32>::new(stream, len, Direction::Download);
         Ok(DecodeWorkspace {
             batch,
             frames,
@@ -235,6 +253,15 @@ impl CudaDecoder {
             confidences: zeros(stream, batch * capacity)?,
             allowed: state(self.classes)?,
             filter_top_k: state(1)?,
+            host: DecodeReadback {
+                frame: readback(batch)?,
+                counts: readback(batch)?,
+                faults: readback(batch)?,
+                tokens: readback(batch * capacity)?,
+                token_frames: readback(batch * capacity)?,
+                token_durations: readback(batch * capacity)?,
+                confidences: HostStaging::new(stream, batch * capacity, Direction::Download)?,
+            },
         })
     }
 
@@ -467,17 +494,25 @@ impl CudaDecoder {
         Ok(())
     }
 
-    /// Whether every row has reached its last frame; syncs the stream
-    pub(crate) fn finished(
+    /// Steps every row still needs at least, given each row's frame cursor: a step
+    /// moves a cursor at most `max_advance` frames
+    fn steps_left(&self, lens: &[usize], frames: impl IntoIterator<Item = usize>) -> usize {
+        lens.iter()
+            .zip(frames)
+            .map(|(len, frame)| len.saturating_sub(frame).div_ceil(self.max_advance))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// [`Self::steps_left`] at the device's current cursors; waits for the stream
+    fn steps_left_on_device(
         &self,
         runtime: &CudaRuntime,
-        ws: &DecodeWorkspace,
-    ) -> Result<bool, TranscriptionError> {
-        let frames = runtime.stream().clone_dtoh(&ws.frame)?;
-        Ok(frames
-            .iter()
-            .zip(&ws.host_lens)
-            .all(|(frame, len)| *frame as usize >= *len))
+        ws: &mut DecodeWorkspace,
+    ) -> Result<usize, TranscriptionError> {
+        ws.host.frame.download(runtime.stream(), &ws.frame)?;
+        let frames = ws.host.frame.read()?;
+        Ok(self.steps_left(&ws.host_lens, frames.iter().map(|frame| *frame as usize)))
     }
 
     /// Runs steps eagerly, `steps_per_check` at a time, until every row finishes
@@ -494,6 +529,11 @@ impl CudaDecoder {
 
     /// Runs `advance` (which must run `steps` decode steps) until every row
     /// finishes, failing if the decode does not end within its step bound
+    ///
+    /// Between cursor reads, it queues every `advance` the cursors prove some row
+    /// still needs ([`Self::steps_left`]), so the GPU runs them back to back and
+    /// only waits on the host when the decode may be done. A row that finishes
+    /// early idles through the rest, as it would on any batch
     pub(crate) fn run_with(
         &self,
         runtime: &CudaRuntime,
@@ -501,29 +541,46 @@ impl CudaDecoder {
         steps: usize,
         mut advance: impl FnMut(&mut DecodeWorkspace) -> Result<(), TranscriptionError>,
     ) -> Result<(), TranscriptionError> {
+        let steps = steps.max(1);
         let bound = ws.max_steps(self.max_symbols);
         let mut done = 0;
-        while !self.finished(runtime, ws)? {
-            if done >= bound {
-                return Err(TranscriptionError::InvalidModelOutput(format!(
-                    "decode did not finish within {bound} steps"
-                )));
+        // `start` put every cursor on frame 0
+        let mut needed = self.steps_left(&ws.host_lens, std::iter::repeat(0));
+        while needed > 0 {
+            for _ in 0..needed.div_ceil(steps) {
+                if done >= bound {
+                    return Err(TranscriptionError::InvalidModelOutput(format!(
+                        "decode did not finish within {bound} steps"
+                    )));
+                }
+                advance(ws)?;
+                done += steps;
             }
-            advance(ws)?;
-            done += steps.max(1);
+            needed = self.steps_left_on_device(runtime, ws)?;
         }
         Ok(())
     }
 
-    /// Each row's emitted tokens; syncs the stream
+    /// Each row's emitted tokens; waits for the stream
     pub(crate) fn output(
         &self,
         runtime: &CudaRuntime,
-        ws: &DecodeWorkspace,
+        ws: &mut DecodeWorkspace,
     ) -> Result<Vec<RawTranscription>, TranscriptionError> {
         let stream = runtime.stream();
-        let counts = stream.clone_dtoh(&ws.counts)?;
-        let faults = stream.clone_dtoh(&ws.faults)?;
+        let host = &mut ws.host;
+        // queue every copy, so the host waits for the stream once
+        host.counts.download(stream, &ws.counts)?;
+        host.faults.download(stream, &ws.faults)?;
+        host.tokens.download(stream, &ws.tokens)?;
+        host.token_frames.download(stream, &ws.token_frames)?;
+        host.token_durations.download(stream, &ws.token_durations)?;
+        host.confidences.download(stream, &ws.confidences)?;
+        // the copies run in order on one stream, so once the last has landed the
+        // other reads below find their copies done and do not wait again
+        let confidences = host.confidences.read()?;
+        let counts = host.counts.read()?;
+        let faults = host.faults.read()?;
         if let Some(row) = faults.iter().position(|fault| *fault != 0) {
             return Err(TranscriptionError::InvalidModelOutput(format!(
                 "joint logits for batch row {row} were not finite"
@@ -536,10 +593,9 @@ impl CudaDecoder {
             )));
         }
 
-        let tokens = stream.clone_dtoh(&ws.tokens)?;
-        let frames = stream.clone_dtoh(&ws.token_frames)?;
-        let durations = stream.clone_dtoh(&ws.token_durations)?;
-        let confidences = stream.clone_dtoh(&ws.confidences)?;
+        let tokens = host.tokens.read()?;
+        let frames = host.token_frames.read()?;
+        let durations = host.token_durations.read()?;
         Ok(counts
             .iter()
             .enumerate()
@@ -702,7 +758,9 @@ mod tests {
                     .workspace(&runtime, batch, mel_frames)
                     .expect("encoder workspace");
                 encoder
-                    .set_input(&runtime, &mut encoder_ws, &time_major, &mel_lens)
+                    .set_input(&runtime, &mut encoder_ws, &mel_lens, |mel| {
+                        mel.copy_from_slice(&time_major)
+                    })
                     .expect("input");
                 encoder.enqueue(&runtime, &mut encoder_ws).expect("encoder");
                 assert_eq!(encoder_ws.frames(), frames, "encoder frames");
@@ -1106,7 +1164,7 @@ mod tests {
             assert_ne!(decided.faults[row], 0, "non-finite row {row} did not fault");
         }
         assert!(
-            decoder.output(&runtime, &ws).is_err(),
+            decoder.output(&runtime, &mut ws).is_err(),
             "faulted rows reached the output"
         );
 

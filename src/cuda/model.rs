@@ -238,18 +238,6 @@ impl CudaModel {
         let longest = lens.iter().copied().max().unwrap_or(0).max(1);
         let mel_frames = longest.div_ceil(MEL_BUCKET) * MEL_BUCKET;
         let batch = chunks.len();
-        // time-major `[batch, mel_frames, features]`, zero past each chunk's frames
-        let mut mel = vec![0.0f32; batch * mel_frames * features];
-        for (row, chunk) in chunks.iter().enumerate() {
-            let start = row * mel_frames * features;
-            for (frame, values) in chunk.features().rows().into_iter().enumerate() {
-                let offset = start + frame * features;
-                for (slot, value) in mel[offset..offset + features].iter_mut().zip(values) {
-                    *slot = *value;
-                }
-            }
-        }
-
         let mut shapes = engine.shapes.lock().map_err(|_| {
             TranscriptionError::InvalidModelOutput("the CUDA model lock was poisoned".to_owned())
         })?;
@@ -272,7 +260,7 @@ impl CudaModel {
         let shape = shapes.get(key).ok_or_else(|| {
             TranscriptionError::InvalidModelOutput("a cached CUDA shape went missing".to_owned())
         })?;
-        engine.transcribe(shape, &mel, &lens, policy.language_mask().as_ref())
+        engine.transcribe(shape, chunks, &lens, policy.language_mask().as_ref())
     }
 }
 
@@ -295,13 +283,28 @@ impl Engine {
     fn transcribe(
         &self,
         shape: &mut Shape,
-        mel: &[f32],
+        chunks: &[EncoderChunk<'_>],
         lens: &[usize],
         language: Option<&LanguageMask>,
     ) -> Result<Vec<ChunkDecode>, TranscriptionError> {
         let runtime = &self.runtime;
+        let row_len = shape.encoder.mel_frames() * self.features;
         self.encoder
-            .set_input(runtime, &mut shape.encoder, mel, lens)?;
+            .set_input(runtime, &mut shape.encoder, lens, |mel| {
+                // time-major `[batch, mel_frames, features]`, zero past each chunk's frames
+                for (row, chunk) in mel.chunks_exact_mut(row_len).zip(chunks) {
+                    let (valid, padding) = row.split_at_mut(chunk.frames() * self.features);
+                    match chunk.features().as_slice() {
+                        Some(values) => valid.copy_from_slice(values),
+                        None => {
+                            for (slot, value) in valid.iter_mut().zip(chunk.features()) {
+                                *slot = *value;
+                            }
+                        }
+                    }
+                    padding.fill(0.0);
+                }
+            })?;
         match &shape.encoder_graph {
             Some(graph) => graph.launch()?,
             None => {
@@ -353,7 +356,7 @@ impl Engine {
 
         Ok(self
             .decoder
-            .output(runtime, &shape.decoder)?
+            .output(runtime, &mut shape.decoder)?
             .into_iter()
             .map(|raw| ChunkDecode { raw, top_k: None })
             .collect())
