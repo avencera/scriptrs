@@ -68,14 +68,19 @@ scriptrs = { version = "0.3", features = ["vad"] }
 
 With the default `online` feature, `scriptrs` can resolve models automatically:
 
-- it downloads the runtime bundle from `avencera/scriptrs-models`
+- Core ML bundles come from `avencera/scriptrs-models`
+- native CUDA weights come from
+  [`avencera/parakeet-tdt-0.6b-v2-cuda`](https://huggingface.co/avencera/parakeet-tdt-0.6b-v2-cuda)
+  and [`avencera/parakeet-tdt-0.6b-v3-cuda`](https://huggingface.co/avencera/parakeet-tdt-0.6b-v3-cuda),
+  and the native Silero VAD from
+  [`avencera/silero-vad-v5-safetensors`](https://huggingface.co/avencera/silero-vad-v5-safetensors)
 
 You can force a local bundle when needed:
 
 - `SCRIPTRS_MODELS_DIR=/path/to/models` forces a local bundle
 
-Online downloads use the immutable `63f6f9cbce43e5561c219229896f86f20c0eb660`
-snapshot of `avencera/scriptrs-models`.
+Each download uses an immutable snapshot pinned in the release, such as
+`63f6f9cbce43e5561c219229896f86f20c0eb660` of `avencera/scriptrs-models`.
 
 ## Local model layout
 
@@ -114,8 +119,9 @@ NeMo's. It supports the v3 language filter and, with `vad`, VAD-backed long-form
 planning.
 
 It loads native weights rather than Core ML models. With the default `online`
-feature, `from_pretrained_native` downloads them from the same pinned
-`avencera/scriptrs-models` snapshot:
+feature, `from_pretrained_native` downloads them from a pinned snapshot of
+[`avencera/parakeet-tdt-0.6b-v2-cuda`](https://huggingface.co/avencera/parakeet-tdt-0.6b-v2-cuda)
+or [`avencera/parakeet-tdt-0.6b-v3-cuda`](https://huggingface.co/avencera/parakeet-tdt-0.6b-v3-cuda):
 
 ```rust,ignore
 use scriptrs::{ModelBundle, ParakeetDeployment, TranscriptionPipeline};
@@ -126,7 +132,9 @@ let result = pipeline.run(&audio)?;
 ```
 
 With `vad`, `from_pretrained_native_long_form` also downloads the Silero VAD
-weights. To manage the files yourself, `dev-tools/nemo/export_native.py` writes
+weights from
+[`avencera/silero-vad-v5-safetensors`](https://huggingface.co/avencera/silero-vad-v5-safetensors).
+To manage the files yourself, `dev-tools/nemo/export_native.py` writes
 them from the NeMo checkpoints in this layout, and `from_native_dir` loads them:
 
 ```text

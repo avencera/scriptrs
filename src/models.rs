@@ -4,6 +4,8 @@ use crate::deployment::ParakeetDeployment;
 use crate::error::TranscriptionError;
 use crate::vocab::Vocabulary;
 
+#[cfg(all(feature = "online", feature = "cuda"))]
+use crate::deployment::ParakeetVersion;
 #[cfg(feature = "online")]
 use hf_hub::{Repo, RepoType};
 
@@ -234,6 +236,39 @@ impl ModelBundle {
         }
     }
 
+    /// Native bundle from files resolved one at a time, such as snapshots of the
+    /// separate Hugging Face repositories for Parakeet and Silero VAD
+    ///
+    /// The root is the weights' directory. Without `vad_path`, the VAD path keeps
+    /// the [`Self::from_native_dir`] layout under that root, so a long-form run
+    /// reports it missing.
+    #[cfg(all(feature = "online", feature = "cuda"))]
+    fn from_native_files(
+        weights_path: PathBuf,
+        vocab_path: PathBuf,
+        vad_path: Option<PathBuf>,
+        deployment: ParakeetDeployment,
+    ) -> Self {
+        let root = weights_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let mut bundle = Self::from_native_dir(root, deployment);
+        if let RuntimeBundle::Native(layout) = &mut bundle.runtime {
+            layout.weights_path = weights_path;
+            layout.vocab_path = vocab_path;
+
+            #[cfg(feature = "vad")]
+            if let Some(vad_path) = vad_path {
+                layout.vad_path = vad_path;
+            }
+        }
+
+        #[cfg(not(feature = "vad"))]
+        let _ = vad_path;
+        bundle
+    }
+
     /// Set the precision of the CUDA encoder's matrix multiplies, FP16 by default
     ///
     /// [`Precision::Tf32`] keeps the weights and operands in FP32, out of FP16's
@@ -368,10 +403,11 @@ impl ModelBundle {
     #[cfg(all(feature = "online", feature = "cuda"))]
     /// Download native CUDA weights for a deployment from Hugging Face
     ///
-    /// This resolves `model.safetensors` and the vocabulary from the pinned
-    /// `avencera/scriptrs-models` snapshot, then behaves like
-    /// [`Self::from_native_dir`]. Set `SCRIPTRS_MODELS_DIR` to force a local
-    /// native bundle.
+    /// This resolves `model.safetensors` and the vocabulary from a pinned
+    /// snapshot of the deployment's model repository,
+    /// `avencera/parakeet-tdt-0.6b-v2-cuda` or `avencera/parakeet-tdt-0.6b-v3-cuda`,
+    /// then behaves like [`Self::from_native_dir`]. Set `SCRIPTRS_MODELS_DIR` to
+    /// force a local native bundle.
     pub fn from_pretrained_native(
         deployment: ParakeetDeployment,
     ) -> Result<Self, hf_hub::api::sync::ApiError> {
@@ -384,7 +420,9 @@ impl ModelBundle {
     #[cfg(all(feature = "online", feature = "cuda", feature = "vad"))]
     /// Download native CUDA weights and the native Silero VAD weights
     ///
-    /// Set `SCRIPTRS_MODELS_DIR` to force a local native bundle.
+    /// The VAD weights come from a pinned snapshot of
+    /// `avencera/silero-vad-v5-safetensors`. Set `SCRIPTRS_MODELS_DIR` to force a
+    /// local native bundle.
     pub fn from_pretrained_native_long_form(
         deployment: ParakeetDeployment,
     ) -> Result<Self, hf_hub::api::sync::ApiError> {
@@ -400,6 +438,27 @@ const HF_REPO: HuggingFaceRepository = HuggingFaceRepository("avencera/scriptrs-
 #[cfg(feature = "online")]
 const HF_REVISION: HuggingFaceRevision =
     HuggingFaceRevision("63f6f9cbce43e5561c219229896f86f20c0eb660");
+
+// native CUDA weights live in one repository per model, named after the model, so
+// each is listed under its base model on Hugging Face and found by searching for it
+#[cfg(all(feature = "online", feature = "cuda"))]
+const NATIVE_V2_SOURCE: HuggingFaceModelSource = HuggingFaceModelSource {
+    repository: HuggingFaceRepository("avencera/parakeet-tdt-0.6b-v2-cuda"),
+    revision: HuggingFaceRevision("ff259a9006fcd3fe19077ec5b76165c7703a7245"),
+};
+#[cfg(all(feature = "online", feature = "cuda"))]
+const NATIVE_V3_SOURCE: HuggingFaceModelSource = HuggingFaceModelSource {
+    repository: HuggingFaceRepository("avencera/parakeet-tdt-0.6b-v3-cuda"),
+    revision: HuggingFaceRevision("01ffcdb65d1e0087f4f12bbe87f5413f9b429626"),
+};
+#[cfg(all(feature = "online", feature = "cuda", feature = "vad"))]
+const NATIVE_VAD_SOURCE: HuggingFaceModelSource = HuggingFaceModelSource {
+    repository: HuggingFaceRepository("avencera/silero-vad-v5-safetensors"),
+    revision: HuggingFaceRevision("bc58b9e061a5cb07bc3ec839df301647753dcc59"),
+};
+/// Weight file name in each native model repository
+#[cfg(all(feature = "online", feature = "cuda"))]
+const NATIVE_HUB_WEIGHTS: &str = "model.safetensors";
 
 #[cfg(feature = "online")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -425,6 +484,14 @@ impl HuggingFaceModelSource {
         }
     }
 
+    #[cfg(feature = "cuda")]
+    fn native(deployment: &ParakeetDeployment) -> Self {
+        match deployment.version() {
+            ParakeetVersion::V2 => NATIVE_V2_SOURCE,
+            ParakeetVersion::V3 => NATIVE_V3_SOURCE,
+        }
+    }
+
     fn api_repo(self, api: &hf_hub::api::sync::Api) -> hf_hub::api::sync::ApiRepo {
         api.repo(Repo::with_revision(
             self.repository.0.to_owned(),
@@ -440,6 +507,7 @@ impl HuggingFaceModelSource {
 /// directory or want to prefetch assets before building a pipeline.
 #[cfg(feature = "online")]
 pub struct ModelManager {
+    api: hf_hub::api::sync::Api,
     repo: hf_hub::api::sync::ApiRepo,
 }
 
@@ -461,6 +529,7 @@ impl ModelManager {
     fn from_api(api: hf_hub::api::sync::Api) -> Self {
         Self {
             repo: HuggingFaceModelSource::runtime().api_repo(&api),
+            api,
         }
     }
 
@@ -503,28 +572,42 @@ impl ModelManager {
 
     /// Ensure a deployment's native CUDA weights are cached locally
     ///
-    /// With `include_vad`, the native Silero VAD weights are cached too. The
-    /// returned [`ModelBundle`] is a native bundle rooted at the snapshot directory.
+    /// The weights come from the deployment's model repository, such as
+    /// `avencera/parakeet-tdt-0.6b-v3-cuda`, and with `include_vad` the Silero VAD
+    /// weights from `avencera/silero-vad-v5-safetensors`, each at a pinned revision.
+    /// The returned [`ModelBundle`] is a native bundle rooted at the Parakeet
+    /// snapshot directory.
     #[cfg(feature = "cuda")]
     pub fn ensure_native(
         &self,
         deployment: ParakeetDeployment,
         include_vad: bool,
     ) -> Result<ModelBundle, hf_hub::api::sync::ApiError> {
-        let layout = deployment.layout();
-        let mut files = vec![
-            layout.vocab().to_owned(),
-            deployment.native_weights_path().to_owned(),
-        ];
-        #[cfg(feature = "vad")]
-        if include_vad {
-            files.push(NATIVE_VAD_PATH.to_owned());
-        }
-        #[cfg(not(feature = "vad"))]
-        let _ = include_vad;
+        let repo = HuggingFaceModelSource::native(&deployment).api_repo(&self.api);
+        let weights_path = repo.get(NATIVE_HUB_WEIGHTS)?;
+        let vocab_path = repo.get(native_hub_vocab(&deployment))?;
 
-        let root = self.download_repo_layout(&self.repo, &files)?;
-        Ok(ModelBundle::from_native_dir(root, deployment))
+        #[cfg(feature = "vad")]
+        let vad_path = match include_vad {
+            true => Some(
+                NATIVE_VAD_SOURCE
+                    .api_repo(&self.api)
+                    .get(NATIVE_HUB_WEIGHTS)?,
+            ),
+            false => None,
+        };
+        #[cfg(not(feature = "vad"))]
+        let vad_path = {
+            let _ = include_vad;
+            None
+        };
+
+        Ok(ModelBundle::from_native_files(
+            weights_path,
+            vocab_path,
+            vad_path,
+            deployment,
+        ))
     }
 
     fn download_repo_layout(
@@ -545,6 +628,14 @@ impl ModelManager {
         };
         Ok(snapshot_root_from_cached_file(&cached_path, relative_path))
     }
+}
+
+/// Vocabulary file name at the root of a native model repository, the file name of
+/// the deployment's vocabulary in the local layout
+#[cfg(all(feature = "online", feature = "cuda"))]
+fn native_hub_vocab(deployment: &ParakeetDeployment) -> &'static str {
+    let vocab = deployment.layout().vocab();
+    vocab.rsplit_once('/').map_or(vocab, |(_, name)| name)
 }
 
 #[cfg(feature = "online")]
