@@ -8,9 +8,9 @@ Fast [NVIDIA Parakeet TDT](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) s
 - Long-form transcription of hour-long recordings, with optional VAD
 - Token-level timestamps and confidences
 
-On an RTX 5090, the CUDA backend transcribes LibriSpeech test-clean at 1176x real
-time, 2.5x as fast as NVIDIA NeMo and 4.6x as fast as parakeet-rs, at the same
-word error rate. Through the batching queue it runs at 3370x. See [CUDA](#cuda)
+On an RTX 5090, the CUDA backend transcribes LibriSpeech test-clean at 1534x real
+time, 3.2x as fast as NVIDIA NeMo and 6.1x as fast as parakeet-rs, at the same
+word error rate. Through the batching queue it runs at 4770x. See [CUDA](#cuda)
 for the numbers.
 
 `scriptrs` is early: the public API is still moving.
@@ -135,16 +135,16 @@ time:
 
 | | Speed (x real time) | vs parakeet-rs | WER |
 |---|---|---|---|
-| scriptrs | 1176x | 4.6x | 1.93 % |
+| scriptrs | 1534x | 6.1x | 1.93 % |
 | NVIDIA NeMo | 477x | 1.9x | 1.93 % |
 | parakeet-rs 0.4.3 (ONNX Runtime) | 253x | 1x | 1.93 % |
 
 Through the [queue](#many-short-inputs), which prepares the next inputs on the CPU
-while the GPU runs, the same set runs at 1305x one at a time with identical
-transcripts, and at 3370x in batches of up to 16 (the default). Batching changes 4
-of the 2620 transcripts by one word or punctuation mark, for 1.92 % WER.
+while the GPU runs, the same set runs at 1761x one at a time with identical
+transcripts, and at 4770x in batches of up to 16 (the default). Batching changes 2
+of the 2620 transcripts by one word or punctuation mark, and WER stays 1.93 %.
 
-On all 44 Earnings-21 calls (39 h), long-form with the defaults runs at 2600x with
+On all 44 Earnings-21 calls (39 h), long-form with the defaults runs at 3630x with
 8.24 % pooled WER; NeMo transcribing each whole call with local attention scores
 9.58 %.
 
@@ -172,11 +172,11 @@ accuracy and speed on dense or far-field speech:
 
 | Set | Overlap WER | VAD WER | Overlap speed | VAD speed |
 |---|---:|---:|---:|---:|
-| Sparse speech, 24 % speech (4.2 h) | 14.8 % | **3.1 %** | 3180x | **3880x** |
-| Earnings-21 earnings calls | **8.2 %** | 8.6 % | **3440x** | 2040x |
-| AMI meetings, headset mix | 21.5 % | **21.2 %** | **3280x** | 1810x |
-| AMI meetings, far-field microphone | **23.2 %** | 26.6 % | **3270x** | 1820x |
-| CHiME-6 dinner parties | **44.0 %** | 54.8 % | **3310x** | 2000x |
+| Sparse speech, 24 % speech (4.2 h) | 14.8 % | **3.1 %** | 3430x | **3990x** |
+| Earnings-21 earnings calls | **8.2 %** | 8.6 % | **3630x** | 2030x |
+| AMI meetings, headset mix | 21.5 % | **21.2 %** | **3480x** | 1800x |
+| AMI meetings, far-field microphone | **23.2 %** | 26.6 % | **3480x** | 1790x |
+| CHiME-6 dinner parties | **44.0 %** | 54.8 % | **3490x** | 1970x |
 
 The sparse set is LibriSpeech test-clean utterances separated by 15 to 75 s of
 film music, effects, ambience and low-level noise. VAD runs use the default 0.5
@@ -199,15 +199,17 @@ On an RTX 5090 with Parakeet v3 (speed in x real time, then WER):
 
 | | FP16 (default) | TF32 | FP32 |
 |---|---|---|---|
-| LibriSpeech test-clean, one utterance at a time | 1416x, 1.93 % | 1104x, 1.93 % | — |
-| Earnings-21, long-form | 3443x, 8.24 % | 2524x, 8.24 % | — |
-| FLEURS de, es, fr, it, nl, pt (15.8 h) | 1671x, 4.57 % | 1344x, 4.57 % | 917x, 4.57 % |
-| MLS es, fr, it, pt (15.8 h) | 1740x, 6.25 % | 1407x, 6.26 % | 944x, 6.26 % |
+| LibriSpeech test-clean, one utterance at a time | 1534x, 1.93 % | 1179x, 1.93 % | — |
+| LibriSpeech test-clean, queue in batches of 16 | 4767x, 1.93 % | 3364x, 1.92 % | — |
+| Earnings-21, long-form | 3633x, 8.24 % | 2633x, 8.24 % | — |
+| FLEURS de, es, fr, it, nl, pt (15.8 h) | 1839x, 4.57 % | 1450x, 4.57 % | 966x, 4.57 % |
+| MLS es, fr, it, pt (15.8 h) | 1921x, 6.25 % | 1524x, 6.26 % | 996x, 6.26 % |
 
 FLEURS and MLS run one utterance at a time with automatic language selection and
 are scored with Whisper's basic normalizer. On each of their ten language sets,
-FP16 is within one word error of TF32. On LibriSpeech, FP16 gives the same
-transcripts as TF32.
+FP16 is within one word error of TF32. On LibriSpeech one utterance at a time,
+FP16 gives the same transcripts as TF32. Batching changes a few transcripts in
+either precision, so the queued FP16 and TF32 transcripts differ slightly.
 
 ## Usage
 
