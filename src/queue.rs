@@ -12,7 +12,7 @@ use std::any::Any;
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{
     Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel,
 };
@@ -228,9 +228,13 @@ impl TranscriptionPipeline {
 
         let (request_tx, request_rx) = sync_channel(queue.capacity);
         let (result_tx, result_rx) = sync_channel(queue.capacity);
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
         let worker = thread::Builder::new()
             .name("scriptrs-queue".to_owned())
-            .spawn(move || run_worker(&self, &config, queue, request_rx, &result_tx))
+            .spawn(move || {
+                run_worker(&self, &config, queue, request_rx, &result_tx, &worker_stop);
+            })
             .map_err(QueueError::WorkerStart)?;
         let sender = QueueSender {
             request_tx,
@@ -241,6 +245,7 @@ impl TranscriptionPipeline {
             result_rx,
             worker: Some(worker),
             state: ReceiverState::Open,
+            stop,
         };
         Ok((sender, receiver))
     }
@@ -300,13 +305,22 @@ enum ReceiverState {
 /// The receive calls take `&mut self` so the receiver can join the worker once
 /// and then report the same end state on every later call
 ///
-/// Dropping the receiver stops the model once it next has a result to send. The
-/// preparation thread stops at the next push, which is accepted and dropped, and
-/// later pushes report [`QueueError::WorkerGone`]
+/// Dropping the receiver stops the worker once its current batch is done, or
+/// within about 50 ms when it is idle, dropping the requests still queued; later
+/// pushes report [`QueueError::WorkerGone`]
 pub struct QueueReceiver {
     result_rx: Receiver<QueuedTranscriptionResult>,
     worker: Option<JoinHandle<()>>,
     state: ReceiverState,
+    /// Set when the receiver drops; shared with the worker
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for QueueReceiver {
+    fn drop(&mut self) {
+        // the worker is not joined, so dropping the receiver never blocks
+        self.stop.store(true, Ordering::Release);
+    }
 }
 
 impl fmt::Debug for QueueReceiver {
@@ -439,19 +453,37 @@ struct Prepared {
     chunk: Result<PreparedChunk, TranscriptionError>,
 }
 
-/// Prepares requests on one thread and transcribes them on this one until the
-/// senders close or the receiver goes away
+/// Longest the preparation thread waits for a request before it checks whether
+/// the worker should stop
 ///
-/// A panic on either thread ends the scope with a panic, which the receiver
-/// reports: a preparation panic closes `prepared_rx` for the model loop, and the
-/// model loop drops `prepared_rx` when it ends, so preparation stops at its next
-/// send
+/// A blocked receive cannot be woken while a sender lives, so preparation waits
+/// in slices to notice a dropped receiver or a stopped model loop
+const STOP_POLL: Duration = Duration::from_millis(50);
+
+/// Sets the stop flag when dropped, so the model loop signals preparation however
+/// it ends, including by panic
+struct StopOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// Prepares requests on one thread and transcribes them on this one until the
+/// senders close, the receiver goes away, or either thread panics
+///
+/// The scope joins both threads before it returns or rethrows a panic, so each
+/// thread's exit must wake the other: preparation dropping `prepared_tx` ends the
+/// model loop's receive, and the model loop ending sets `stop` and drops
+/// `prepared_rx`, which ends preparation within [`STOP_POLL`] or at its next send
 fn run_worker(
     pipeline: &TranscriptionPipeline,
     config: &TranscriptionConfig,
     queue: QueueConfig,
     request_rx: Receiver<(QueuedTranscriptionJobId, QueuedTranscriptionRequest)>,
     result_tx: &SyncSender<QueuedTranscriptionResult>,
+    stop: &AtomicBool,
 ) {
     // the model drains up to a batch of prepared inputs while the next batch is
     // prepared, which bounds the features held in memory
@@ -461,7 +493,12 @@ fn run_worker(
             .name("scriptrs-queue-prep".to_owned())
             .spawn_scoped(scope, move || {
                 let preparer = TranscriptionPipeline::chunk_preparer(config);
-                for (job_id, request) in request_rx {
+                while !stop.load(Ordering::Acquire) {
+                    let (job_id, request) = match request_rx.recv_timeout(STOP_POLL) {
+                        Ok(next) => next,
+                        Err(RecvTimeoutError::Timeout) => continue,
+                        Err(RecvTimeoutError::Disconnected) => break,
+                    };
                     let prepared = Prepared {
                         job_id,
                         samples: request.audio.len(),
@@ -475,6 +512,7 @@ fn run_worker(
             })
             .expect("spawning the queue's preparation thread");
 
+        let _stop_preparation = StopOnDrop(stop);
         transcribe_prepared(pipeline, config, queue.max_batch, prepared_rx, result_tx);
     });
 }
@@ -483,8 +521,7 @@ fn run_worker(
 /// ends or the receiver goes away
 ///
 /// `prepared_rx` is taken by value so it drops as soon as this loop ends, by
-/// return or by panic. The scope joins the preparation thread before it returns
-/// or rethrows, and that thread would otherwise block forever on a full channel
+/// return or by panic, which wakes preparation if it is blocked on a full channel
 fn transcribe_prepared(
     pipeline: &TranscriptionPipeline,
     config: &TranscriptionConfig,

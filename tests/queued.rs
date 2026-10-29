@@ -257,21 +257,40 @@ fn edit_distance(a: &[u32], b: &[u32]) -> usize {
     previous[b.len()]
 }
 
-/// Dropping the receiver stops the worker at its next result, after which pushes
-/// report that the worker is gone
+/// Dropping the receiver stops the worker, both while it is idle, waiting on a
+/// sender that is still alive, and while it is transcribing; pushes then report
+/// that the worker is gone
 #[test]
 #[ignore = "needs a CUDA GPU, the native weights and LibriSpeech; `just gpu-parity` runs it on gpu0"]
 fn gpu_dropping_the_receiver_stops_the_worker() {
     let (id, audio) = utterances().swap_remove(0);
+
+    // idle: nothing was ever pushed, so only the receiver's drop can stop it
     let (sender, receiver) = pipeline().into_queued().expect("queue");
     drop(receiver);
+    thread::sleep(Duration::from_secs(2));
+    assert!(
+        matches!(
+            sender.try_push(QueuedTranscriptionRequest::new(id.clone(), audio.clone())),
+            Err(QueueError::WorkerGone)
+        ),
+        "the idle worker kept running"
+    );
 
+    // busy: the receiver goes away while requests are queued
+    let (sender, receiver) = pipeline().into_queued().expect("queue");
+    for _ in 0..4 {
+        sender
+            .try_push(QueuedTranscriptionRequest::new(id.clone(), audio.clone()))
+            .expect("push");
+    }
+    drop(receiver);
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         match sender.try_push(QueuedTranscriptionRequest::new(id.clone(), audio.clone())) {
             Err(QueueError::WorkerGone) => break,
             Ok(_) | Err(QueueError::Full(_)) => {
-                assert!(Instant::now() < deadline, "the worker kept running");
+                assert!(Instant::now() < deadline, "the busy worker kept running");
                 thread::sleep(Duration::from_millis(10));
             }
             Err(error) => panic!("push failed: {error}"),
