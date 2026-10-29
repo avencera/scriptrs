@@ -4,13 +4,13 @@ Fast [NVIDIA Parakeet TDT](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) s
 
 - Parakeet TDT 0.6B v2 (English) and v3 (25 European languages)
 - Core ML on macOS
-- Native CUDA on Linux, with no ONNX Runtime or PyTorch (experimental, `cuda` feature)
+- Native CUDA on Linux, with no ONNX Runtime or PyTorch (`cuda` feature)
 - Long-form transcription of hour-long recordings, with optional VAD
 - Token-level timestamps and confidences
 
 On an RTX 5090, the CUDA backend transcribes LibriSpeech test-clean at 1108x real
 time, 2.3x as fast as NVIDIA NeMo and 4.4x as fast as parakeet-rs, at the same
-word error rate. See [CUDA](#cuda-experimental) for the numbers.
+word error rate. See [CUDA](#cuda) for the numbers.
 
 `scriptrs` is early: the public API is still moving.
 
@@ -22,7 +22,7 @@ The base crate exposes a single-chunk `TranscriptionPipeline`. Fast long-audio c
 - Optional fast long-form pipeline with overlap chunking
 - Optional VAD-backed long-form region planning
 - Native CoreML inference on macOS
-- Experimental CUDA inference on Linux (`cuda` feature)
+- CUDA inference on Linux (`cuda` feature)
 - Hugging Face download support with optional local model loading
 
 ## What it does not do yet
@@ -95,7 +95,7 @@ models/
 ```
 
 
-## CUDA (experimental)
+## CUDA
 
 The `cuda` feature runs Parakeet on an NVIDIA GPU with no ONNX Runtime or
 PyTorch. It is built from this repository only for now. It supports the v3
@@ -131,11 +131,11 @@ shorter overlaps lose accuracy on long recordings.
 On an RTX 5090, Parakeet v3 on LibriSpeech test-clean (5.4 h), one utterance at a
 time:
 
-| | Speed (x real time) | WER |
-|---|---|---|
-| scriptrs | 1108x | 1.93 % |
-| NVIDIA NeMo | 477x | 1.93 % |
-| parakeet-rs 0.4.3 (ONNX Runtime) | 253x | 1.92 % |
+| | Speed (x real time) | vs parakeet-rs | WER |
+|---|---|---|---|
+| scriptrs | 1108x | 4.4x | 1.93 % |
+| NVIDIA NeMo | 477x | 1.9x | 1.93 % |
+| parakeet-rs 0.4.3 (ONNX Runtime) | 253x | 1x | 1.93 % |
 
 On all 44 Earnings-21 calls (39 h), long-form with the defaults runs at 2500x with
 8.24 % pooled WER; NeMo transcribing each whole call with local attention scores
