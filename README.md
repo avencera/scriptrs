@@ -38,21 +38,28 @@ The base crate exposes a single-chunk `TranscriptionPipeline`. Fast long-audio c
 
 ```toml
 [dependencies]
-scriptrs = "0.1.0"
+scriptrs = "0.3"
+```
+
+For native CUDA on Linux:
+
+```toml
+[dependencies]
+scriptrs = { version = "0.3", features = ["cuda"] }
 ```
 
 For fast long-form transcription:
 
 ```toml
 [dependencies]
-scriptrs = { version = "0.1.0", features = ["long-form"] }
+scriptrs = { version = "0.3", features = ["long-form"] }
 ```
 
 For VAD-backed long-form transcription:
 
 ```toml
 [dependencies]
-scriptrs = { version = "0.1.0", features = ["vad"] }
+scriptrs = { version = "0.3", features = ["vad"] }
 ```
 
 ## Model downloads
@@ -65,7 +72,7 @@ You can force a local bundle when needed:
 
 - `SCRIPTRS_MODELS_DIR=/path/to/models` forces a local bundle
 
-Online downloads use the immutable `5fbef649fc28117307a967e509be696c77b6e521`
+Online downloads use the immutable `63f6f9cbce43e5561c219229896f86f20c0eb660`
 snapshot of `avencera/scriptrs-models`.
 
 ## Local model layout

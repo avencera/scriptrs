@@ -1555,7 +1555,7 @@ dependencies = [
 
 [[package]]
 name = "scriptrs"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "approx",
  "block2",
