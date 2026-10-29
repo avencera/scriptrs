@@ -100,10 +100,24 @@ models/
 ## CUDA
 
 The `cuda` feature runs Parakeet on an NVIDIA GPU with no ONNX Runtime or
-PyTorch. It is built from this repository only for now. It supports the v3
-language filter and, with `vad`, VAD-backed long-form planning.
+PyTorch. It supports the v3 language filter and, with `vad`, VAD-backed
+long-form planning.
 
-It loads native weights rather than Core ML models:
+It loads native weights rather than Core ML models. With the default `online`
+feature, `from_pretrained_native` downloads them from the same pinned
+`avencera/scriptrs-models` snapshot:
+
+```rust,ignore
+use scriptrs::{ModelBundle, ParakeetDeployment, TranscriptionPipeline};
+
+let bundle = ModelBundle::from_pretrained_native(ParakeetDeployment::v3())?;
+let pipeline = TranscriptionPipeline::from_bundle(bundle)?;
+let result = pipeline.run(&audio)?;
+```
+
+With `vad`, `from_pretrained_native_long_form` also downloads the Silero VAD
+weights. To manage the files yourself, `dev-tools/nemo/export_native.py` writes
+them from the NeMo checkpoints in this layout, and `from_native_dir` loads them:
 
 ```text
 models/
@@ -118,11 +132,7 @@ models/
 ```
 
 ```rust,ignore
-use scriptrs::{ModelBundle, ParakeetDeployment, TranscriptionPipeline};
-
 let bundle = ModelBundle::from_native_dir("models", ParakeetDeployment::v3());
-let pipeline = TranscriptionPipeline::from_bundle(bundle)?;
-let result = pipeline.run(&audio)?;
 ```
 
 A native bundle accepts single inputs up to 40 s; longer audio goes through
