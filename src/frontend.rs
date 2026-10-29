@@ -294,6 +294,10 @@ impl MelFilterbank {
     }
 
     /// Writes the mel energies of one frame's power spectrum into `out`
+    ///
+    /// Each energy rounds exactly as the dense `matrixmultiply` product this
+    /// replaced: its kernels add bins in order, fused on x86-64 with FMA and on
+    /// aarch64, and as a separate multiply and add elsewhere
     fn apply(&self, power: &[f32], out: &mut [f32]) {
         #[cfg(target_arch = "x86_64")]
         if std::arch::is_x86_feature_detected!("fma") {
@@ -302,25 +306,33 @@ impl MelFilterbank {
             return;
         }
 
-        self.apply_with(power, out);
+        #[cfg(target_arch = "aarch64")]
+        self.apply_with(power, out, f32::mul_add);
+        #[cfg(not(target_arch = "aarch64"))]
+        self.apply_with(power, out, |weight, bin, sum| sum + weight * bin);
     }
 
+    /// # Safety
+    ///
+    /// The CPU must support FMA. The function is `unsafe` rather than a safe
+    /// `#[target_feature]` function, which needs Rust 1.86
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "fma")]
-    fn apply_fma(&self, power: &[f32], out: &mut [f32]) {
-        self.apply_with(power, out);
+    unsafe fn apply_fma(&self, power: &[f32], out: &mut [f32]) {
+        // `mul_add` is one instruction here; without the feature it would call a
+        // slow software fallback
+        self.apply_with(power, out, f32::mul_add);
     }
 
-    // inlined into `apply_fma`, where `mul_add` becomes one instruction; elsewhere it
-    // is the target's fused multiply-add, in hardware on aarch64
+    /// Folds each filter over its bins in order with `step(weight, bin, sum)`
     #[inline(always)]
-    fn apply_with(&self, power: &[f32], out: &mut [f32]) {
+    fn apply_with(&self, power: &[f32], out: &mut [f32], step: impl Fn(f32, f32, f32) -> f32) {
         for ((first, weights), slot) in self.filters.iter().zip(out) {
             let bins = &power[*first..*first + weights.len()];
             *slot = weights
                 .iter()
                 .zip(bins)
-                .fold(0.0, |sum, (weight, bin)| weight.mul_add(*bin, sum));
+                .fold(0.0, |sum, (weight, bin)| step(*weight, *bin, sum));
         }
     }
 }
@@ -366,7 +378,7 @@ mod tests {
     use approx::assert_abs_diff_eq;
 
     use super::{
-        MelFilterbank, ParakeetFeatureExtractor, TranscriptionConfig, create_mel_filterbank,
+        Array2, MelFilterbank, ParakeetFeatureExtractor, TranscriptionConfig, create_mel_filterbank,
     };
 
     fn sine_wave(frequency_hz: f32, sample_rate: usize, num_samples: usize) -> Vec<f32> {
@@ -408,18 +420,30 @@ mod tests {
         let config = TranscriptionConfig::default();
         let dense = create_mel_filterbank(config.n_fft, config.feature_size, config.sample_rate);
         let filterbank = MelFilterbank::new(&dense);
-        // non-negative like a power spectrum, and different in every bin
-        let power: Vec<f32> = (0..dense.ncols())
-            .map(|bin| 1.0 + (bin as f32 * 0.37).sin().abs() * bin as f32)
-            .collect();
-        let mut mels = vec![0.0f32; filterbank.mels()];
-        filterbank.apply(&power, &mut mels);
+        // non-negative like a power spectrum and different in every bin, with frames
+        // spread over several orders of magnitude so rounding differs between them
+        let frames = 64;
+        let power = Array2::from_shape_fn((dense.ncols(), frames), |(bin, frame)| {
+            let scale = 10f32.powi(frame as i32 % 8 - 4);
+            scale * (1.0 + (bin as f32 * 0.37 + frame as f32).sin().abs() * bin as f32)
+        });
+        // the dense product the sparse filterbank replaced, on this CPU's kernels
+        let expected = dense.dot(&power);
 
-        assert_eq!(mels.len(), dense.nrows());
-        for (mel, (sparse, row)) in mels.iter().zip(dense.rows()).enumerate() {
-            let expected: f32 = row.iter().zip(&power).map(|(w, p)| w * p).sum();
-            assert!(expected > 0.0, "mel {mel} weights no bin");
-            assert_abs_diff_eq!(*sparse, expected, epsilon = expected * 1e-5);
+        assert_eq!(filterbank.mels(), dense.nrows());
+        let mut mels = vec![0.0f32; filterbank.mels()];
+        for (frame, spectrum) in power.columns().into_iter().enumerate() {
+            let spectrum: Vec<f32> = spectrum.to_vec();
+            filterbank.apply(&spectrum, &mut mels);
+            for (mel, sparse) in mels.iter().enumerate() {
+                let expected = expected[[mel, frame]];
+                assert!(expected > 0.0, "mel {mel} weights no bin");
+                assert_eq!(
+                    sparse.to_bits(),
+                    expected.to_bits(),
+                    "mel {mel} frame {frame}: {sparse} vs {expected}"
+                );
+            }
         }
     }
 
