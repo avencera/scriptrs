@@ -4,12 +4,18 @@
 //! so each stage can be held against the reference activations. Everything a pass
 //! touches lives in an [`EncoderWorkspace`] allocated once per input shape, which
 //! keeps [`CudaEncoder::enqueue`] free of allocations and host syncs and therefore
-//! capturable in a CUDA graph
+//! capturable in a CUDA graph.
+//!
+//! [`EncoderMath::Fp16`] stores the Conformer layers' linear weights in FP16 and has
+//! the kernels before each of those GEMMs write an FP16 copy of their output, so the
+//! GEMMs read half the bytes and run at the FP16 tensor-core rate. The residual
+//! stream, the GEMM outputs and their accumulation stay FP32
 
-use cudakit::cudarc::driver::CudaSlice;
+use cudakit::cudarc::driver::{CudaSlice, CudaView, DevicePtrMut};
 use cudakit::{DeviceTensor, Math, Sgemm, SgemmBatched};
 
-use crate::cuda::kernels::{CudaRuntime, EncoderKernels, FeatureMap, Heads};
+use crate::cuda::fp16::linear_fp16;
+use crate::cuda::kernels::{CudaRuntime, EncoderKernels, FeatureMap, GemmOperand, Heads};
 use crate::cuda::{Direction, HostStaging, linear, upload, upload_host, zeros};
 use crate::error::TranscriptionError;
 use crate::native::spec::EncoderSpec;
@@ -24,32 +30,71 @@ fn subsampled(len: usize) -> usize {
     (len + 2).saturating_sub(3) / 2 + 1
 }
 
+/// Precision of the encoder's GEMMs
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EncoderMath {
+    /// Every GEMM on FP32 operands in this cuBLAS math
+    Single(Math),
+    /// The Conformer layers' linear layers on FP16 operands with FP32 output and
+    /// accumulation. The attention score and mix products and the subsampling module
+    /// keep FP32 operands in TF32: they are a few percent of the work, and their
+    /// operands would need conversions of their own
+    Fp16,
+}
+
+impl EncoderMath {
+    /// The math of the GEMMs that keep FP32 operands
+    fn single(self) -> Math {
+        match self {
+            Self::Single(math) => math,
+            Self::Fp16 => Math::Tf32,
+        }
+    }
+
+    fn fp16(self) -> bool {
+        self == Self::Fp16
+    }
+}
+
+/// A linear layer's `[out, in]` weight, in the precision its GEMM reads
+enum Linear {
+    Single(DeviceTensor),
+    /// FP16 bits
+    Fp16(CudaSlice<u16>),
+}
+
+/// The activation a linear layer reads, matching its [`Linear`] weight
+enum Operand<'a> {
+    Single(CudaView<'a, f32>),
+    Fp16(CudaView<'a, u16>),
+}
+
 struct Norm {
     weight: DeviceTensor,
     bias: DeviceTensor,
 }
 
 struct FeedForward {
-    linear1: DeviceTensor,
-    linear2: DeviceTensor,
+    linear1: Linear,
+    linear2: Linear,
 }
 
 struct Attention {
     /// `linear_q`, `linear_k` and `linear_v` stacked to `[3 * d_model, d_model]`
-    qkv: DeviceTensor,
-    pos: DeviceTensor,
-    out: DeviceTensor,
+    qkv: Linear,
+    pos: Linear,
+    out: Linear,
     bias_u: DeviceTensor,
     bias_v: DeviceTensor,
 }
 
 struct ConvModule {
-    pointwise1: DeviceTensor,
+    pointwise1: Linear,
     depthwise: DeviceTensor,
     /// Eval-mode BatchNorm folded to `x * scale + shift`
     scale: DeviceTensor,
     shift: DeviceTensor,
-    pointwise2: DeviceTensor,
+    pointwise2: Linear,
 }
 
 struct Layer {
@@ -76,8 +121,7 @@ struct Subsampling {
 /// Encoder weights on the GPU and the kernels that run them
 pub(crate) struct CudaEncoder {
     spec: EncoderSpec,
-    /// Precision of every encoder GEMM
-    math: Math,
+    math: EncoderMath,
     subsampling: Subsampling,
     layers: Vec<Layer>,
     kernels: EncoderKernels,
@@ -116,6 +160,20 @@ pub(crate) struct EncoderWorkspace {
     bd: CudaSlice<f32>,
     context: CudaSlice<f32>,
     merged: CudaSlice<f32>,
+    /// FP16 GEMM inputs under [`EncoderMath::Fp16`]
+    fp16: Option<Fp16Inputs>,
+}
+
+/// FP16 copies of the activations the FP16 linear layers read
+struct Fp16Inputs {
+    /// `[batch * frames, d_model]` LayerNorm output
+    normed: CudaSlice<u16>,
+    /// `[batch * frames, ff_hidden]` SiLU output
+    hidden: CudaSlice<u16>,
+    /// `[batch * frames, d_model]` attention context or conv module output
+    merged: CudaSlice<u16>,
+    /// `[2 * frames - 1, d_model]` relative position table
+    pos_emb: CudaSlice<u16>,
 }
 
 impl EncoderWorkspace {
@@ -162,21 +220,29 @@ impl EncoderWorkspace {
             &self.context,
             &self.merged,
         ];
-        lens + buffers
-            .iter()
-            .map(|buffer| buffer.num_bytes())
-            .sum::<usize>()
+        let fp16 = self.fp16.as_ref().map_or(0, |fp16| {
+            [&fp16.normed, &fp16.hidden, &fp16.merged, &fp16.pos_emb]
+                .iter()
+                .map(|buffer| buffer.num_bytes())
+                .sum()
+        });
+        lens + fp16
+            + buffers
+                .iter()
+                .map(|buffer| buffer.num_bytes())
+                .sum::<usize>()
     }
 }
 
 impl CudaEncoder {
-    /// Uploads the encoder weights and loads the kernels; every GEMM runs at `math`
+    /// Uploads the encoder weights and loads the kernels; the GEMMs run at `math`
     pub(crate) fn load(
         runtime: &CudaRuntime,
         file: &WeightFile,
         spec: EncoderSpec,
-        math: Math,
+        math: EncoderMath,
     ) -> Result<Self, TranscriptionError> {
+        let kernels = EncoderKernels::load(runtime)?;
         let d = spec.d_model;
         let channels = spec.subsampling_channels;
         let flat = channels * spec.features / spec.subsampling_factor;
@@ -207,7 +273,9 @@ impl CudaEncoder {
 
         let mut layers = Vec::with_capacity(spec.layers);
         for index in 0..spec.layers {
-            layers.push(Self::load_layer(runtime, file, spec, index)?);
+            layers.push(Self::load_layer(
+                runtime, &kernels, file, spec, math, index,
+            )?);
         }
 
         Ok(Self {
@@ -215,14 +283,16 @@ impl CudaEncoder {
             math,
             subsampling,
             layers,
-            kernels: EncoderKernels::load(runtime)?,
+            kernels,
         })
     }
 
     fn load_layer(
         runtime: &CudaRuntime,
+        kernels: &EncoderKernels,
         file: &WeightFile,
         spec: EncoderSpec,
+        math: EncoderMath,
         index: usize,
     ) -> Result<Layer, TranscriptionError> {
         let d = spec.d_model;
@@ -230,6 +300,8 @@ impl CudaEncoder {
         let tensor = |name: &str, shape: &[usize]| file.tensor(&format!("{prefix}.{name}"), shape);
         let load =
             |name: &str, shape: &[usize]| upload(runtime, file, &format!("{prefix}.{name}"), shape);
+        let to_linear = |weight: DeviceTensor| Linear::new(runtime, kernels, weight, math);
+        let load_linear = |name: &str, shape: &[usize]| to_linear(load(name, shape)?);
         let norm = |name: &str| -> Result<Norm, TranscriptionError> {
             Ok(Norm {
                 weight: load(&format!("{name}.weight"), &[d])?,
@@ -238,8 +310,8 @@ impl CudaEncoder {
         };
         let feed_forward = |name: &str| -> Result<FeedForward, TranscriptionError> {
             Ok(FeedForward {
-                linear1: load(&format!("{name}.linear1.weight"), &[spec.ff_hidden, d])?,
-                linear2: load(&format!("{name}.linear2.weight"), &[d, spec.ff_hidden])?,
+                linear1: load_linear(&format!("{name}.linear1.weight"), &[spec.ff_hidden, d])?,
+                linear2: load_linear(&format!("{name}.linear2.weight"), &[d, spec.ff_hidden])?,
             })
         };
 
@@ -249,9 +321,9 @@ impl CudaEncoder {
         }
         let head_dim = d / spec.heads;
         let attention = Attention {
-            qkv: DeviceTensor::upload(runtime.stream(), &qkv, &[3 * d, d])?,
-            pos: load("self_attn.linear_pos.weight", &[d, d])?,
-            out: load("self_attn.linear_out.weight", &[d, d])?,
+            qkv: to_linear(DeviceTensor::upload(runtime.stream(), &qkv, &[3 * d, d])?)?,
+            pos: load_linear("self_attn.linear_pos.weight", &[d, d])?,
+            out: load_linear("self_attn.linear_out.weight", &[d, d])?,
             bias_u: load("self_attn.pos_bias_u", &[spec.heads, head_dim])?,
             bias_v: load("self_attn.pos_bias_v", &[spec.heads, head_dim])?,
         };
@@ -272,11 +344,11 @@ impl CudaEncoder {
             shift.push((f64::from(beta[c]) - f64::from(mean[c]) * s) as f32);
         }
         let conv = ConvModule {
-            pointwise1: load("conv.pointwise_conv1.weight", &[2 * d, d, 1])?,
+            pointwise1: load_linear("conv.pointwise_conv1.weight", &[2 * d, d, 1])?,
             depthwise: load("conv.depthwise_conv.weight", &[d, 1, spec.conv_kernel])?,
             scale: upload_host(runtime, &scale)?,
             shift: upload_host(runtime, &shift)?,
-            pointwise2: load("conv.pointwise_conv2.weight", &[d, d, 1])?,
+            pointwise2: load_linear("conv.pointwise_conv2.weight", &[d, d, 1])?,
         };
 
         Ok(Layer {
@@ -308,6 +380,21 @@ impl CudaEncoder {
         let frames = maps[3].frames;
         let rows = batch * frames;
         let positions = 2 * frames - 1;
+        let pos_emb = stream.clone_htod(&relative_positions(frames, d))?;
+        let fp16 = match self.math {
+            EncoderMath::Single(_) => None,
+            EncoderMath::Fp16 => {
+                let mut table = zeros(stream, pos_emb.len())?;
+                self.kernels
+                    .to_f16(stream, &pos_emb.slice(..), &mut table.slice_mut(..))?;
+                Some(Fp16Inputs {
+                    normed: zeros(stream, rows * d)?,
+                    hidden: zeros(stream, rows * spec.ff_hidden)?,
+                    merged: zeros(stream, rows * d)?,
+                    pos_emb: table,
+                })
+            }
+        };
 
         Ok(EncoderWorkspace {
             batch,
@@ -336,13 +423,14 @@ impl CudaEncoder {
             q_v: zeros(stream, rows * d)?,
             k: zeros(stream, rows * d)?,
             v: zeros(stream, rows * d)?,
-            pos_emb: stream.clone_htod(&relative_positions(frames, d))?,
+            pos_emb,
             pos: zeros(stream, positions * d)?,
             pos_heads: zeros(stream, positions * d)?,
             scores: zeros(stream, batch * heads * frames * frames)?,
             bd: zeros(stream, rows * heads * positions)?,
             context: zeros(stream, rows * d)?,
             merged: zeros(stream, rows * d)?,
+            fp16,
         })
     }
 
@@ -490,7 +578,7 @@ impl CudaEncoder {
                 channels * third.features,
                 1.0,
                 1.0,
-                self.math,
+                self.math.single(),
             ),
             &ws.flat,
             weight.data(),
@@ -513,7 +601,7 @@ impl CudaEncoder {
         let plane = map.frames * map.features;
         let per_row = map.channels * plane;
         let gemm = Sgemm {
-            math: self.math,
+            math: self.math.single(),
             ..Sgemm::new(map.channels, plane, map.channels)
         };
         runtime.sgemm_batched(
@@ -541,8 +629,8 @@ impl CudaEncoder {
     /// One Conformer layer on the residual stream
     ///
     /// Layers run in order after [`Self::enqueue_subsampling`]: a layer's closing
-    /// norm also writes the next layer's first norm to `normed`, so every layer but
-    /// the first starts from it
+    /// norm also writes the next layer's first norm to `normed` (or its FP16 copy),
+    /// so every layer but the first starts from it
     pub(crate) fn enqueue_layer(
         &self,
         runtime: &CudaRuntime,
@@ -577,28 +665,86 @@ impl CudaEncoder {
                 &layer.norm_out.bias.data().slice(..),
             ),
             next.as_ref().map(|(gamma, beta)| (gamma, beta)),
-            &mut ws.normed.slice_mut(..),
+            self.gemm_output(
+                &mut ws.normed,
+                ws.fp16.as_mut().map(|fp16| &mut fp16.normed),
+            )?,
             self.spec.d_model,
             NORM_EPS,
         )?;
         Ok(())
     }
 
+    /// LayerNorm of the residual stream for the next linear layer: into `ws.normed`,
+    /// or its FP16 copy under [`EncoderMath::Fp16`]
     fn norm(
         &self,
         runtime: &CudaRuntime,
         ws: &mut EncoderWorkspace,
         norm: &Norm,
     ) -> Result<(), TranscriptionError> {
+        let out = self.gemm_output(
+            &mut ws.normed,
+            ws.fp16.as_mut().map(|fp16| &mut fp16.normed),
+        )?;
         self.kernels.layer_norm(
             runtime.stream(),
             &ws.x.slice(..),
             &norm.weight.data().slice(..),
             &norm.bias.data().slice(..),
-            &mut ws.normed.slice_mut(..),
+            out,
             self.spec.d_model,
             NORM_EPS,
         )?;
+        Ok(())
+    }
+
+    /// Where a kernel writes the activation a linear layer reads next: `single`, or
+    /// `fp16`, its FP16 copy, under [`EncoderMath::Fp16`]
+    fn gemm_output<'a>(
+        &self,
+        single: &'a mut CudaSlice<f32>,
+        fp16: Option<&'a mut CudaSlice<u16>>,
+    ) -> Result<GemmOperand<'a>, TranscriptionError> {
+        match (self.math, fp16) {
+            (EncoderMath::Single(_), _) => Ok(GemmOperand::Single(single.slice_mut(..))),
+            (EncoderMath::Fp16, Some(fp16)) => Ok(GemmOperand::Fp16(fp16.slice_mut(..))),
+            (EncoderMath::Fp16, None) => Err(mixed_precision()),
+        }
+    }
+
+    /// The activation a linear layer reads: `single`, or `fp16`, its FP16 copy, under
+    /// [`EncoderMath::Fp16`]
+    fn gemm_input<'a>(
+        &self,
+        single: CudaView<'a, f32>,
+        fp16: Option<CudaView<'a, u16>>,
+    ) -> Result<Operand<'a>, TranscriptionError> {
+        match (self.math, fp16) {
+            (EncoderMath::Single(_), _) => Ok(Operand::Single(single)),
+            (EncoderMath::Fp16, Some(fp16)) => Ok(Operand::Fp16(fp16)),
+            (EncoderMath::Fp16, None) => Err(mixed_precision()),
+        }
+    }
+
+    /// Runs `spec`, a [`linear`] product, on `a` and `weight` in their shared precision
+    fn linear<C: DevicePtrMut<f32>>(
+        &self,
+        runtime: &CudaRuntime,
+        spec: Sgemm,
+        a: Operand<'_>,
+        weight: &Linear,
+        c: &mut C,
+    ) -> Result<(), TranscriptionError> {
+        match (a, weight, self.math) {
+            (Operand::Single(a), Linear::Single(w), EncoderMath::Single(_)) => {
+                runtime.sgemm(spec, &a, w.data(), c)?;
+            }
+            (Operand::Fp16(a), Linear::Fp16(w), EncoderMath::Fp16) => {
+                linear_fp16(runtime, spec, &a, w, c)?;
+            }
+            _ => return Err(mixed_precision()),
+        }
         Ok(())
     }
 
@@ -611,20 +757,40 @@ impl CudaEncoder {
         weights: &FeedForward,
     ) -> Result<(), TranscriptionError> {
         let (d, hidden) = (self.spec.d_model, self.spec.ff_hidden);
+        let math = self.math.single();
         let rows = ws.batch * ws.frames;
-        let mut hidden_view = ws.hidden.slice_mut(..rows * hidden);
-        runtime.sgemm(
-            linear(rows, hidden, d, 1.0, 0.0, self.math),
-            &ws.normed,
-            weights.linear1.data(),
-            &mut hidden_view,
+        let normed = self.gemm_input(
+            ws.normed.slice(..),
+            ws.fp16.as_ref().map(|fp16| fp16.normed.slice(..)),
         )?;
-        self.kernels.silu(runtime.stream(), &mut hidden_view)?;
+        self.linear(
+            runtime,
+            linear(rows, hidden, d, 1.0, 0.0, math),
+            normed,
+            &weights.linear1,
+            &mut ws.hidden.slice_mut(..rows * hidden),
+        )?;
+        let stream = runtime.stream();
+        match ws.fp16.as_mut() {
+            Some(fp16) => self.kernels.silu_f16(
+                stream,
+                &ws.hidden.slice(..rows * hidden),
+                &mut fp16.hidden.slice_mut(..),
+            )?,
+            None => self
+                .kernels
+                .silu(stream, &mut ws.hidden.slice_mut(..rows * hidden))?,
+        }
+        let activated = self.gemm_input(
+            ws.hidden.slice(..rows * hidden),
+            ws.fp16.as_ref().map(|fp16| fp16.hidden.slice(..)),
+        )?;
         // NeMo scales the feed-forward residual by 0.5 (`fc_factor`)
-        runtime.sgemm(
-            linear(rows, d, hidden, 0.5, 1.0, self.math),
-            &ws.hidden.slice(..rows * hidden),
-            weights.linear2.data(),
+        self.linear(
+            runtime,
+            linear(rows, d, hidden, 0.5, 1.0, math),
+            activated,
+            &weights.linear2,
             &mut ws.x,
         )?;
         Ok(())
@@ -651,10 +817,16 @@ impl CudaEncoder {
             head_dim,
         };
 
-        runtime.sgemm(
-            linear(rows, 3 * d, d, 1.0, 0.0, self.math),
-            &ws.normed,
-            weights.qkv.data(),
+        let math = self.math.single();
+        let normed = self.gemm_input(
+            ws.normed.slice(..),
+            ws.fp16.as_ref().map(|fp16| fp16.normed.slice(..)),
+        )?;
+        self.linear(
+            runtime,
+            linear(rows, 3 * d, d, 1.0, 0.0, math),
+            normed,
+            &weights.qkv,
             &mut ws.qkv,
         )?;
         self.kernels.split_qkv(
@@ -668,10 +840,15 @@ impl CudaEncoder {
             &mut ws.v.slice_mut(..),
             shape,
         )?;
-        runtime.sgemm(
-            linear(positions, d, d, 1.0, 0.0, self.math),
-            &ws.pos_emb,
-            weights.pos.data(),
+        let table = self.gemm_input(
+            ws.pos_emb.slice(..),
+            ws.fp16.as_ref().map(|fp16| fp16.pos_emb.slice(..)),
+        )?;
+        self.linear(
+            runtime,
+            linear(positions, d, d, 1.0, 0.0, math),
+            table,
+            &weights.pos,
             &mut ws.pos,
         )?;
         self.kernels.split_heads(
@@ -686,7 +863,7 @@ impl CudaEncoder {
         // content scores: (q + u) · kᵀ per (batch, head)
         let content = Sgemm {
             b_transposed: true,
-            math: self.math,
+            math,
             ..Sgemm::new(frames, frames, head_dim)
         };
         runtime.sgemm_batched(
@@ -698,7 +875,7 @@ impl CudaEncoder {
         // position scores: (q + v) · pᵀ per head, every utterance against one table
         let position = Sgemm {
             b_transposed: true,
-            math: self.math,
+            math,
             ..Sgemm::new(rows, positions, head_dim)
         };
         runtime.sgemm_batched(
@@ -716,7 +893,7 @@ impl CudaEncoder {
         )?;
 
         let mix = Sgemm {
-            math: self.math,
+            math,
             ..Sgemm::new(frames, head_dim, frames)
         };
         runtime.sgemm_batched(
@@ -725,16 +902,21 @@ impl CudaEncoder {
             &ws.v,
             &mut ws.context,
         )?;
-        self.kernels.merge_heads(
-            stream,
-            &ws.context.slice(..),
-            &mut ws.merged.slice_mut(..),
-            shape,
+        let merged = self.gemm_output(
+            &mut ws.merged,
+            ws.fp16.as_mut().map(|fp16| &mut fp16.merged),
         )?;
-        runtime.sgemm(
-            linear(rows, d, d, 1.0, 1.0, self.math),
-            &ws.merged,
-            weights.out.data(),
+        self.kernels
+            .merge_heads(stream, &ws.context.slice(..), merged, shape)?;
+        let merged = self.gemm_input(
+            ws.merged.slice(..),
+            ws.fp16.as_ref().map(|fp16| fp16.merged.slice(..)),
+        )?;
+        self.linear(
+            runtime,
+            linear(rows, d, d, 1.0, 1.0, math),
+            merged,
+            &weights.out,
             &mut ws.x,
         )?;
         Ok(())
@@ -749,13 +931,23 @@ impl CudaEncoder {
         weights: &ConvModule,
     ) -> Result<(), TranscriptionError> {
         let d = self.spec.d_model;
+        let math = self.math.single();
         let rows = ws.batch * ws.frames;
         let pw1_len = rows * 2 * d;
-        runtime.sgemm(
-            linear(rows, 2 * d, d, 1.0, 0.0, self.math),
-            &ws.normed,
-            weights.pointwise1.data(),
+        let normed = self.gemm_input(
+            ws.normed.slice(..),
+            ws.fp16.as_ref().map(|fp16| fp16.normed.slice(..)),
+        )?;
+        self.linear(
+            runtime,
+            linear(rows, 2 * d, d, 1.0, 0.0, math),
+            normed,
+            &weights.pointwise1,
             &mut ws.hidden.slice_mut(..pw1_len),
+        )?;
+        let glued = self.gemm_output(
+            &mut ws.merged,
+            ws.fp16.as_mut().map(|fp16| &mut fp16.merged),
         )?;
         self.kernels.conv_glue(
             runtime.stream(),
@@ -764,20 +956,52 @@ impl CudaEncoder {
             &weights.depthwise.data().slice(..),
             &weights.scale.data().slice(..),
             &weights.shift.data().slice(..),
-            &mut ws.merged.slice_mut(..),
+            glued,
             ws.batch,
             ws.frames,
             d,
             self.spec.conv_kernel,
         )?;
-        runtime.sgemm(
-            linear(rows, d, d, 1.0, 1.0, self.math),
-            &ws.merged,
-            weights.pointwise2.data(),
+        let glued = self.gemm_input(
+            ws.merged.slice(..),
+            ws.fp16.as_ref().map(|fp16| fp16.merged.slice(..)),
+        )?;
+        self.linear(
+            runtime,
+            linear(rows, d, d, 1.0, 1.0, math),
+            glued,
+            &weights.pointwise2,
             &mut ws.x,
         )?;
         Ok(())
     }
+}
+
+impl Linear {
+    /// Keeps `weight` for an FP32 or TF32 GEMM, or rounds it to FP16 on the device for
+    /// [`EncoderMath::Fp16`] and frees the FP32 copy
+    fn new(
+        runtime: &CudaRuntime,
+        kernels: &EncoderKernels,
+        weight: DeviceTensor,
+        math: EncoderMath,
+    ) -> Result<Self, TranscriptionError> {
+        if !math.fp16() {
+            return Ok(Self::Single(weight));
+        }
+        let stream = runtime.stream();
+        let mut bits = zeros(stream, weight.data().len())?;
+        kernels.to_f16(stream, &weight.data().slice(..), &mut bits.slice_mut(..))?;
+        Ok(Self::Fp16(bits))
+    }
+}
+
+/// A workspace or weight in the wrong precision for the encoder's math, which
+/// [`CudaEncoder::load`] and [`CudaEncoder::workspace`] never build
+fn mixed_precision() -> TranscriptionError {
+    TranscriptionError::InvalidModelOutput(
+        "an encoder GEMM's operands differ in precision".to_owned(),
+    )
 }
 
 /// NeMo's `RelPositionalEncoding` rows for positions `frames - 1` down to
@@ -805,7 +1029,7 @@ mod tests {
     use cudakit::{Library, Math, Options};
     use ndarray::{ArrayD, Axis, Ix3};
 
-    use super::{CudaEncoder, relative_positions};
+    use super::{CudaEncoder, EncoderMath, relative_positions};
     use crate::cuda::kernels::CudaRuntime;
     use crate::cuda::test_support::weights;
     use crate::deployment::{ParakeetDeployment, ParakeetVersion};
@@ -891,8 +1115,13 @@ mod tests {
             };
             let file = weights(version);
             let spec = file.parakeet_spec(&deployment).expect("spec");
-            let encoder =
-                CudaEncoder::load(&runtime, &file, spec.encoder, Math::Fp32).expect("encoder");
+            let encoder = CudaEncoder::load(
+                &runtime,
+                &file,
+                spec.encoder,
+                EncoderMath::Single(Math::Fp32),
+            )
+            .expect("encoder");
 
             for set in ["b1", "b8", "long-full"] {
                 let reference = NemoReference::open(version, set);
@@ -967,14 +1196,22 @@ mod tests {
         assert!(worst < 1e-4, "encoder output relative L2 {worst:.2e}");
     }
 
-    /// Runs the TF32 encoder end to end and holds it near NeMo FP32; its output must
-    /// differ from the FP32 encoder's, or the GEMMs never took the TF32 path
+    /// Runs the TF32 and FP16 encoders end to end and holds each near NeMo FP32 and
+    /// finite, which an FP16 overflow would break. Each output must differ from
+    /// the FP32 encoder's, or its GEMMs never left the FP32 path
     #[test]
     #[ignore = "needs a CUDA GPU and the NeMo references; `just gpu-parity` runs it on gpu0"]
-    fn gpu_tf32_encoder_stays_near_nemo() {
+    fn gpu_fast_encoders_stay_near_nemo() {
+        // a 10-bit mantissa per product through 24 layers lands at 6e-4 to 1.3e-2 in
+        // TF32 and 7e-4 to 6e-3 in FP16 on an RTX 5090; a broken GEMM is off by order
+        // 1. WER is the accuracy gate
+        let fast = [
+            ("TF32", EncoderMath::Single(Math::Tf32)),
+            ("FP16", EncoderMath::Fp16),
+        ];
         let runtime = CudaRuntime::open(0, Options::default()).expect("CUDA runtime");
         runtime.prepare(Library::Cublas).expect("cuBLAS");
-        let mut worst = 0f64;
+        let mut worst = [0f64; 2];
         for version in [ParakeetVersion::V2, ParakeetVersion::V3] {
             let deployment = match version {
                 ParakeetVersion::V2 => ParakeetDeployment::v2(),
@@ -984,7 +1221,7 @@ mod tests {
             let spec = file.parakeet_spec(&deployment).expect("spec");
             let load =
                 |math| CudaEncoder::load(&runtime, &file, spec.encoder, math).expect("encoder");
-            let (fp32, tf32) = (load(Math::Fp32), load(Math::Tf32));
+            let fp32 = load(EncoderMath::Single(Math::Fp32));
 
             for set in ["b1", "b8", "long-full"] {
                 let reference = NemoReference::open(version, set);
@@ -1013,88 +1250,109 @@ mod tests {
                     (output, ws.output_lens().to_vec())
                 };
                 let (full, out_lens) = encode(&fp32);
-                let (fast, _) = encode(&tf32);
-                assert!(
-                    full != fast,
-                    "{version:?} {set}: TF32 matches FP32 bit for bit"
-                );
-
                 let expected = reference.f32("encoder.out").permuted_axes(vec![0, 2, 1]);
                 let expected = expected.as_standard_layout().into_owned();
-                let (rel, max_abs) = compare(&fast, &expected, &out_lens);
-                println!("{version:?} {set} TF32 encoder.out rel {rel:.2e} max {max_abs:.2e}");
-                worst = worst.max(rel);
+                for (index, (name, math)) in fast.iter().enumerate() {
+                    // loaded per set so only one extra copy of the weights is resident
+                    let (output, _) = encode(&load(*math));
+                    assert!(
+                        full != output,
+                        "{version:?} {set}: {name} matches FP32 bit for bit"
+                    );
+                    let (rel, max_abs) = compare(&output, &expected, &out_lens);
+                    println!(
+                        "{version:?} {set} {name} encoder.out rel {rel:.2e} max {max_abs:.2e}"
+                    );
+                    worst[index] = worst[index].max(rel);
+                }
             }
         }
 
-        // a 10-bit mantissa per product through 24 layers lands at 6e-4 to 1.3e-2 on
-        // an RTX 5090; a broken GEMM is off by order 1. WER is the accuracy gate
-        assert!(worst < 5e-2, "TF32 encoder output relative L2 {worst:.2e}");
+        for ((name, _), worst) in fast.iter().zip(worst) {
+            assert!(
+                worst < 5e-2,
+                "{name} encoder output relative L2 {worst:.2e}"
+            );
+        }
     }
 
-    /// Captures the encoder in a CUDA graph, checks the replay against the eager pass
-    /// bit for bit, and prints replay times for the v3 reference shapes
+    /// Captures the encoder in a CUDA graph at each precision, checks the replay
+    /// against the eager pass bit for bit, and prints replay times for the v3
+    /// reference shapes
     #[test]
     #[ignore = "needs a CUDA GPU and the NeMo references; `just gpu-parity` runs it on gpu0"]
     fn gpu_encoder_graph_replays_the_eager_pass() {
-        const REPLAYS: u32 = 100;
         let runtime = CudaRuntime::open(0, Options::default()).expect("CUDA runtime");
         runtime.prepare(Library::Cublas).expect("cuBLAS");
         let file = weights(ParakeetVersion::V3);
         let spec = file.parakeet_spec(&ParakeetDeployment::v3()).expect("spec");
-        let encoder =
-            CudaEncoder::load(&runtime, &file, spec.encoder, Math::Fp32).expect("encoder");
+        let precisions = [
+            ("FP32", EncoderMath::Single(Math::Fp32)),
+            ("TF32", EncoderMath::Single(Math::Tf32)),
+            ("FP16", EncoderMath::Fp16),
+        ];
 
-        for set in ["b1", "b8"] {
-            let reference = NemoReference::open(ParakeetVersion::V3, set);
-            let mel = reference
-                .f32("mel")
-                .into_dimensionality::<Ix3>()
-                .expect("[batch, features, frames]");
-            let (batch, mel_frames) = (mel.shape()[0], mel.shape()[2]);
-            let lens: Vec<usize> = reference
-                .i64("mel_len")
-                .iter()
-                .map(|len| *len as usize)
-                .collect();
-            let time_major: Vec<f32> = mel.permuted_axes([0, 2, 1]).iter().copied().collect();
-            let mut ws = encoder
-                .workspace(&runtime, batch, mel_frames)
-                .expect("workspace");
-            encoder
-                .set_input(&runtime, &mut ws, &lens, |mel| {
-                    mel.copy_from_slice(&time_major)
-                })
-                .expect("input");
-
-            // the eager pass also finishes cuBLAS's lazy setup before capture
-            encoder.enqueue(&runtime, &mut ws).expect("eager");
-            let eager = runtime.stream().clone_dtoh(ws.output()).expect("download");
-            // SAFETY: the graph is declared after `ws` and `encoder`, so it drops before
-            // the buffers it points at, which stay in place on the runtime's stream
-            let graph = unsafe { runtime.capture_nonempty(|| encoder.enqueue(&runtime, &mut ws)) }
-                .expect("capture");
-            graph.launch().expect("replay");
-            let replayed = runtime.stream().clone_dtoh(ws.output()).expect("download");
-            assert!(
-                eager == replayed,
-                "v3 {set}: graph replay differs from the eager pass"
-            );
-
-            let start = std::time::Instant::now();
-            for _ in 0..REPLAYS {
-                graph.launch().expect("replay");
+        for (name, math) in precisions {
+            let encoder = CudaEncoder::load(&runtime, &file, spec.encoder, math).expect("encoder");
+            for set in ["b1", "b8"] {
+                time_graph(&runtime, &encoder, name, set);
             }
-            runtime.synchronize().expect("sync");
-            let replay_ms = start.elapsed().as_secs_f64() * 1e3 / f64::from(REPLAYS);
-            let audio_s: f64 = reference
-                .i64("audio_len")
-                .iter()
-                .map(|len| *len as f64 / 16000.0)
-                .sum();
-            println!(
-                "v3 {set}: batch {batch}, {audio_s:.1} s audio, encoder graph replay {replay_ms:.3} ms"
-            );
         }
+    }
+
+    /// Checks one graph replay of `encoder` on the v3 reference `set` against its
+    /// eager pass and prints the mean replay time
+    fn time_graph(runtime: &CudaRuntime, encoder: &CudaEncoder, name: &str, set: &str) {
+        const REPLAYS: u32 = 100;
+        let reference = NemoReference::open(ParakeetVersion::V3, set);
+        let mel = reference
+            .f32("mel")
+            .into_dimensionality::<Ix3>()
+            .expect("[batch, features, frames]");
+        let (batch, mel_frames) = (mel.shape()[0], mel.shape()[2]);
+        let lens: Vec<usize> = reference
+            .i64("mel_len")
+            .iter()
+            .map(|len| *len as usize)
+            .collect();
+        let time_major: Vec<f32> = mel.permuted_axes([0, 2, 1]).iter().copied().collect();
+        let mut ws = encoder
+            .workspace(runtime, batch, mel_frames)
+            .expect("workspace");
+        encoder
+            .set_input(runtime, &mut ws, &lens, |mel| {
+                mel.copy_from_slice(&time_major)
+            })
+            .expect("input");
+
+        // the eager pass also finishes cuBLAS's lazy setup before capture
+        encoder.enqueue(runtime, &mut ws).expect("eager");
+        let eager = runtime.stream().clone_dtoh(ws.output()).expect("download");
+        // SAFETY: the graph is declared after `ws` and `encoder` outlives this call, so
+        // it drops before the buffers it points at, which stay in place on the
+        // runtime's stream
+        let graph = unsafe { runtime.capture_nonempty(|| encoder.enqueue(runtime, &mut ws)) }
+            .expect("capture");
+        graph.launch().expect("replay");
+        let replayed = runtime.stream().clone_dtoh(ws.output()).expect("download");
+        assert!(
+            eager == replayed,
+            "v3 {set} {name}: graph replay differs from the eager pass"
+        );
+
+        let start = std::time::Instant::now();
+        for _ in 0..REPLAYS {
+            graph.launch().expect("replay");
+        }
+        runtime.synchronize().expect("sync");
+        let replay_ms = start.elapsed().as_secs_f64() * 1e3 / f64::from(REPLAYS);
+        let audio_s: f64 = reference
+            .i64("audio_len")
+            .iter()
+            .map(|len| *len as f64 / 16000.0)
+            .sum();
+        println!(
+            "v3 {set} {name}: batch {batch}, {audio_s:.1} s audio, encoder graph replay {replay_ms:.3} ms"
+        );
     }
 }

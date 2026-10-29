@@ -19,9 +19,10 @@
 //! at batch 1 the windows run one at a time on one worker, and above it the
 //! default workers prepare windows ahead of the model. `--language <code>` decodes
 //! with that language's filter instead of automatic language selection,
-//! `--fp32` runs the encoder GEMMs in FP32 instead of TF32, and `--vad` (with the
-//! `vad` feature) plans long recordings from Silero speech regions instead of
-//! overlap windows over the whole recording, at `--vad-threshold <p>` if given
+//! `--tf32` or `--fp32` runs the encoder GEMMs in that precision instead of FP16,
+//! and `--vad` (with the `vad` feature) plans long recordings from Silero speech
+//! regions instead of overlap windows over the whole recording, at
+//! `--vad-threshold <p>` if given
 //!
 //! ```sh
 //! cargo run --release --features cuda,long-form --example cuda_bench -- \
@@ -100,6 +101,7 @@ fn run() -> Result<()> {
         "backend": match args.precision {
             Precision::Fp32 => "scriptrs-cuda-fp32",
             Precision::Tf32 => "scriptrs-cuda-tf32",
+            Precision::Fp16 => "scriptrs-cuda-fp16",
         },
         "version": version,
         "bs": batch,
@@ -341,6 +343,7 @@ fn parse_args() -> Result<Args> {
                     .ok_or_else(|| eyre!("unknown language {code}"))?;
                 language = LanguageSelection::Language(parsed);
             }
+            "--tf32" => precision = Precision::Tf32,
             "--fp32" => precision = Precision::Fp32,
             "--vad" if cfg!(feature = "vad") => vad = true,
             "--vad" => return Err(eyre!("--vad needs the `vad` feature")),

@@ -6,15 +6,18 @@
 //! exactly the elements its shape implies
 
 use cudakit::cudarc::driver::{
-    CudaFunction, CudaStream, CudaView, CudaViewMut, LaunchConfig, PushKernelArg,
+    CudaFunction, CudaStream, CudaView, CudaViewMut, LaunchArgs, LaunchConfig, PushKernelArg,
 };
 use cudakit::{
     AreaPtx, EmbeddedPtx, Error, ExtraSymbols, KernelArea, LibraryPolicy, LoadedKernels, Profile,
     PtxTier, Runtime, TierSet, check_len, element_count,
 };
 
+use crate::cuda::fp16;
+
 /// Build-wide CUDA policy: cuBLAS is allowed while the encoder is library-first, and
-/// only the `sm_75` baseline PTX ships
+/// only the `sm_75` baseline PTX ships. The FP16 encoder GEMMs call `cublasGemmEx`
+/// directly
 pub(crate) static PROFILE: Profile = Profile {
     consumer: "scriptrs",
     compiled: TierSet::of(&[PtxTier::Sm75]),
@@ -23,7 +26,10 @@ pub(crate) static PROFILE: Profile = Profile {
     // user who already enabled `cuda` to enable it, so those get cudakit's generic hint
     tier_features: &[(PtxTier::Sm75, "cuda")],
     libraries: LibraryPolicy::Allowed,
-    extra_symbols: ExtraSymbols::NONE,
+    extra_symbols: ExtraSymbols {
+        cublas: fp16::CUBLAS_SYMBOLS,
+        ..ExtraSymbols::NONE
+    },
 };
 
 /// One PTX module per kernel area
@@ -216,6 +222,39 @@ fn check_subsampling(
     check_len("subsampling output", output.len(), out)
 }
 
+/// The output of a kernel that feeds a GEMM: FP32 for an FP32 or TF32 GEMM, or FP16
+/// bits for an FP16 one, which the kernel's `_f16` twin writes from the same
+/// parameters
+pub(crate) enum GemmOperand<'a> {
+    Single(CudaViewMut<'a, f32>),
+    Fp16(CudaViewMut<'a, u16>),
+}
+
+impl GemmOperand<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Single(view) => view.len(),
+            Self::Fp16(view) => view.len(),
+        }
+    }
+
+    /// The kernel for this output: `single` or its `_f16` twin
+    fn pick<'k>(&self, single: &'k CudaFunction, fp16: &'k CudaFunction) -> &'k CudaFunction {
+        match self {
+            Self::Single(_) => single,
+            Self::Fp16(_) => fp16,
+        }
+    }
+
+    /// Pushes the output buffer and its length
+    fn push<'l>(&'l mut self, launch: &mut LaunchArgs<'l>, length: &'l u64) {
+        match self {
+            Self::Single(view) => launch.arg(view).arg(length),
+            Self::Fp16(view) => launch.arg(view).arg(length),
+        };
+    }
+}
+
 /// A subsampling feature map `[batch, channels, frames, features]`
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FeatureMap {
@@ -234,13 +273,19 @@ impl FeatureMap {
 /// The `encoder` area's kernels
 pub(crate) struct EncoderKernels {
     layer_norm: CudaFunction,
+    layer_norm_f16: CudaFunction,
     layer_norm_pair: CudaFunction,
+    layer_norm_pair_f16: CudaFunction,
     silu: CudaFunction,
+    silu_f16: CudaFunction,
+    to_f16: CudaFunction,
     split_qkv: CudaFunction,
     split_heads: CudaFunction,
     merge_heads: CudaFunction,
+    merge_heads_f16: CudaFunction,
     rel_pos_softmax: CudaFunction,
     conv_glue: CudaFunction,
+    conv_glue_f16: CudaFunction,
     fill_rows: CudaFunction,
     subsample_conv_in: CudaFunction,
     subsample_depthwise: CudaFunction,
@@ -253,13 +298,19 @@ impl EncoderKernels {
         let module: LoadedKernels<KernelModule> = runtime.load_embedded(KernelModule::Encoder)?;
         Ok(Self {
             layer_norm: module.function("encoder_layer_norm")?,
+            layer_norm_f16: module.function("encoder_layer_norm_f16")?,
             layer_norm_pair: module.function("encoder_layer_norm_pair")?,
+            layer_norm_pair_f16: module.function("encoder_layer_norm_pair_f16")?,
             silu: module.function("encoder_silu")?,
+            silu_f16: module.function("encoder_silu_f16")?,
+            to_f16: module.function("encoder_to_f16")?,
             split_qkv: module.function("encoder_split_qkv")?,
             split_heads: module.function("encoder_split_heads")?,
             merge_heads: module.function("encoder_merge_heads")?,
+            merge_heads_f16: module.function("encoder_merge_heads_f16")?,
             rel_pos_softmax: module.function("encoder_rel_pos_softmax")?,
             conv_glue: module.function("encoder_conv_glue")?,
+            conv_glue_f16: module.function("encoder_conv_glue_f16")?,
             fill_rows: module.function("encoder_fill_rows")?,
             subsample_conv_in: module.function("encoder_subsample_conv_in")?,
             subsample_depthwise: module.function("encoder_subsample_depthwise")?,
@@ -279,14 +330,14 @@ impl EncoderKernels {
         x: &CudaView<'_, f32>,
         gamma: &CudaView<'_, f32>,
         beta: &CudaView<'_, f32>,
-        out: &mut CudaViewMut<'_, f32>,
+        mut out: GemmOperand<'_>,
         width: usize,
         eps: f32,
     ) -> Result<(), Error> {
         let config = layer_norm_rows(x.len(), gamma.len(), beta.len(), out.len(), width)?;
-        let lens = [len(x), len(gamma), len(beta), len_mut(out)];
+        let lens = [len(x), len(gamma), len(beta), out.len() as u64];
         let width = u32_of("layer norm width", width)?;
-        let mut launch = stream.launch_builder(&self.layer_norm);
+        let mut launch = stream.launch_builder(out.pick(&self.layer_norm, &self.layer_norm_f16));
         launch
             .arg(x)
             .arg(&lens[0])
@@ -294,15 +345,18 @@ impl EncoderKernels {
             .arg(&lens[1])
             .arg(beta)
             .arg(&lens[2]);
-        launch.arg(out).arg(&lens[3]).arg(&width).arg(&eps);
-        // SAFETY: the arguments match `encoder_layer_norm`'s parameters in order, and
-        // one block per row of `width` stays inside `x` and `out`
+        out.push(&mut launch, &lens[3]);
+        launch.arg(&width).arg(&eps);
+        // SAFETY: the arguments match the parameters of `encoder_layer_norm` and its
+        // `_f16` twin in order, and one block per row of `width` stays inside `x` and
+        // `out`
         unsafe { launch.launch(config) }?;
         Ok(())
     }
 
     /// `x = LayerNorm(x)` in place with `norm`, then with `next` the next layer's
-    /// first LayerNorm of the result into `out`; without `next`, `out` is untouched
+    /// first LayerNorm of the result into `out`, in FP32 or as FP16 bits for an FP16
+    /// GEMM; without `next`, `out` is untouched
     #[allow(
         clippy::too_many_arguments,
         reason = "launchers mirror their kernel's parameter list so each launch reads against it"
@@ -313,7 +367,7 @@ impl EncoderKernels {
         x: &mut CudaViewMut<'_, f32>,
         norm: (&CudaView<'_, f32>, &CudaView<'_, f32>),
         next: Option<(&CudaView<'_, f32>, &CudaView<'_, f32>)>,
-        out: &mut CudaViewMut<'_, f32>,
+        mut out: GemmOperand<'_>,
         width: usize,
         eps: f32,
     ) -> Result<(), Error> {
@@ -330,11 +384,12 @@ impl EncoderKernels {
             len(beta),
             len(next_gamma),
             len(next_beta),
-            len_mut(out),
+            out.len() as u64,
         ];
         let width = u32_of("layer norm width", width)?;
         let flag = u32::from(next.is_some());
-        let mut launch = stream.launch_builder(&self.layer_norm_pair);
+        let mut launch =
+            stream.launch_builder(out.pick(&self.layer_norm_pair, &self.layer_norm_pair_f16));
         launch
             .arg(x)
             .arg(&lens[0])
@@ -346,12 +401,11 @@ impl EncoderKernels {
             .arg(next_gamma)
             .arg(&lens[3])
             .arg(next_beta)
-            .arg(&lens[4])
-            .arg(out)
-            .arg(&lens[5]);
+            .arg(&lens[4]);
+        out.push(&mut launch, &lens[5]);
         launch.arg(&width).arg(&eps).arg(&flag);
-        // SAFETY: matches `encoder_layer_norm_pair`; one block per row of `width`
-        // stays inside `x` and `out`, which are sized alike above
+        // SAFETY: matches `encoder_layer_norm_pair` and its `_f16` twin; one block per
+        // row of `width` stays inside `x` and `out`, which are sized alike above
         unsafe { launch.launch(config) }?;
         Ok(())
     }
@@ -367,6 +421,47 @@ impl EncoderKernels {
         let mut launch = stream.launch_builder(&self.silu);
         launch.arg(x).arg(&length);
         // SAFETY: matches `encoder_silu`; the kernel bounds-checks its index
+        unsafe { launch.launch(config) }?;
+        Ok(())
+    }
+
+    /// `out = x * sigmoid(x)` rounded to FP16
+    pub(crate) fn silu_f16(
+        &self,
+        stream: &CudaStream,
+        x: &CudaView<'_, f32>,
+        out: &mut CudaViewMut<'_, u16>,
+    ) -> Result<(), Error> {
+        self.elementwise_f16(stream, &self.silu_f16, "silu", x, out)
+    }
+
+    /// `out = x` rounded to FP16
+    pub(crate) fn to_f16(
+        &self,
+        stream: &CudaStream,
+        x: &CudaView<'_, f32>,
+        out: &mut CudaViewMut<'_, u16>,
+    ) -> Result<(), Error> {
+        self.elementwise_f16(stream, &self.to_f16, "to fp16", x, out)
+    }
+
+    /// Launches `function`, which maps each element of `x` to the same element of
+    /// `out` as `(x, out)`
+    fn elementwise_f16(
+        &self,
+        stream: &CudaStream,
+        function: &CudaFunction,
+        context: &'static str,
+        x: &CudaView<'_, f32>,
+        out: &mut CudaViewMut<'_, u16>,
+    ) -> Result<(), Error> {
+        check_len(context, x.len(), out.len())?;
+        let config = elements(x.len())?;
+        let lens = [len(x), len_mut(out)];
+        let mut launch = stream.launch_builder(function);
+        launch.arg(x).arg(&lens[0]).arg(out).arg(&lens[1]);
+        // SAFETY: matches `encoder_silu_f16` and `encoder_to_f16`; `x` holds every
+        // index of `out`, and the kernel bounds-checks its index against `out`
         unsafe { launch.launch(config) }?;
         Ok(())
     }
@@ -472,28 +567,30 @@ impl EncoderKernels {
         &self,
         stream: &CudaStream,
         x: &CudaView<'_, f32>,
-        out: &mut CudaViewMut<'_, f32>,
+        mut out: GemmOperand<'_>,
         shape: Heads,
     ) -> Result<(), Error> {
         let n = shape.len()?;
         check_len("merge heads input", n, x.len())?;
         check_len("merge heads output", n, out.len())?;
         let config = elements(n)?;
-        let lens = [len(x), len_mut(out)];
+        let lens = [len(x), out.len() as u64];
         let dims = [
             u32_of("batch", shape.batch)?,
             u32_of("frames", shape.frames)?,
             u32_of("heads", shape.heads)?,
             u32_of("head dim", shape.head_dim)?,
         ];
-        let mut launch = stream.launch_builder(&self.merge_heads);
-        launch.arg(x).arg(&lens[0]).arg(out).arg(&lens[1]);
+        let mut launch = stream.launch_builder(out.pick(&self.merge_heads, &self.merge_heads_f16));
+        launch.arg(x).arg(&lens[0]);
+        out.push(&mut launch, &lens[1]);
         launch
             .arg(&dims[0])
             .arg(&dims[1])
             .arg(&dims[2])
             .arg(&dims[3]);
-        // SAFETY: matches `encoder_merge_heads`; indexing is checked in the kernel
+        // SAFETY: matches `encoder_merge_heads` and its `_f16` twin; indexing is
+        // checked in the kernel
         unsafe { launch.launch(config) }?;
         Ok(())
     }
@@ -563,7 +660,7 @@ impl EncoderKernels {
         weight: &CudaView<'_, f32>,
         scale: &CudaView<'_, f32>,
         shift: &CudaView<'_, f32>,
-        out: &mut CudaViewMut<'_, f32>,
+        mut out: GemmOperand<'_>,
         batch: usize,
         frames: usize,
         channels: usize,
@@ -591,7 +688,7 @@ impl EncoderKernels {
             len(weight),
             len(scale),
             len(shift),
-            len_mut(out),
+            out.len() as u64,
         ];
         let dims = [
             u32_of("batch", batch)?,
@@ -599,7 +696,7 @@ impl EncoderKernels {
             u32_of("channels", channels)?,
             u32_of("kernel size", kernel_size)?,
         ];
-        let mut launch = stream.launch_builder(&self.conv_glue);
+        let mut launch = stream.launch_builder(out.pick(&self.conv_glue, &self.conv_glue_f16));
         launch
             .arg(pw1)
             .arg(&lens[0])
@@ -607,19 +704,15 @@ impl EncoderKernels {
             .arg(&lens[1])
             .arg(weight)
             .arg(&lens[2]);
-        launch
-            .arg(scale)
-            .arg(&lens[3])
-            .arg(shift)
-            .arg(&lens[4])
-            .arg(out)
-            .arg(&lens[5]);
+        launch.arg(scale).arg(&lens[3]).arg(shift).arg(&lens[4]);
+        out.push(&mut launch, &lens[5]);
         launch
             .arg(&dims[0])
             .arg(&dims[1])
             .arg(&dims[2])
             .arg(&dims[3]);
-        // SAFETY: matches `encoder_conv_glue`; indexing is checked in the kernel
+        // SAFETY: matches `encoder_conv_glue` and its `_f16` twin; indexing is checked
+        // in the kernel
         unsafe { launch.launch(config) }?;
         Ok(())
     }
@@ -1300,7 +1393,8 @@ mod tests {
     use cudakit::{Error, Options};
 
     use super::{
-        CudaRuntime, DecodeKernels, EncoderKernels, LstmInput, LstmState, LstmWeights, Projection,
+        CudaRuntime, DecodeKernels, EncoderKernels, GemmOperand, LstmInput, LstmState, LstmWeights,
+        Projection,
     };
 
     /// A buffer one row short must fail on the host, before the kernel's unchecked
@@ -1320,7 +1414,7 @@ mod tests {
             &x.slice(..),
             &gamma.slice(..),
             &gamma.slice(..),
-            &mut out.slice_mut(..),
+            GemmOperand::Single(out.slice_mut(..)),
             4,
             1e-5,
         );

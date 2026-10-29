@@ -1,14 +1,15 @@
 //! FastConformer encoder glue around the cuBLAS GEMMs
 //!
-//! Every kernel is FP32 and mirrors one NeMo operation, so the reference activations
-//! in `/shared/datasets/parakeet-ref` check them one at a time. Layouts are row-major:
-//! activations `[batch * frames, width]`, attention heads `[batch, heads, frames,
-//! head_dim]` and subsampling feature maps `[batch, channels, frames, features]`.
-//! Lengths are per batch row, in frames of the tensor they mask
+//! Every kernel computes in FP32 and mirrors one NeMo operation, so the reference
+//! activations in `/shared/datasets/parakeet-ref` check them one at a time. The `_f16`
+//! variants write the same values rounded to FP16 bits for the FP16 GEMMs that read
+//! them. Layouts are row-major: activations `[batch * frames, width]`, attention heads
+//! `[batch, heads, frames, head_dim]` and subsampling feature maps `[batch, channels,
+//! frames, features]`. Lengths are per batch row, in frames of the tensor they mask
 
 use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
 
-use crate::common::{MAX_WARPS, add, block_reduce, sigmoid};
+use crate::common::{MAX_WARPS, add, block_reduce, sigmoid, to_f16};
 
 fn max(a: f32, b: f32) -> f32 {
     a.max(b)
@@ -101,6 +102,71 @@ pub fn encoder_layer_norm(
     }
 }
 
+/// [`encoder_layer_norm`] with its output rounded to FP16
+#[kernel]
+pub fn encoder_layer_norm_f16(
+    x: &[f32],
+    gamma: &[f32],
+    beta: &[f32],
+    mut out: DisjointSlice<u16>,
+    width: u32,
+    eps: f32,
+) {
+    static mut SCRATCH: SharedArray<f32, MAX_WARPS> = SharedArray::UNINIT;
+    // SAFETY: a raw pointer to the block's shared array; only `block_reduce` touches
+    // it, between barriers
+    let scratch = unsafe { SharedArray::as_raw_mut_ptr(&raw mut SCRATCH) };
+    let width = width as usize;
+    let row = thread::blockIdx_x() as usize * width;
+    let tid = thread::threadIdx_x() as usize;
+    let threads = thread::blockDim_x() as usize;
+
+    let values = load_row(x, row, width);
+    let (mean, inv_std) = row_moments(&values, width, eps, scratch);
+    let mut n = 0;
+    while n < ROW_VALUES && tid + n * threads < width {
+        let i = tid + n * threads;
+        // SAFETY: rows are disjoint across blocks and `i` is distinct within the block
+        let slot = unsafe { out.get_unchecked_mut(row + i) };
+        *slot = to_f16((values[n] - mean) * inv_std * gamma[i] + beta[i]);
+        n += 1;
+    }
+}
+
+/// A layer's closing LayerNorm of row `row` of `x` in place, as the LayerNorm pair
+/// kernels run it, returning this thread's normalized slots
+#[inline(always)]
+fn closing_norm(
+    x: &mut DisjointSlice<f32>,
+    gamma: &[f32],
+    beta: &[f32],
+    row: usize,
+    width: usize,
+    eps: f32,
+    scratch: *mut f32,
+) -> [f32; ROW_VALUES] {
+    let tid = thread::threadIdx_x() as usize;
+    let threads = thread::blockDim_x() as usize;
+    let mut values = [0.0f32; ROW_VALUES];
+    let mut n = 0;
+    while n < ROW_VALUES && tid + n * threads < width {
+        // SAFETY: rows are disjoint across blocks and `tid + n * threads` is distinct
+        // within the block, so each thread reads and later writes only its own slots
+        values[n] = unsafe { *x.get_unchecked_mut(row + tid + n * threads) };
+        n += 1;
+    }
+    let (mean, inv_std) = row_moments(&values, width, eps, scratch);
+    let mut n = 0;
+    while n < ROW_VALUES && tid + n * threads < width {
+        let i = tid + n * threads;
+        values[n] = (values[n] - mean) * inv_std * gamma[i] + beta[i];
+        // SAFETY: as above
+        unsafe { *x.get_unchecked_mut(row + i) = values[n] };
+        n += 1;
+    }
+    values
+}
+
 /// A layer's closing LayerNorm in place, `x = LayerNorm(x)` with `gamma` and `beta`,
 /// then with `next` set the next layer's first LayerNorm of the result into `out`
 /// with `next_gamma` and `next_beta`
@@ -129,23 +195,7 @@ pub fn encoder_layer_norm_pair(
     let tid = thread::threadIdx_x() as usize;
     let threads = thread::blockDim_x() as usize;
 
-    let mut values = [0.0f32; ROW_VALUES];
-    let mut n = 0;
-    while n < ROW_VALUES && tid + n * threads < width {
-        // SAFETY: rows are disjoint across blocks and `tid + n * threads` is distinct
-        // within the block, so each thread reads and later writes only its own slots
-        values[n] = unsafe { *x.get_unchecked_mut(row + tid + n * threads) };
-        n += 1;
-    }
-    let (mean, inv_std) = row_moments(&values, width, eps, scratch);
-    let mut n = 0;
-    while n < ROW_VALUES && tid + n * threads < width {
-        let i = tid + n * threads;
-        values[n] = (values[n] - mean) * inv_std * gamma[i] + beta[i];
-        // SAFETY: as above
-        unsafe { *x.get_unchecked_mut(row + i) = values[n] };
-        n += 1;
-    }
+    let values = closing_norm(&mut x, gamma, beta, row, width, eps, scratch);
     if next == 0 {
         return;
     }
@@ -154,9 +204,50 @@ pub fn encoder_layer_norm_pair(
     let mut n = 0;
     while n < ROW_VALUES && tid + n * threads < width {
         let i = tid + n * threads;
-        // SAFETY: as above; the host sizes `out` like `x`
+        // SAFETY: rows are disjoint across blocks and `i` is distinct within the
+        // block; the host sizes `out` like `x`
         let slot = unsafe { out.get_unchecked_mut(row + i) };
         *slot = (values[n] - mean) * inv_std * next_gamma[i] + next_beta[i];
+        n += 1;
+    }
+}
+
+/// [`encoder_layer_norm_pair`] with the next layer's norm rounded to FP16 for the
+/// FP16 GEMM that reads it
+#[kernel]
+pub fn encoder_layer_norm_pair_f16(
+    mut x: DisjointSlice<f32>,
+    gamma: &[f32],
+    beta: &[f32],
+    next_gamma: &[f32],
+    next_beta: &[f32],
+    mut out: DisjointSlice<u16>,
+    width: u32,
+    eps: f32,
+    next: u32,
+) {
+    static mut SCRATCH: SharedArray<f32, MAX_WARPS> = SharedArray::UNINIT;
+    // SAFETY: a raw pointer to the block's shared array; only `block_reduce` touches
+    // it, between barriers
+    let scratch = unsafe { SharedArray::as_raw_mut_ptr(&raw mut SCRATCH) };
+    let width = width as usize;
+    let row = thread::blockIdx_x() as usize * width;
+    let tid = thread::threadIdx_x() as usize;
+    let threads = thread::blockDim_x() as usize;
+
+    let values = closing_norm(&mut x, gamma, beta, row, width, eps, scratch);
+    if next == 0 {
+        return;
+    }
+
+    let (mean, inv_std) = row_moments(&values, width, eps, scratch);
+    let mut n = 0;
+    while n < ROW_VALUES && tid + n * threads < width {
+        let i = tid + n * threads;
+        // SAFETY: rows are disjoint across blocks and `i` is distinct within the
+        // block; the host sizes `out` like `x`
+        let slot = unsafe { out.get_unchecked_mut(row + i) };
+        *slot = to_f16((values[n] - mean) * inv_std * next_gamma[i] + next_beta[i]);
         n += 1;
     }
 }
@@ -168,6 +259,27 @@ pub fn encoder_silu(mut x: DisjointSlice<f32>) {
     if let Some(slot) = x.get_mut(idx) {
         let value = *slot;
         *slot = value * sigmoid(value);
+    }
+}
+
+/// SiLU of `x` into `out`, rounded to FP16, one thread per element
+#[kernel]
+pub fn encoder_silu_f16(x: &[f32], mut out: DisjointSlice<u16>) {
+    let idx = thread::index_1d();
+    let i = idx.get();
+    if let Some(slot) = out.get_mut(idx) {
+        let value = x[i];
+        *slot = to_f16(value * sigmoid(value));
+    }
+}
+
+/// Rounds `x` to FP16 into `out`, one thread per element
+#[kernel]
+pub fn encoder_to_f16(x: &[f32], mut out: DisjointSlice<u16>) {
+    let idx = thread::index_1d();
+    let i = idx.get();
+    if let Some(slot) = out.get_mut(idx) {
+        *slot = to_f16(x[i]);
     }
 }
 
@@ -244,6 +356,17 @@ pub fn encoder_split_heads(
     unsafe { *out.get_unchecked_mut((h * rows + row) * head_dim + d) = x[i] };
 }
 
+/// Index in `[batch, heads, frames, head_dim]` of element `i` of the merged
+/// `[batch * frames, heads * head_dim]`
+#[inline(always)]
+fn merged_source(i: usize, frames: usize, heads: usize, head_dim: usize) -> usize {
+    let width = heads * head_dim;
+    let (row, column) = (i / width, i % width);
+    let (b, t) = (row / frames, row % frames);
+    let (h, d) = (column / head_dim, column % head_dim);
+    ((b * heads + h) * frames + t) * head_dim + d
+}
+
 /// Merges `[batch, heads, frames, head_dim]` back to `[batch * frames, heads *
 /// head_dim]` for the output projection, one thread per element
 #[kernel]
@@ -257,17 +380,35 @@ pub fn encoder_merge_heads(
 ) {
     let (batch, frames, heads, head_dim) =
         (batch as usize, frames as usize, heads as usize, head_dim as usize);
-    let width = heads * head_dim;
     let i = thread::index_1d().get();
-    if i >= batch * frames * width {
+    if i >= batch * frames * heads * head_dim {
         return;
     }
 
-    let (row, column) = (i / width, i % width);
-    let (b, t) = (row / frames, row % frames);
-    let (h, d) = (column / head_dim, column % head_dim);
     // SAFETY: `(b, t, h, d)` is a bijection on the thread index
-    unsafe { *out.get_unchecked_mut(i) = x[((b * heads + h) * frames + t) * head_dim + d] };
+    unsafe { *out.get_unchecked_mut(i) = x[merged_source(i, frames, heads, head_dim)] };
+}
+
+/// [`encoder_merge_heads`] with its output rounded to FP16
+#[kernel]
+pub fn encoder_merge_heads_f16(
+    x: &[f32],
+    mut out: DisjointSlice<u16>,
+    batch: u32,
+    frames: u32,
+    heads: u32,
+    head_dim: u32,
+) {
+    let (batch, frames, heads, head_dim) =
+        (batch as usize, frames as usize, heads as usize, head_dim as usize);
+    let i = thread::index_1d().get();
+    if i >= batch * frames * heads * head_dim {
+        return;
+    }
+
+    let value = x[merged_source(i, frames, heads, head_dim)];
+    // SAFETY: `(b, t, h, d)` is a bijection on the thread index
+    unsafe { *out.get_unchecked_mut(i) = to_f16(value) };
 }
 
 /// Relative-position attention weights, in place over the content scores
@@ -356,6 +497,41 @@ pub fn encoder_rel_pos_softmax(
     }
 }
 
+/// Output element `i` of the conv module between its two pointwise convolutions, for
+/// the conv-glue kernels
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn conv_glue_value(
+    pw1: &[f32],
+    lens: &[u32],
+    weight: &[f32],
+    scale: &[f32],
+    shift: &[f32],
+    i: usize,
+    frames: usize,
+    channels: usize,
+    kernel_size: usize,
+) -> f32 {
+    let (row, c) = (i / channels, i % channels);
+    let (b, t) = (row / frames, row % frames);
+    let len = lens[b] as usize;
+    let half = kernel_size / 2;
+    let mut acc = 0.0f32;
+    let mut tap = 0;
+    while tap < kernel_size {
+        // frames before 0 or at or past the length are zero after the mask
+        if t + tap >= half && t + tap - half < len {
+            let source = (b * frames + t + tap - half) * 2 * channels + c;
+            let glu = pw1[source] * sigmoid(pw1[source + channels]);
+            acc += weight[c * kernel_size + tap] * glu;
+        }
+        tap += 1;
+    }
+
+    let normed = acc * scale[c] + shift[c];
+    normed * sigmoid(normed)
+}
+
 /// The conv module between its two pointwise convolutions: GLU, the pad mask, the
 /// depthwise convolution, BatchNorm and SiLU
 ///
@@ -387,25 +563,57 @@ pub fn encoder_conv_glue(
         return;
     }
 
-    let (row, c) = (i / channels, i % channels);
-    let (b, t) = (row / frames, row % frames);
-    let len = lens[b] as usize;
-    let half = kernel_size / 2;
-    let mut acc = 0.0f32;
-    let mut tap = 0;
-    while tap < kernel_size {
-        // frames before 0 or at or past the length are zero after the mask
-        if t + tap >= half && t + tap - half < len {
-            let source = (b * frames + t + tap - half) * 2 * channels + c;
-            let glu = pw1[source] * sigmoid(pw1[source + channels]);
-            acc += weight[c * kernel_size + tap] * glu;
-        }
-        tap += 1;
+    let value = conv_glue_value(
+        pw1,
+        lens,
+        weight,
+        scale,
+        shift,
+        i,
+        frames,
+        channels,
+        kernel_size,
+    );
+    if let Some(slot) = out.get_mut(idx) {
+        *slot = value;
+    }
+}
+
+/// [`encoder_conv_glue`] with its output rounded to FP16
+#[kernel]
+pub fn encoder_conv_glue_f16(
+    pw1: &[f32],
+    lens: &[u32],
+    weight: &[f32],
+    scale: &[f32],
+    shift: &[f32],
+    mut out: DisjointSlice<u16>,
+    batch: u32,
+    frames: u32,
+    channels: u32,
+    kernel_size: u32,
+) {
+    let (batch, frames, channels, kernel_size) =
+        (batch as usize, frames as usize, channels as usize, kernel_size as usize);
+    let idx = thread::index_1d();
+    let i = idx.get();
+    if i >= batch * frames * channels {
+        return;
     }
 
-    let normed = acc * scale[c] + shift[c];
+    let value = conv_glue_value(
+        pw1,
+        lens,
+        weight,
+        scale,
+        shift,
+        i,
+        frames,
+        channels,
+        kernel_size,
+    );
     if let Some(slot) = out.get_mut(idx) {
-        *slot = normed * sigmoid(normed);
+        *slot = to_f16(value);
     }
 }
 

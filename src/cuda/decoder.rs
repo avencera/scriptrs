@@ -623,7 +623,7 @@ mod tests {
 
     use super::{CudaDecoder, DecodeWorkspace};
     use crate::backend::{DecodePolicy, LanguageMask, decide_from_logits};
-    use crate::cuda::encoder::CudaEncoder;
+    use crate::cuda::encoder::{CudaEncoder, EncoderMath};
     use crate::cuda::kernels::CudaRuntime;
     use crate::cuda::test_support::{native_root, weights};
     use crate::decode::RawTranscription;
@@ -727,8 +727,13 @@ mod tests {
             let file = weights(version);
             let spec = file.parakeet_spec(&deployment(version)).expect("spec");
             let decoder = CudaDecoder::load(&runtime, &file, &spec).expect("decoder");
-            let encoder =
-                CudaEncoder::load(&runtime, &file, spec.encoder, Math::Fp32).expect("encoder");
+            let encoder = CudaEncoder::load(
+                &runtime,
+                &file,
+                spec.encoder,
+                EncoderMath::Single(Math::Fp32),
+            )
+            .expect("encoder");
 
             for set in SETS {
                 let reference = NemoReference::open(version, set);
