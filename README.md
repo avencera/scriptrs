@@ -8,8 +8,8 @@ Fast [NVIDIA Parakeet TDT](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) s
 - Long-form transcription of hour-long recordings, with optional VAD
 - Token-level timestamps and confidences
 
-On an RTX 5090, the CUDA backend transcribes LibriSpeech test-clean at 948x real
-time, twice as fast as NVIDIA NeMo and 3.7x as fast as parakeet-rs, at the same
+On an RTX 5090, the CUDA backend transcribes LibriSpeech test-clean at 1108x real
+time, 2.3x as fast as NVIDIA NeMo and 4.4x as fast as parakeet-rs, at the same
 word error rate. See [CUDA](#cuda-experimental) for the numbers.
 
 `scriptrs` is early: the public API is still moving.
@@ -133,7 +133,7 @@ time:
 
 | | Speed (x real time) | WER |
 |---|---|---|
-| scriptrs | 948x | 1.93 % |
+| scriptrs | 1108x | 1.93 % |
 | NVIDIA NeMo | 477x | 1.93 % |
 | parakeet-rs 0.4.3 (ONNX Runtime) | 253x | 1.92 % |
 

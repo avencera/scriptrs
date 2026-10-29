@@ -1,5 +1,5 @@
-//! Greedy TDT decode on the device: LSTM predictor and joint on cuBLAS plus the
-//! `decode` kernel area
+//! Greedy TDT decode on the device: the joint's GEMMs on cuBLAS, and the LSTM
+//! predictor and the token decision in the `decode` kernel area
 //!
 //! A step decides one token for every unfinished batch row and advances its frame
 //! cursor on the device, NeMo's label-looping rule. Steps need no host sync, so a
@@ -7,12 +7,12 @@
 //! between replays to see whether every row has reached its last frame
 
 use cudakit::cudarc::driver::CudaSlice;
-use cudakit::{DeviceTensor, Error, Math};
+use cudakit::{DeviceTensor, Math};
 
 use crate::backend::LanguageMask;
 use crate::cuda::kernels::{
     CudaRuntime, DecodeFilter, DecodeKernels, DecodeOutput, DecodeShape, DecodeState,
-    EncoderKernels, MAX_FILTER_TOP_K,
+    EncoderKernels, LstmInput, LstmState, LstmWeights, MAX_FILTER_TOP_K, Projection,
 };
 use crate::cuda::{linear, upload, upload_host, zeros};
 use crate::decode::RawTranscription;
@@ -68,10 +68,11 @@ pub(crate) struct DecodeWorkspace {
     pred_proj: CudaSlice<f32>,
     joint_in: CudaSlice<f32>,
     logits: CudaSlice<f32>,
-    embedded: CudaSlice<f32>,
-    gates: CudaSlice<f32>,
-    h: Vec<CudaSlice<f32>>,
-    c: Vec<CudaSlice<f32>>,
+    /// LSTM states, `[layers, batch, hidden]` each: `h` before a step, `h_next` the
+    /// layers' new states until `decode_project` copies them back, and `c` in place
+    h: CudaSlice<f32>,
+    h_next: CudaSlice<f32>,
+    c: CudaSlice<f32>,
     frame: CudaSlice<u32>,
     emitted: CudaSlice<u32>,
     label: CudaSlice<u32>,
@@ -97,8 +98,9 @@ impl DecodeWorkspace {
             &self.pred_proj,
             &self.joint_in,
             &self.logits,
-            &self.embedded,
-            &self.gates,
+            &self.h,
+            &self.h_next,
+            &self.c,
             &self.confidences,
         ];
         let state = [
@@ -115,12 +117,7 @@ impl DecodeWorkspace {
             &self.allowed,
             &self.filter_top_k,
         ];
-        floats
-            .into_iter()
-            .chain(self.h.iter())
-            .chain(self.c.iter())
-            .map(CudaSlice::num_bytes)
-            .sum::<usize>()
+        floats.into_iter().map(CudaSlice::num_bytes).sum::<usize>()
             + state.into_iter().map(CudaSlice::num_bytes).sum::<usize>()
     }
 
@@ -212,7 +209,7 @@ impl CudaDecoder {
         let stream = runtime.stream();
         let capacity = frames.max(1) * self.max_symbols;
         let state = |len: usize| zeros::<u32>(stream, len);
-        let layers = self.lstm.len();
+        let lstm_state = batch * self.lstm.len() * self.hidden;
         Ok(DecodeWorkspace {
             batch,
             frames,
@@ -223,14 +220,9 @@ impl CudaDecoder {
             pred_proj: zeros(stream, batch * self.joint_hidden)?,
             joint_in: zeros(stream, batch * self.joint_hidden)?,
             logits: zeros(stream, batch * self.outputs)?,
-            embedded: zeros(stream, batch * self.hidden)?,
-            gates: zeros(stream, batch * 4 * self.hidden)?,
-            h: (0..layers)
-                .map(|_| zeros(stream, batch * self.hidden))
-                .collect::<Result<_, Error>>()?,
-            c: (0..layers)
-                .map(|_| zeros(stream, batch * self.hidden))
-                .collect::<Result<_, Error>>()?,
+            h: zeros(stream, lstm_state)?,
+            h_next: zeros(stream, lstm_state)?,
+            c: zeros(stream, lstm_state)?,
             frame: state(batch)?,
             emitted: state(batch)?,
             label: state(batch)?,
@@ -324,9 +316,8 @@ impl CudaDecoder {
         ws.host_lens.copy_from_slice(lens);
         let lens: Vec<u32> = lens.iter().map(|len| *len as u32).collect();
         stream.memcpy_htod(&lens, &mut ws.lens)?;
-        for buffer in ws.h.iter_mut().chain(ws.c.iter_mut()) {
-            stream.memset_zeros(buffer)?;
-        }
+        stream.memset_zeros(&mut ws.h)?;
+        stream.memset_zeros(&mut ws.c)?;
         for buffer in [
             &mut ws.frame,
             &mut ws.emitted,
@@ -343,95 +334,81 @@ impl CudaDecoder {
     }
 
     /// Feeds each emitting row's label through the LSTM and projects the top layer
-    /// for the joint; the other rows keep their state and projection
+    /// for the joint; the other rows keep their state and projection. Also prepares
+    /// the next step: its joint input at each row's current frame, and the joint
+    /// bias in the logits
     fn predict(
         &self,
         runtime: &CudaRuntime,
         ws: &mut DecodeWorkspace,
     ) -> Result<(), TranscriptionError> {
         let stream = runtime.stream();
-        let batch = ws.batch;
-        self.kernels.embed(
-            stream,
-            &self.embed.data().slice(..),
-            &ws.label.slice(..),
-            &mut ws.embedded.slice_mut(..),
-            self.hidden,
-        )?;
-
-        let gates = 4 * self.hidden;
+        let n = ws.batch * self.hidden;
         for (index, layer) in self.lstm.iter().enumerate() {
-            self.encoder_kernels.fill_rows(
-                stream,
-                &layer.bias.data().slice(..),
-                &mut ws.gates.slice_mut(..),
-            )?;
-            let input = if index == 0 {
-                &ws.embedded
-            } else {
-                &ws.h[index - 1]
+            let weights = LstmWeights {
+                weight_ih: layer.weight_ih.data().slice(..),
+                weight_hh: layer.weight_hh.data().slice(..),
+                bias: layer.bias.data().slice(..),
             };
-            runtime.sgemm(
-                linear(batch, gates, self.hidden, 1.0, 1.0, Math::Fp32),
-                input,
-                layer.weight_ih.data(),
-                &mut ws.gates,
-            )?;
-            runtime.sgemm(
-                linear(batch, gates, self.hidden, 1.0, 1.0, Math::Fp32),
-                &ws.h[index],
-                layer.weight_hh.data(),
-                &mut ws.gates,
-            )?;
-            let (h, c) = (&mut ws.h[index], &mut ws.c[index]);
-            self.kernels.lstm_cell(
+            // the layer below's new state sits just before this layer's in `h_next`
+            let (below, mut rest) = ws.h_next.split_at_mut(index * n);
+            let input = match index {
+                0 => LstmInput::Embedded {
+                    table: self.embed.data().slice(..),
+                    label: ws.label.slice(..),
+                },
+                _ => LstmInput::Below(below.slice((index - 1) * n..)),
+            };
+            let mut state = LstmState {
+                h: ws.h.slice(index * n..(index + 1) * n),
+                h_next: rest.slice_mut(..n),
+                c: ws.c.slice_mut(index * n..(index + 1) * n),
+            };
+            self.kernels.lstm(
                 stream,
-                &ws.gates.slice(..),
+                &weights,
+                &input,
                 &ws.emit.slice(..),
-                &mut h.slice_mut(..),
-                &mut c.slice_mut(..),
+                &mut state,
                 self.hidden,
             )?;
         }
 
-        // rows that did not emit have an unchanged top state, so recomputing their
-        // projection reproduces it
-        self.encoder_kernels.fill_rows(
+        let top = (self.lstm.len() - 1) * n;
+        let mut buffers = Projection {
+            weight: self.joint_pred.weight.data().slice(..),
+            bias: self.joint_pred.bias.data().slice(..),
+            top: ws.h_next.slice(top..),
+            enc_proj: ws.enc_proj.slice(..),
+            frame: ws.frame.slice(..),
+            lens: ws.lens.slice(..),
+            joint_bias: self.joint_out.bias.data().slice(..),
+            h_next: ws.h_next.slice(..),
+            h: ws.h.slice_mut(..),
+            pred_proj: ws.pred_proj.slice_mut(..),
+            joint_in: ws.joint_in.slice_mut(..),
+            logits: ws.logits.slice_mut(..),
+        };
+        self.kernels.project(
             stream,
-            &self.joint_pred.bias.data().slice(..),
-            &mut ws.pred_proj.slice_mut(..),
-        )?;
-        runtime.sgemm(
-            linear(batch, self.joint_hidden, self.hidden, 1.0, 1.0, Math::Fp32),
-            &ws.h[self.lstm.len() - 1],
-            self.joint_pred.weight.data(),
-            &mut ws.pred_proj,
+            &mut buffers,
+            &ws.emit.slice(..),
+            ws.frames,
+            self.hidden,
         )?;
         Ok(())
     }
 
     /// One greedy step for every unfinished row; capturable in a CUDA graph
+    ///
+    /// The previous step (or [`Self::start`]) left the joint input and the joint
+    /// bias in the logits, so the step is the joint GEMM, the decision and the
+    /// predictor
     pub(crate) fn step(
         &self,
         runtime: &CudaRuntime,
         ws: &mut DecodeWorkspace,
     ) -> Result<(), TranscriptionError> {
-        let stream = runtime.stream();
-        self.kernels.joint_input(
-            stream,
-            &ws.enc_proj.slice(..),
-            &ws.pred_proj.slice(..),
-            &ws.frame.slice(..),
-            &ws.lens.slice(..),
-            &mut ws.joint_in.slice_mut(..),
-            ws.frames,
-            self.joint_hidden,
-        )?;
-        self.encoder_kernels.fill_rows(
-            stream,
-            &self.joint_out.bias.data().slice(..),
-            &mut ws.logits.slice_mut(..),
-        )?;
         runtime.sgemm(
             linear(
                 ws.batch,
