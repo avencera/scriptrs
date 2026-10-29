@@ -207,8 +207,9 @@ On an RTX 5090 with Parakeet v3 (speed in x real time, then WER):
 
 FLEURS and MLS run one utterance at a time with automatic language selection and
 are scored with Whisper's basic normalizer. On each of their ten language sets,
-FP16 is within one word error of TF32. On LibriSpeech, FP16 gives the same
-transcripts as TF32.
+FP16 is within one word error of TF32. On LibriSpeech one utterance at a time,
+FP16 gives the same transcripts as TF32. Batching changes a few transcripts in
+either precision, so the queued FP16 and TF32 transcripts differ slightly.
 
 ## Usage
 
