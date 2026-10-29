@@ -13,7 +13,7 @@ pub(crate) fn native_root() -> PathBuf {
 }
 
 /// Native bundle from [`native_root`] in FP32, the precision the NeMo references
-/// were decoded in; the TF32 default only stays near them
+/// were decoded in; the faster precisions only stay near them
 pub(crate) fn nemo_parity_bundle(deployment: ParakeetDeployment) -> ModelBundle {
     native_bundle(deployment, Precision::Fp32)
 }

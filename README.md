@@ -172,19 +172,21 @@ accuracy and speed on dense or far-field speech:
 
 | Set | Overlap WER | VAD WER | Overlap speed | VAD speed |
 |---|---:|---:|---:|---:|
-| Sparse speech, 24 % speech (4.2 h) | 14.8 % | **3.1 %** | 2340x | **3060x** |
-| Earnings-21 earnings calls | **8.2 %** | 8.6 % | **2500x** | 1540x |
-| AMI meetings, headset mix | 21.5 % | **21.2 %** | **2380x** | 1330x |
-| AMI meetings, far-field microphone | **23.2 %** | 26.6 % | **2370x** | 1320x |
-| CHiME-6 dinner parties | **44.0 %** | 54.8 % | **2360x** | 1480x |
+| Sparse speech, 24 % speech (4.2 h) | 14.8 % | **3.1 %** | 3180x | **3880x** |
+| Earnings-21 earnings calls | **8.2 %** | 8.6 % | **3440x** | 2040x |
+| AMI meetings, headset mix | 21.5 % | **21.2 %** | **3280x** | 1810x |
+| AMI meetings, far-field microphone | **23.2 %** | 26.6 % | **3270x** | 1820x |
+| CHiME-6 dinner parties | **44.0 %** | 54.8 % | **3310x** | 2000x |
 
 The sparse set is LibriSpeech test-clean utterances separated by 15 to 75 s of
 film music, effects, ambience and low-level noise. VAD runs use the default 0.5
 speech threshold.
 
-The encoder's matrix multiplies use TF32 tensor cores on Ampere and newer GPUs.
-Older GPUs run them in FP32. For output that matches NeMo's FP32 decode token for
-token, set FP32 on any GPU:
+By default the encoder layers' linear weights are stored in FP16, which has TF32's
+10-bit mantissa, and their matrix multiplies run on FP16 tensor cores with FP32
+accumulation. `Precision::Tf32` keeps the weights in FP32 and uses TF32 tensor
+cores on Ampere and newer GPUs, or FP32 on older ones. `Precision::Fp32` matches
+NeMo's FP32 decode token for token on any GPU:
 
 ```rust,ignore
 use scriptrs::{ModelBundle, ParakeetDeployment, Precision};
@@ -193,16 +195,19 @@ let bundle = ModelBundle::from_native_dir("models", ParakeetDeployment::v3())
     .with_precision(Precision::Fp32);
 ```
 
-`Precision::Fp16` is faster. It stores the encoder layers' linear weights in FP16,
-which has TF32's 10-bit mantissa, and runs those matrix multiplies on FP16 tensor
-cores with FP32 accumulation. On an RTX 5090 with Parakeet v3:
+On an RTX 5090 with Parakeet v3 (speed in x real time, then WER):
 
-| | TF32 (default) | FP16 |
-|---|---|---|
-| LibriSpeech test-clean, one utterance at a time | 953x, 1.93 % WER | 1166x, 1.93 % WER |
-| Earnings-21, long-form | 2498x, 8.24 % WER | 3376x, 8.24 % WER |
+| | FP16 (default) | TF32 | FP32 |
+|---|---|---|---|
+| LibriSpeech test-clean, one utterance at a time | 1416x, 1.93 % | 1104x, 1.93 % | — |
+| Earnings-21, long-form | 3443x, 8.24 % | 2524x, 8.24 % | — |
+| FLEURS de, es, fr, it, nl, pt (15.8 h) | 1671x, 4.57 % | 1344x, 4.57 % | 917x, 4.57 % |
+| MLS es, fr, it, pt (15.8 h) | 1740x, 6.25 % | 1407x, 6.26 % | 944x, 6.26 % |
 
-On LibriSpeech, FP16 produces the same transcripts as TF32.
+FLEURS and MLS run one utterance at a time with automatic language selection and
+are scored with Whisper's basic normalizer. On each of their ten language sets,
+FP16 is within one word error of TF32. On LibriSpeech, FP16 gives the same
+transcripts as TF32.
 
 ## Usage
 

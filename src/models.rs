@@ -52,17 +52,17 @@ pub(crate) enum RuntimeBundle {
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Precision {
-    /// TF32 tensor-core multiplies (10-bit mantissa) on Ampere and newer GPUs; cuBLAS
-    /// runs them as FP32 on older GPUs
-    #[default]
-    Tf32,
-    /// Full FP32 multiplies, matching NeMo's FP32 decode token for token
-    Fp32,
     /// FP16 weights and operands for the Conformer layers' linear layers, with FP32
     /// accumulation; the rest of the encoder runs as [`Precision::Tf32`]. FP16 keeps
     /// TF32's 10-bit mantissa, so the weights take half the memory and the multiplies
     /// run at the faster FP16 tensor-core rate. Activations past ±65504 would overflow
+    #[default]
     Fp16,
+    /// TF32 tensor-core multiplies (10-bit mantissa) on Ampere and newer GPUs, with
+    /// FP32 weights and operands; cuBLAS runs them as FP32 on older GPUs
+    Tf32,
+    /// Full FP32 multiplies, matching NeMo's FP32 decode token for token
+    Fp32,
 }
 
 /// Native fp32 weights and vocabulary for one deployment, as
@@ -234,11 +234,11 @@ impl ModelBundle {
         }
     }
 
-    /// Set the precision of the CUDA encoder's matrix multiplies, TF32 by default
+    /// Set the precision of the CUDA encoder's matrix multiplies, FP16 by default
     ///
-    /// [`Precision::Fp32`] gives up the tensor-core speedup for output that matches
-    /// NeMo's FP32 decode exactly; [`Precision::Fp16`] is faster still with FP16
-    /// weights. Core ML bundles ignore it
+    /// [`Precision::Tf32`] keeps the weights and operands in FP32, out of FP16's
+    /// overflow range, and [`Precision::Fp32`] gives up the tensor-core speedup for
+    /// output that matches NeMo's FP32 decode exactly. Core ML bundles ignore it
     #[cfg(feature = "cuda")]
     pub fn with_precision(mut self, precision: Precision) -> Self {
         if let RuntimeBundle::Native(layout) = &mut self.runtime {
