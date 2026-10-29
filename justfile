@@ -28,10 +28,10 @@ check:
     just clippy
     just test
 
-# GPU parity tests (`gpu_` prefix) against the NeMo references; they need the GPU,
-# so submit them through the homebased gpu0 queue instead of running them directly
+# GPU tests (`gpu_` prefix): NeMo parity and the transcription queue; they need the
+# GPU, so submit them through the homebased gpu0 queue instead of running them directly
 gpu-parity *args:
-    cargo test --release --features cuda,long-form,vad --lib gpu_ -- --ignored --nocapture --test-threads 1 {{args}}
+    cargo test --release --features cuda,long-form,vad --lib --test queued gpu_ -- --ignored --nocapture --test-threads 1 {{args}}
 
 # rebuild src/cuda/ptx/<area>.sm75.ptx from crates/scriptrs-cuda-kernels with the
 # cuda-oxide nightly; a hand-built stand-in until cudakit-build owns the toolchain

@@ -531,7 +531,7 @@ impl LongFormTranscriptionPipeline {
                         control.check()?;
                         let raws = self
                             .inner
-                            .transcribe_prepared_batch(windows, config.transcription.language)?;
+                            .transcribe_prepared_batch(&windows, config.transcription.language)?;
                         raw_tasks.extend(raws.into_iter().map(Some));
                         control.check()?;
                     }

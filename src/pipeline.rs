@@ -114,7 +114,6 @@ impl TranscriptionPipeline {
         self.bundle.deployment()
     }
 
-    #[cfg(feature = "long-form")]
     pub(crate) fn decode_raw(
         &self,
         raw: &RawTranscription,
@@ -151,7 +150,7 @@ impl TranscriptionPipeline {
             global_sample_offset,
             context_samples,
         };
-        let mut raws = self.transcribe_prepared_batch(vec![window], language)?;
+        let mut raws = self.transcribe_prepared_batch(std::slice::from_ref(&window), language)?;
         Ok(raws.remove(0))
     }
 
@@ -164,7 +163,7 @@ impl TranscriptionPipeline {
     /// Transcribes windows in one model call, each placed on the recording's timeline
     pub(crate) fn transcribe_prepared_batch(
         &self,
-        windows: Vec<PreparedWindow>,
+        windows: &[PreparedWindow],
         language: crate::language::LanguageSelection,
     ) -> Result<Vec<RawTranscription>, TranscriptionError> {
         let chunks: Vec<EncoderChunk<'_>> = windows
@@ -174,7 +173,7 @@ impl TranscriptionPipeline {
         let decoded = self.model.transcribe_batch(&chunks, language)?;
         Ok(decoded
             .into_iter()
-            .zip(&windows)
+            .zip(windows)
             .map(|(decoded, window)| {
                 let mut raw = decoded.raw;
                 apply_time_offsets(
@@ -187,7 +186,6 @@ impl TranscriptionPipeline {
             .collect())
     }
 
-    #[cfg(feature = "long-form")]
     pub(crate) fn chunk_preparer(config: &TranscriptionConfig) -> ChunkPreparer {
         ChunkPreparer::new(config)
     }
@@ -238,14 +236,12 @@ impl PreparedChunk {
     }
 }
 
-#[cfg(feature = "long-form")]
 #[derive(Debug)]
 pub(crate) struct ChunkPreparer {
     config: TranscriptionConfig,
     extractor: ParakeetFeatureExtractor,
 }
 
-#[cfg(feature = "long-form")]
 impl ChunkPreparer {
     fn new(config: &TranscriptionConfig) -> Self {
         Self {

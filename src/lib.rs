@@ -151,6 +151,7 @@ mod native;
 mod pipeline;
 #[cfg(feature = "long-form")]
 mod preprocessing;
+mod queue;
 #[cfg(test)]
 mod test_support;
 mod types;
@@ -190,6 +191,10 @@ pub use preprocessing::{
     AudioWindowMut, PreprocessedTranscriptionError, SourceSampleRange, TranscriptionControl,
     TranscriptionControlError, TranscriptionDeadline, WindowIndex, WindowLimit, WindowLimitError,
     WindowPreprocessor,
+};
+pub use queue::{
+    QueueConfig, QueueError, QueueReceiver, QueueReceiverIter, QueueSender,
+    QueuedTranscriptionJobId, QueuedTranscriptionRequest, QueuedTranscriptionResult,
 };
 pub use types::{TimedToken, TranscriptChunk, TranscriptionResult};
 pub use vocab::Vocabulary;

@@ -481,6 +481,14 @@ pub(crate) struct CoreMlModel {
     input_dict: RefCell<Retained<NSMutableDictionary<NSString, AnyObject>>>,
 }
 
+// SAFETY: a model is used from one thread at a time: it is not `Sync`, and the
+// queue moves its pipeline to the worker thread whole. Apple documents MLModel
+// prediction as thread-safe, the noop deallocator block captures nothing, and
+// the input dictionary is only touched inside `predict`, through the `RefCell`.
+// speakrs moves its Core ML models to worker threads the same way
+#[cfg(target_os = "macos")]
+unsafe impl Send for CoreMlModel {}
+
 #[cfg(target_os = "macos")]
 impl std::fmt::Debug for CoreMlModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -612,6 +620,10 @@ pub(crate) struct CachedInputShape {
     total_elements: usize,
 }
 
+// SAFETY: the NSString and NSArrays are immutable after construction and only read
+#[cfg(target_os = "macos")]
+unsafe impl Send for CachedInputShape {}
+
 #[cfg(target_os = "macos")]
 impl std::fmt::Debug for CachedInputShape {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -653,6 +665,10 @@ struct CachedOutputKey {
     name: &'static str,
     key: Retained<NSString>,
 }
+
+// SAFETY: the NSString is immutable after construction and only read
+#[cfg(target_os = "macos")]
+unsafe impl Send for CachedOutputKey {}
 
 #[cfg(target_os = "macos")]
 impl std::fmt::Debug for CachedOutputKey {

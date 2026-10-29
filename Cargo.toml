@@ -85,3 +85,7 @@ tempfile = "3.23.0"
 [[example]]
 name = "cuda_bench"
 required-features = ["cuda", "long-form"]
+
+[[test]]
+name = "queued"
+required-features = ["cuda"]

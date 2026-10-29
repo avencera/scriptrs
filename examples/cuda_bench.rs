@@ -6,6 +6,11 @@
 //! mel, encoder, decode and detokenization for every utterance. Writes a summary
 //! and `<out>.texts.json` (`{id: text}`) for `dev-tools/nemo/wer.py`
 //!
+//! With `--queue`, the utterances go through the pipeline's background queue
+//! instead, pushed in the same order from a second thread, which overlaps feature
+//! extraction with the model; `--batch` sets the queue's `max_batch` (default
+//! [`QueueConfig::DEFAULT_MAX_BATCH`]), and 1 runs each utterance alone
+//!
 //! With `--long <wav or directory>` (repeatable), the first recording runs once as
 //! warmup, then each runs through the long-form pipeline with the bundle's
 //! defaults; the timed region excludes reading the files, and transcripts are keyed
@@ -28,13 +33,15 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use eyre::{Result, bail, eyre};
 use hound::WavReader;
 use scriptrs::{
     LanguageSelection, LongFormConfig, LongFormTranscriptionPipeline, ModelBundle,
-    ParakeetDeployment, ParakeetLanguage, Precision, TranscriptionConfig, TranscriptionPipeline,
+    ParakeetDeployment, ParakeetLanguage, Precision, QueueConfig, QueueError,
+    QueuedTranscriptionRequest, TranscriptionConfig, TranscriptionPipeline,
 };
 use serde_json::{Value, json};
 
@@ -54,6 +61,7 @@ struct Args {
     precision: Precision,
     vad: bool,
     vad_threshold: Option<f32>,
+    queue: bool,
 }
 
 struct Utterance {
@@ -77,7 +85,11 @@ fn run() -> Result<()> {
     let bundle = ModelBundle::from_native_dir(&args.models, args.deployment.clone())
         .with_precision(args.precision);
     let (audio_s, walls, texts, batch) = if args.long.is_empty() {
-        bench_manifest(bundle, &args.manifest, args.repeats, args.language)?
+        let queue = args.queue.then(|| QueueConfig {
+            max_batch: args.batch.unwrap_or(QueueConfig::DEFAULT_MAX_BATCH),
+            ..QueueConfig::default()
+        });
+        bench_manifest(bundle, &args.manifest, args.repeats, args.language, queue)?
     } else {
         bench_long(bundle, &args.long, &args)?
     };
@@ -94,6 +106,7 @@ fn run() -> Result<()> {
         "long": !args.long.is_empty(),
         "vad": args.vad,
         "vad_threshold": args.vad_threshold,
+        "queue": args.queue,
         "n_utts": texts.len(),
         "audio_s": audio_s,
         "walls_s": walls,
@@ -131,6 +144,7 @@ fn bench_manifest(
     manifest: &Path,
     repeats: usize,
     language: LanguageSelection,
+    queue: Option<QueueConfig>,
 ) -> Result<Bench> {
     let pipeline = TranscriptionPipeline::from_bundle(bundle)?;
     let config = TranscriptionConfig {
@@ -156,13 +170,58 @@ fn bench_manifest(
     for _ in 0..repeats {
         texts.clear();
         let started = Instant::now();
-        for utterance in &utterances {
-            let text = pipeline.run_with_config(&utterance.audio, &config)?.text;
-            texts.insert(utterance.id.clone(), text);
+        match queue {
+            None => {
+                for utterance in &utterances {
+                    let text = pipeline.run_with_config(&utterance.audio, &config)?.text;
+                    texts.insert(utterance.id.clone(), text);
+                }
+            }
+            Some(queue) => {
+                let (sender, receiver) = pipeline
+                    .clone()
+                    .into_queued_with_config(config.clone(), queue)?;
+                let utterances = &utterances;
+                thread::scope(|scope| -> Result<()> {
+                    let producer = scope.spawn(move || push_all(&sender, utterances));
+                    for queued in receiver {
+                        let queued = queued?;
+                        texts.insert(queued.id, queued.result?.text);
+                    }
+                    producer
+                        .join()
+                        .map_err(|_| eyre!("the producer thread panicked"))??;
+                    Ok(())
+                })?;
+            }
         }
         walls.push(started.elapsed().as_secs_f64());
     }
-    Ok((audio_s, walls, texts, 1))
+    Ok((
+        audio_s,
+        walls,
+        texts,
+        queue.map_or(1, |queue| queue.max_batch),
+    ))
+}
+
+/// Pushes every utterance, in order, retrying while the queue is full
+fn push_all(sender: &scriptrs::QueueSender, utterances: &[Utterance]) -> Result<(), QueueError> {
+    for utterance in utterances {
+        let mut request =
+            QueuedTranscriptionRequest::new(utterance.id.clone(), utterance.audio.clone());
+        loop {
+            match sender.try_push(request) {
+                Ok(_) => break,
+                Err(QueueError::Full(rejected)) => {
+                    request = rejected;
+                    thread::sleep(Duration::from_micros(200));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
 }
 
 fn bench_long(bundle: ModelBundle, paths: &[PathBuf], args: &Args) -> Result<Bench> {
@@ -256,6 +315,7 @@ fn parse_args() -> Result<Args> {
     let mut precision = Precision::default();
     let mut vad = false;
     let mut vad_threshold = None;
+    let mut queue = false;
     let mut args = env::args().skip(1);
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| eyre!("{flag} needs a value"));
@@ -285,6 +345,7 @@ fn parse_args() -> Result<Args> {
             "--vad" if cfg!(feature = "vad") => vad = true,
             "--vad" => return Err(eyre!("--vad needs the `vad` feature")),
             "--vad-threshold" => vad_threshold = Some(value()?.parse()?),
+            "--queue" => queue = true,
             other => return Err(eyre!("unknown argument {other}")),
         }
     }
@@ -310,6 +371,7 @@ fn parse_args() -> Result<Args> {
         precision,
         vad,
         vad_threshold,
+        queue,
     })
 }
 
