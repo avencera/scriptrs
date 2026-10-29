@@ -8,10 +8,10 @@ Fast [NVIDIA Parakeet TDT](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) s
 - Long-form transcription of hour-long recordings, with optional VAD
 - Token-level timestamps and confidences
 
-On an RTX 5090, the CUDA backend transcribes LibriSpeech test-clean at 1108x real
-time, 2.3x as fast as NVIDIA NeMo and 4.4x as fast as parakeet-rs, at the same
-word error rate. Through the batching queue it runs at
-3296x. See [CUDA](#cuda) for the numbers.
+On an RTX 5090, the CUDA backend transcribes LibriSpeech test-clean at 1176x real
+time, 2.5x as fast as NVIDIA NeMo and 4.6x as fast as parakeet-rs, at the same
+word error rate. Through the batching queue it runs at 3370x. See [CUDA](#cuda)
+for the numbers.
 
 `scriptrs` is early: the public API is still moving.
 
@@ -135,13 +135,13 @@ time:
 
 | | Speed (x real time) | vs parakeet-rs | WER |
 |---|---|---|---|
-| scriptrs | 1108x | 4.4x | 1.93 % |
+| scriptrs | 1176x | 4.6x | 1.93 % |
 | NVIDIA NeMo | 477x | 1.9x | 1.93 % |
 | parakeet-rs 0.4.3 (ONNX Runtime) | 253x | 1x | 1.93 % |
 
 Through the [queue](#many-short-inputs), which prepares the next inputs on the CPU
-while the GPU runs, the same set runs at 1098x one at a time with identical
-transcripts, and at 3296x in batches of up to 16 (the default). Batching changes 4
+while the GPU runs, the same set runs at 1305x one at a time with identical
+transcripts, and at 3370x in batches of up to 16 (the default). Batching changes 4
 of the 2620 transcripts by one word or punctuation mark, for 1.92 % WER.
 
 On all 44 Earnings-21 calls (39 h), long-form with the defaults runs at 2600x with
