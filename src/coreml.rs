@@ -15,6 +15,8 @@ use std::ffi::c_void;
 use std::path::Path;
 #[cfg(target_os = "macos")]
 use std::ptr::NonNull;
+#[cfg(target_os = "macos")]
+use std::sync::{Arc, Mutex, PoisonError};
 
 #[cfg(target_os = "macos")]
 use block2::RcBlock;
@@ -477,15 +479,19 @@ pub(crate) struct SileroVadOutput {
 #[cfg(target_os = "macos")]
 pub(crate) struct CoreMlModel {
     model: Retained<MLModel>,
+    /// Held across every prediction, and shared by clones, which share `model`
+    prediction: Arc<Mutex<()>>,
     noop_deallocator: RcBlock<dyn Fn(NonNull<c_void>)>,
     input_dict: RefCell<Retained<NSMutableDictionary<NSString, AnyObject>>>,
 }
 
-// SAFETY: a model is used from one thread at a time: it is not `Sync`, and the
-// queue moves its pipeline to the worker thread whole. Apple documents MLModel
-// prediction as thread-safe, the noop deallocator block captures nothing, and
-// the input dictionary is only touched inside `predict`, through the `RefCell`.
-// speakrs moves its Core ML models to worker threads the same way
+// SAFETY: each wrapper is used from one thread at a time: it is not `Sync`, and
+// the queue moves its pipeline to the worker thread whole. Clones share the
+// `MLModel`, and Apple requires synchronous predictions on one model to run one
+// at a time, so every prediction holds the clones' shared `prediction` lock. The
+// noop deallocator block captures nothing, and each clone has its own input
+// dictionary, only touched inside a prediction, through the `RefCell`. speakrs
+// moves its Core ML models to worker threads the same way
 #[cfg(target_os = "macos")]
 unsafe impl Send for CoreMlModel {}
 
@@ -501,6 +507,7 @@ impl Clone for CoreMlModel {
     fn clone(&self) -> Self {
         Self {
             model: self.model.clone(),
+            prediction: Arc::clone(&self.prediction),
             noop_deallocator: RcBlock::new(|_: NonNull<c_void>| {}),
             input_dict: RefCell::new(NSMutableDictionary::new()),
         }
@@ -512,6 +519,7 @@ impl CoreMlModel {
     pub(crate) fn new(path: &Path) -> Result<Self, TranscriptionError> {
         Ok(Self {
             model: runtime::load_model(path, configured_compute_units()?)?,
+            prediction: Arc::new(Mutex::new(())),
             noop_deallocator: RcBlock::new(|_: NonNull<c_void>| {}),
             input_dict: RefCell::new(NSMutableDictionary::new()),
         })
@@ -559,6 +567,12 @@ impl CoreMlModel {
             &RcBlock<dyn Fn(NonNull<c_void>)>,
         ) -> Result<T, TranscriptionError>,
     ) -> Result<T, TranscriptionError> {
+        // the lock guards no data, so a panic in another prediction leaves nothing
+        // inconsistent
+        let _predicting = self
+            .prediction
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         autoreleasepool(|_| {
             let input_dict = self.input_dict.borrow_mut();
             input_dict.removeAllObjects();
