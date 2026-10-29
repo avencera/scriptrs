@@ -20,6 +20,8 @@
 //! default workers prepare windows ahead of the model. `--language <code>` decodes
 //! with that language's filter instead of automatic language selection,
 //! `--tf32` or `--fp32` runs the encoder GEMMs in that precision instead of FP16,
+//! as do the quantized precisions `--fp8`, `--fp8-tensor`, `--fp8-token`, `--mxfp8`,
+//! `--nvfp4`, `--int8-weights`, `--int4-weights` and `--int4-weights64`,
 //! and `--vad` (with the `vad` feature) plans long recordings from Silero speech
 //! regions instead of overlap windows over the whole recording, at
 //! `--vad-threshold <p>` if given
@@ -98,11 +100,7 @@ fn run() -> Result<()> {
     let mut sorted = walls.clone();
     sorted.sort_by(f64::total_cmp);
     let summary = json!({
-        "backend": match args.precision {
-            Precision::Fp32 => "scriptrs-cuda-fp32",
-            Precision::Tf32 => "scriptrs-cuda-tf32",
-            Precision::Fp16 => "scriptrs-cuda-fp16",
-        },
+        "backend": format!("scriptrs-cuda-{}", precision_name(args.precision)),
         "version": version,
         "bs": batch,
         "long": !args.long.is_empty(),
@@ -303,6 +301,23 @@ fn stem(path: &Path) -> Result<String> {
         .ok_or_else(|| eyre!("{} has no file stem", path.display()))
 }
 
+/// The name a precision's flag and backend label use
+fn precision_name(precision: Precision) -> &'static str {
+    match precision {
+        Precision::Fp32 => "fp32",
+        Precision::Tf32 => "tf32",
+        Precision::Fp16 => "fp16",
+        Precision::Fp8 => "fp8",
+        Precision::Fp8PerTensor => "fp8-tensor",
+        Precision::Fp8PerToken => "fp8-token",
+        Precision::Mxfp8 => "mxfp8",
+        Precision::Nvfp4 => "nvfp4",
+        Precision::Int8Weights => "int8-weights",
+        Precision::Int4Weights => "int4-weights",
+        Precision::Int4Weights64 => "int4-weights64",
+    }
+}
+
 fn parse_args() -> Result<Args> {
     let mut models = None;
     let mut deployment = ParakeetDeployment::v3();
@@ -345,6 +360,14 @@ fn parse_args() -> Result<Args> {
             }
             "--tf32" => precision = Precision::Tf32,
             "--fp32" => precision = Precision::Fp32,
+            "--fp8" => precision = Precision::Fp8,
+            "--fp8-tensor" => precision = Precision::Fp8PerTensor,
+            "--fp8-token" => precision = Precision::Fp8PerToken,
+            "--mxfp8" => precision = Precision::Mxfp8,
+            "--nvfp4" => precision = Precision::Nvfp4,
+            "--int8-weights" => precision = Precision::Int8Weights,
+            "--int4-weights" => precision = Precision::Int4Weights,
+            "--int4-weights64" => precision = Precision::Int4Weights64,
             "--vad" if cfg!(feature = "vad") => vad = true,
             "--vad" => return Err(eyre!("--vad needs the `vad` feature")),
             "--vad-threshold" => vad_threshold = Some(value()?.parse()?),

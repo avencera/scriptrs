@@ -252,6 +252,25 @@ FP16 is within one word error of TF32. On LibriSpeech one utterance at a time,
 FP16 gives the same transcripts as TF32. Batching changes a few transcripts in
 either precision, so the queued FP16 and TF32 transcripts differ slightly.
 
+Lower precisions quantize the same linear weights when the model loads.
+`Precision::Fp8` stores FP8 E4M3 weights with a scale per output channel and
+quantizes each activation with one scale per product, and `Precision::Fp8PerTensor`
+and `Precision::Fp8PerToken` change those scales; the FP8 modes need an Ada or newer
+GPU. `Precision::Mxfp8` and `Precision::Nvfp4` use Blackwell's block-scaled tensor
+cores. `Precision::Int8Weights`, `Precision::Int4Weights` and
+`Precision::Int4Weights64` keep only the weights small and run FP16 products on any
+GPU. To skip quantizing at load and download less, write the weights in a
+precision's own file:
+
+```sh
+cargo run --release --features cuda --example quantize_native -- models/parakeet-v3/model.safetensors fp8
+```
+
+This writes `model-fp8.safetensors` beside `model.safetensors`. A bundle loaded with
+that precision reads the precision's own file when it is present and needs no FP32
+file. `fp16` writes FP16 weights for the default precision, half the size of the
+FP32 file, with the same transcripts.
+
 ## Usage
 
 ### Short audio

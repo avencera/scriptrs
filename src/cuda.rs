@@ -7,7 +7,10 @@ pub(crate) mod decoder;
 pub(crate) mod encoder;
 pub(crate) mod fp16;
 pub(crate) mod kernels;
+pub(crate) mod lt;
 pub(crate) mod model;
+pub(crate) mod quant;
+pub(crate) mod stored;
 #[cfg(test)]
 pub(crate) mod test_support;
 
@@ -19,8 +22,9 @@ use cudakit::cudarc::driver::{
 };
 use cudakit::{DeviceTensor, Error, Math, Sgemm};
 
-use crate::cuda::encoder::EncoderMath;
+use crate::cuda::encoder::{EncoderMath, Quantization};
 use crate::cuda::kernels::CudaRuntime;
+use crate::cuda::quant::Scheme;
 use crate::error::TranscriptionError;
 use crate::models::Precision;
 use crate::native::weights::WeightFile;
@@ -145,10 +149,27 @@ impl<T> Drop for HostStaging<T> {
 
 /// The encoder GEMM precision of a model precision
 pub(crate) fn math(precision: Precision) -> EncoderMath {
+    match (precision, scheme(precision)) {
+        (_, Some(scheme)) => EncoderMath::Quantized(Quantization::all(scheme)),
+        (Precision::Fp32, None) => EncoderMath::Single(Math::Fp32),
+        (Precision::Tf32, None) => EncoderMath::Single(Math::Tf32),
+        (_, None) => EncoderMath::Fp16,
+    }
+}
+
+/// The scheme a quantized precision stores its linear weights in, `None` for the
+/// float precisions
+pub(crate) fn scheme(precision: Precision) -> Option<Scheme> {
     match precision {
-        Precision::Fp32 => EncoderMath::Single(Math::Fp32),
-        Precision::Tf32 => EncoderMath::Single(Math::Tf32),
-        Precision::Fp16 => EncoderMath::Fp16,
+        Precision::Fp32 | Precision::Tf32 | Precision::Fp16 => None,
+        Precision::Fp8 => Some(Scheme::Fp8Channel),
+        Precision::Fp8PerTensor => Some(Scheme::Fp8Tensor),
+        Precision::Fp8PerToken => Some(Scheme::Fp8Token),
+        Precision::Mxfp8 => Some(Scheme::Mxfp8),
+        Precision::Nvfp4 => Some(Scheme::Nvfp4),
+        Precision::Int8Weights => Some(Scheme::Int8Weights),
+        Precision::Int4Weights => Some(Scheme::Int4Weights { group: 128 }),
+        Precision::Int4Weights64 => Some(Scheme::Int4Weights { group: 64 }),
     }
 }
 

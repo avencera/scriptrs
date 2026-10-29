@@ -41,11 +41,13 @@ pub fn block_reduce(value: f32, scratch: *mut f32, combine: impl Fn(f32, f32) ->
     total
 }
 
+#[cfg(any(feature = "encoder", feature = "decode"))]
 pub fn add(a: f32, b: f32) -> f32 {
     a + b
 }
 
 /// torch's `sigmoid`, `1 / (1 + exp(-x))`
+#[cfg(any(feature = "encoder", feature = "decode"))]
 #[inline(always)]
 pub fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
