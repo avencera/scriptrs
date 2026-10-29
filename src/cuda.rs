@@ -70,8 +70,8 @@ pub(crate) enum Direction {
 /// Copies through pageable memory make the driver stage the data, and a download
 /// blocks the host until it lands. These copies queue like kernels, and `done`
 /// marks when the last one finished. cudarc records the pinned slice's own event
-/// only when it tracks several streams, which this single-stream backend never
-/// does, so the order is kept here instead
+/// only while it manages stream synchronization, which cudakit turns off during
+/// graph capture, so `done` keeps the order whatever that setting
 pub(crate) struct HostStaging<T> {
     buffer: PinnedHostSlice<T>,
     /// Recorded after each queued copy; the host waits on it before touching

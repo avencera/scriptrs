@@ -576,6 +576,9 @@ impl CudaDecoder {
         host.token_frames.download(stream, &ws.token_frames)?;
         host.token_durations.download(stream, &ws.token_durations)?;
         host.confidences.download(stream, &ws.confidences)?;
+        // the copies run in order on one stream, so once the last has landed the
+        // other reads below find their copies done and do not wait again
+        let confidences = host.confidences.read()?;
         let counts = host.counts.read()?;
         let faults = host.faults.read()?;
         if let Some(row) = faults.iter().position(|fault| *fault != 0) {
@@ -593,7 +596,6 @@ impl CudaDecoder {
         let tokens = host.tokens.read()?;
         let frames = host.token_frames.read()?;
         let durations = host.token_durations.read()?;
-        let confidences = host.confidences.read()?;
         Ok(counts
             .iter()
             .enumerate()
