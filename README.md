@@ -167,20 +167,22 @@ On all 44 Earnings-21 calls (39 h), long-form with the defaults runs at 3630x wi
 
 On harder English audio, long-form with the defaults and English selected has a
 lower WER than Whisper large-v3 (run through WhisperX 3.8.6 in float16) on every
-set:
+set, and runs 10x to 14x as fast:
 
-| Set | Recordings | Hours | scriptrs | Whisper large-v3 |
-|---|---:|---:|---:|---:|
-| Earnings-21 earnings calls | 44 | 39.3 | **8.2 %** | 9.7 % |
-| AMI meetings, headset mix | 34 | 18.7 | **21.5 %** | 23.8 % |
-| AMI meetings, far-field microphone | 34 | 18.7 | **23.2 %** | 28.3 % |
-| EdAcc accented conversations | 40 | 18.2 | **16.0 %** | 19.2 % |
-| CHiME-6 dinner parties | 4 | 9.7 | **44.0 %** | 44.7 % |
-| AppTek call-center calls, 14 accents | 56 | 9.4 | **11.2 %** | 12.6 % |
-| Mean over sets | 212 | 114 | **20.7 %** | 23.1 % |
+| Set | Recordings | Hours | scriptrs WER | Whisper WER | scriptrs speed | Whisper speed | vs Whisper |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Earnings-21 earnings calls | 44 | 39.3 | **8.2 %** | 9.7 % | **2458x** | 186x | 13.2x |
+| AMI meetings, headset mix | 34 | 18.7 | **21.5 %** | 23.8 % | **2420x** | 182x | 13.3x |
+| AMI meetings, far-field microphone | 34 | 18.7 | **23.2 %** | 28.3 % | **2414x** | 199x | 12.1x |
+| EdAcc accented conversations | 40 | 18.2 | **16.0 %** | 19.2 % | **2433x** | 201x | 12.1x |
+| CHiME-6 dinner parties | 4 | 9.7 | **44.0 %** | 44.7 % | **2438x** | 176x | 13.8x |
+| AppTek call-center calls, 14 accents | 56 | 9.4 | **11.2 %** | 12.6 % | **2220x** | 224x | 9.9x |
+| Mean over sets | 212 | 114 | **20.7 %** | 23.1 % | **2417x** | 191x | 12.6x |
 
 WER is pooled over each set's recordings, both sides through Whisper's English
-normalizer.
+normalizer. Speed is x real time for transcription alone on one RTX 5090, with
+models loaded and audio in memory; WhisperX runs its VAD with batch size 16. The
+last row's speed is over all 114 hours.
 
 With `vad`, Silero VAD v5 runs on the CPU, at about 0.3 s per hour of audio. On a
 GPU each step of its recurrence costs more in launches than the whole step costs on
