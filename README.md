@@ -153,11 +153,11 @@ shorter overlaps lose accuracy on long recordings.
 On an RTX 5090, Parakeet v3 on LibriSpeech test-clean (5.4 h), one utterance at a
 time:
 
-| | Speed (x real time) | vs parakeet-rs | WER |
+| | Speed (x real time) | vs NeMo | WER |
 |---|---|---|---|
-| scriptrs | 1534x | 6.1x | 1.93 % |
-| NVIDIA NeMo | 477x | 1.9x | 1.93 % |
-| parakeet-rs 0.4.3 (ONNX Runtime) | 253x | 1x | 1.93 % |
+| scriptrs | 1534x | 3.2x | 1.93 % |
+| NVIDIA NeMo | 477x | 1x | 1.93 % |
+| parakeet-rs 0.4.3 (ONNX Runtime) | 253x | 0.53x | 1.93 % |
 
 Through the [queue](#many-short-inputs), which prepares the next inputs on the CPU
 while the GPU runs, the same set runs at 1761x one at a time with identical
