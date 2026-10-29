@@ -364,13 +364,42 @@ impl ModelBundle {
         }
         ModelManager::new()?.ensure_with_deployment(deployment, true)
     }
+
+    #[cfg(all(feature = "online", feature = "cuda"))]
+    /// Download native CUDA weights for a deployment from Hugging Face
+    ///
+    /// This resolves `model.safetensors` and the vocabulary from the pinned
+    /// `avencera/scriptrs-models` snapshot, then behaves like
+    /// [`Self::from_native_dir`]. Set `SCRIPTRS_MODELS_DIR` to force a local
+    /// native bundle.
+    pub fn from_pretrained_native(
+        deployment: ParakeetDeployment,
+    ) -> Result<Self, hf_hub::api::sync::ApiError> {
+        if let Ok(models_dir) = std::env::var(SCRIPTRS_MODELS_DIR_ENV) {
+            return Ok(Self::from_native_dir(models_dir, deployment));
+        }
+        ModelManager::new()?.ensure_native(deployment, false)
+    }
+
+    #[cfg(all(feature = "online", feature = "cuda", feature = "vad"))]
+    /// Download native CUDA weights and the native Silero VAD weights
+    ///
+    /// Set `SCRIPTRS_MODELS_DIR` to force a local native bundle.
+    pub fn from_pretrained_native_long_form(
+        deployment: ParakeetDeployment,
+    ) -> Result<Self, hf_hub::api::sync::ApiError> {
+        if let Ok(models_dir) = std::env::var(SCRIPTRS_MODELS_DIR_ENV) {
+            return Ok(Self::from_native_dir(models_dir, deployment));
+        }
+        ModelManager::new()?.ensure_native(deployment, true)
+    }
 }
 
 #[cfg(feature = "online")]
 const HF_REPO: HuggingFaceRepository = HuggingFaceRepository("avencera/scriptrs-models");
 #[cfg(feature = "online")]
 const HF_REVISION: HuggingFaceRevision =
-    HuggingFaceRevision("5fbef649fc28117307a967e509be696c77b6e521");
+    HuggingFaceRevision("63f6f9cbce43e5561c219229896f86f20c0eb660");
 
 #[cfg(feature = "online")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -470,6 +499,32 @@ impl ModelManager {
         let _ = include_vad;
         let root = self.download_repo_layout(&self.repo, &files)?;
         Ok(ModelBundle::from_dir_with_deployment(root, deployment))
+    }
+
+    /// Ensure a deployment's native CUDA weights are cached locally
+    ///
+    /// With `include_vad`, the native Silero VAD weights are cached too. The
+    /// returned [`ModelBundle`] is a native bundle rooted at the snapshot directory.
+    #[cfg(feature = "cuda")]
+    pub fn ensure_native(
+        &self,
+        deployment: ParakeetDeployment,
+        include_vad: bool,
+    ) -> Result<ModelBundle, hf_hub::api::sync::ApiError> {
+        let layout = deployment.layout();
+        let mut files = vec![
+            layout.vocab().to_owned(),
+            deployment.native_weights_path().to_owned(),
+        ];
+        #[cfg(feature = "vad")]
+        if include_vad {
+            files.push(NATIVE_VAD_PATH.to_owned());
+        }
+        #[cfg(not(feature = "vad"))]
+        let _ = include_vad;
+
+        let root = self.download_repo_layout(&self.repo, &files)?;
+        Ok(ModelBundle::from_native_dir(root, deployment))
     }
 
     fn download_repo_layout(
