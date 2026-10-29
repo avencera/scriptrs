@@ -175,7 +175,7 @@ default scores the same WER as FP32. Speed is for the FP16 default:
 | FLEURS de, es, fr, it, nl, pt (15.8 h) | 1839x | 4.57 % | 4.57 % |
 | MLS es, fr, it, pt (15.8 h) | 1921x | 6.25 % | 6.26 % |
 
-On all 44 Earnings-21 calls (39 h), long-form with the defaults runs at 3630x with
+On all 44 Earnings-21 calls (39 h), long-form with the defaults runs at 3541x with
 8.24 % pooled WER; NeMo transcribing each whole call with local attention scores
 9.58 %.
 
