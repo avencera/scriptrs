@@ -1200,6 +1200,10 @@ mod tests {
         LongFormConfig, LongFormMode, PreparationContext, RegionTaskKind, WindowPreprocessor,
         parallel_worker_count, prepare_window_samples,
     };
+    #[cfg(all(feature = "cuda", feature = "vad"))]
+    use super::{SileroVad, detect_speech_regions};
+    #[cfg(all(feature = "cuda", feature = "vad"))]
+    use crate::constants::SAMPLE_RATE;
     #[cfg(feature = "cuda")]
     use crate::cuda::test_support::nemo_parity_bundle;
     use crate::deployment::ParakeetDeployment;
@@ -1210,6 +1214,8 @@ mod tests {
     use crate::preprocessing::{
         AudioWindowMut, TranscriptionControl, TranscriptionDeadline, WindowLimit,
     };
+    #[cfg(all(feature = "cuda", feature = "vad"))]
+    use crate::test_support::NemoReference;
 
     #[derive(Debug)]
     struct HookError;
@@ -1813,5 +1819,189 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(120))
             .expect("the batched run should end after a worker panics, not hang");
         assert!(panicked, "the batched run should raise the worker's panic");
+    }
+
+    /// Speech probabilities of the reference recording, from the native VAD and
+    /// from Silero itself
+    #[cfg(all(feature = "cuda", feature = "vad"))]
+    fn reference_probabilities() -> (Vec<f32>, Vec<f32>, usize) {
+        let reference = NemoReference::silero();
+        let audio = reference.f32("audio");
+        let audio = audio.as_slice().expect("contiguous audio");
+        let vad = SileroVad::from_bundle(&nemo_parity_bundle(ParakeetDeployment::v3()))
+            .expect("native VAD should load")
+            .expect("the native bundle should have a VAD model");
+        let ours = vad
+            .process(
+                audio,
+                &LongFormConfig::default().vad,
+                &TranscriptionControl::internal_unbounded(),
+            )
+            .expect("VAD scan");
+        (
+            ours,
+            reference.f32("probs").into_iter().collect(),
+            audio.len(),
+        )
+    }
+
+    /// Regions and planned ASR windows `(start, end)` for one set of probabilities
+    #[cfg(all(feature = "cuda", feature = "vad"))]
+    fn speech_plan(
+        probabilities: &[f32],
+        audio_len: usize,
+        config: &LongFormConfig,
+    ) -> (Vec<SampleRange>, Vec<(usize, usize)>) {
+        let regions = detect_speech_regions(
+            probabilities,
+            audio_len,
+            config.segmentation.threshold(config.vad.default_threshold),
+            &config.segmentation,
+        );
+        let mut tasks = Vec::new();
+        for region in &regions {
+            build_region_plan(*region, probabilities, config, &mut tasks);
+        }
+        let windows = tasks
+            .iter()
+            .map(|task| (task.audio_start, task.audio_end))
+            .collect();
+        (regions, windows)
+    }
+
+    /// The native VAD's probabilities plan the same speech regions and ASR windows
+    /// as Silero's own on the reference recording, with the native defaults and with
+    /// 3 s windows that make the planner split the region on its probabilities
+    #[cfg(all(feature = "cuda", feature = "vad"))]
+    #[test]
+    #[ignore = "reads Silero references from /shared/datasets/parakeet-ref"]
+    fn nemo_parity_native_vad_plans_the_reference_windows() {
+        let (ours, expected, audio_len) = reference_probabilities();
+        let defaults = LongFormConfig::for_bundle(&nemo_parity_bundle(ParakeetDeployment::v3()));
+        let mut short_windows = defaults.clone();
+        short_windows.overlap.max_model_samples = 48_000;
+
+        for config in [defaults, short_windows] {
+            let plan = speech_plan(&ours, audio_len, &config);
+            assert!(!plan.0.is_empty(), "the reference recording is speech");
+            assert_eq!(plan, speech_plan(&expected, audio_len, &config));
+        }
+    }
+
+    /// Reference speech, 20 s of silence, speech, silence, speech: past the native
+    /// single-input limit, with gaps the VAD must leave out
+    #[cfg(all(feature = "cuda", feature = "vad"))]
+    fn sparse_speech() -> (Vec<f32>, Vec<usize>) {
+        let speech = NemoReference::silero().f32("audio");
+        let speech = speech.as_slice().expect("contiguous audio");
+        let gap = vec![0.0; 20 * SAMPLE_RATE];
+        let audio = [speech, &gap, speech, &gap, speech].concat();
+        let gap_midpoints = (1..=2)
+            .map(|gap_index| gap_index * speech.len() + (2 * gap_index - 1) * gap.len() / 2)
+            .collect();
+        (audio, gap_midpoints)
+    }
+
+    /// The native pipeline in VAD mode, otherwise configured as [`native_pipeline`]
+    #[cfg(all(feature = "cuda", feature = "vad"))]
+    fn native_vad_pipeline() -> (LongFormTranscriptionPipeline, LongFormConfig) {
+        let (pipeline, config) = native_pipeline();
+        let config = LongFormConfig {
+            mode: LongFormMode::Vad,
+            ..config
+        };
+        (pipeline, config)
+    }
+
+    /// Windows the VAD plan for `audio` sends to the model, as `(index, start, end)`
+    #[cfg(all(feature = "cuda", feature = "vad"))]
+    fn planned_vad_windows(
+        pipeline: &LongFormTranscriptionPipeline,
+        audio: &[f32],
+        config: &LongFormConfig,
+    ) -> Vec<(usize, usize, usize)> {
+        let vad = pipeline
+            .vad
+            .as_ref()
+            .expect("the native bundle has a VAD model");
+        let probabilities = vad
+            .process(
+                audio,
+                &config.vad,
+                &TranscriptionControl::internal_unbounded(),
+            )
+            .expect("VAD scan");
+        let (_, windows) = speech_plan(&probabilities, audio.len(), config);
+        windows
+            .into_iter()
+            .enumerate()
+            .map(|(index, (start, end))| (index, start, end))
+            .collect()
+    }
+
+    /// In VAD mode every path preprocesses exactly the planned speech windows, and
+    /// none of them reaches into the middle of a silent gap
+    #[cfg(all(feature = "cuda", feature = "vad"))]
+    #[test]
+    #[ignore = "needs a CUDA GPU and the native weights; `just gpu-parity` runs it on gpu0"]
+    fn gpu_vad_runs_the_preprocessor_once_per_planned_speech_window() {
+        let (pipeline, base) = native_vad_pipeline();
+        let (audio, gap_midpoints) = sparse_speech();
+        assert!(audio.len() > base.transcription.max_audio_samples);
+
+        for path in [
+            ExecutionPath::Serial,
+            ExecutionPath::Parallel,
+            ExecutionPath::Batched,
+        ] {
+            let config = path.config(&base);
+            let planned = planned_vad_windows(&pipeline, &audio, &config);
+            assert!(planned.len() >= 3, "{path:?} planned {planned:?}");
+            for midpoint in &gap_midpoints {
+                assert!(
+                    planned
+                        .iter()
+                        .all(|(_, start, end)| end <= midpoint || start >= midpoint),
+                    "{path:?} planned a window across the gap at {midpoint}: {planned:?}"
+                );
+            }
+            let hook = RecordingHook(Arc::new(Mutex::new(Vec::new())));
+
+            let result = pipeline
+                .run_with_preprocessor(&audio, &config, &recording_control(planned.len()), &hook)
+                .unwrap_or_else(|error| panic!("{path:?} run failed: {error}"));
+
+            let mut observed = observed_hooks(&hook);
+            if !matches!(path, ExecutionPath::Serial) {
+                observed.sort_unstable();
+            }
+            assert_eq!(observed, planned, "{path:?} preprocessed windows");
+            assert!(!result.text.is_empty(), "{path:?} transcribed no speech");
+        }
+    }
+
+    /// Silence plans no speech, so no path calls the preprocessor or the model
+    #[cfg(all(feature = "cuda", feature = "vad"))]
+    #[test]
+    #[ignore = "needs a CUDA GPU and the native weights; `just gpu-parity` runs it on gpu0"]
+    fn gpu_vad_skips_the_model_on_silence() {
+        let (pipeline, base) = native_vad_pipeline();
+        let audio = vec![0.0; LONG_AUDIO_SAMPLES];
+
+        for path in [
+            ExecutionPath::Serial,
+            ExecutionPath::Parallel,
+            ExecutionPath::Batched,
+        ] {
+            let config = path.config(&base);
+            let hook = RecordingHook(Arc::new(Mutex::new(Vec::new())));
+
+            let result = pipeline
+                .run_with_preprocessor(&audio, &config, &recording_control(1), &hook)
+                .unwrap_or_else(|error| panic!("{path:?} run failed: {error}"));
+
+            assert!(observed_hooks(&hook).is_empty(), "{path:?} ran windows");
+            assert!(result.text.is_empty(), "{path:?} transcribed silence");
+        }
     }
 }

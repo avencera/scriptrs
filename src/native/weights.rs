@@ -94,8 +94,17 @@ impl WeightFile {
         Ok(weights)
     }
 
-    fn expect_metadata(&self, key: &str, expected: &str) -> Result<(), TranscriptionError> {
-        match self.metadata.get(key) {
+    /// One string from the safetensors header metadata
+    pub(crate) fn metadata(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key).map(String::as_str)
+    }
+
+    pub(crate) fn expect_metadata(
+        &self,
+        key: &str,
+        expected: &str,
+    ) -> Result<(), TranscriptionError> {
+        match self.metadata(key) {
             Some(found) if found == expected => Ok(()),
             Some(found) => Err(invalid(format!(
                 "metadata `{key}` is `{found}`, expected `{expected}`"

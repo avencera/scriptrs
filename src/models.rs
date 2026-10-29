@@ -9,6 +9,10 @@ use hf_hub::{Repo, RepoType};
 
 #[cfg(feature = "vad")]
 const VAD_DIR: &str = "vad/silero-vad.mlmodelc";
+/// Silero v5 weights in a native bundle, as `dev-tools/nemo/export_native.py`
+/// writes them next to the Parakeet directories
+#[cfg(all(feature = "cuda", feature = "vad"))]
+const NATIVE_VAD_PATH: &str = "vad/silero-vad-v5.safetensors";
 /// Longest single input for native bundles, 40 s at 16 kHz; the CUDA encoder has no
 /// fixed input width, and full attention over 40 s still fits easily in memory
 #[cfg(feature = "cuda")]
@@ -63,6 +67,8 @@ pub enum Precision {
 pub(crate) struct NativeLayout {
     weights_path: PathBuf,
     vocab_path: PathBuf,
+    #[cfg(feature = "vad")]
+    vad_path: PathBuf,
     precision: Precision,
 }
 
@@ -72,6 +78,8 @@ impl NativeLayout {
         Self {
             weights_path: root.join(deployment.native_weights_path()),
             vocab_path: root.join(deployment.layout().vocab()),
+            #[cfg(feature = "vad")]
+            vad_path: root.join(NATIVE_VAD_PATH),
             precision: Precision::default(),
         }
     }
@@ -90,6 +98,11 @@ impl NativeLayout {
 
     pub(crate) fn weights_path(&self) -> &Path {
         &self.weights_path
+    }
+
+    #[cfg(feature = "vad")]
+    pub(crate) fn vad_path(&self) -> &Path {
+        &self.vad_path
     }
 
     pub(crate) fn precision(&self) -> Precision {
@@ -196,9 +209,10 @@ impl ModelBundle {
     /// Resolve native fp32 weights for the CUDA backend from a local directory
     ///
     /// The directory holds `parakeet-v2/` or `parakeet-v3/` with `model.safetensors`
-    /// and the vocabulary, as `dev-tools/nemo/export_native.py` writes them. This
-    /// only resolves paths; [`Self::validate_base`] checks they exist, and loading
-    /// checks the weights against the deployment.
+    /// and the vocabulary, as `dev-tools/nemo/export_native.py` writes them. With
+    /// `vad`, the Silero VAD weights are `vad/silero-vad-v5.safetensors` in the same
+    /// directory. This only resolves paths; [`Self::validate_base`] checks they
+    /// exist, and loading checks the weights against the deployment.
     ///
     /// The CUDA encoder takes inputs of any length, so a native bundle raises the
     /// deployment's single-input limit to 40 s, enough for whole LibriSpeech
@@ -253,7 +267,11 @@ impl ModelBundle {
             }
             RuntimeBundle::CoreMl(_) => Ok(()),
             #[cfg(feature = "cuda")]
-            RuntimeBundle::Native(_) => Err(self.missing_vad_error()),
+            RuntimeBundle::Native(layout) if !layout.vad_path.exists() => {
+                Err(self.missing_vad_error())
+            }
+            #[cfg(feature = "cuda")]
+            RuntimeBundle::Native(_) => Ok(()),
         }
     }
 
@@ -290,9 +308,9 @@ impl ModelBundle {
                 path: layout.vad_dir.clone(),
             },
             #[cfg(feature = "cuda")]
-            RuntimeBundle::Native(_) => TranscriptionError::InvalidConfiguration(
-                "voice activity detection is not available for native bundles yet".to_owned(),
-            ),
+            RuntimeBundle::Native(layout) => TranscriptionError::MissingModelAsset {
+                path: layout.vad_path.clone(),
+            },
         }
     }
 

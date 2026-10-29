@@ -21,8 +21,10 @@ pub struct VadConfig {
 #[cfg(feature = "vad")]
 impl Default for VadConfig {
     fn default() -> Self {
+        // Silero's own default; 0.85 dropped low-confidence phone and far-field
+        // speech, raising long-form WER on every set measured (README)
         Self {
-            default_threshold: 0.85,
+            default_threshold: 0.5,
         }
     }
 }
@@ -431,7 +433,7 @@ mod tests {
     fn vad_defaults_lock_threshold_and_segmentation() {
         let vad = VadConfig::default();
         let segmentation = VadSegmentationConfig::default();
-        assert_eq!(vad.default_threshold, 0.85);
+        assert_eq!(vad.default_threshold, 0.5);
         assert_eq!(segmentation.min_speech_duration, 0.15);
         assert_eq!(segmentation.min_silence_duration, 0.75);
         assert_eq!(segmentation.speech_padding, 0.10);

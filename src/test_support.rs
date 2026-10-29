@@ -23,16 +23,30 @@ pub(crate) struct NemoReference {
     meta_path: PathBuf,
 }
 
+fn reference_root() -> PathBuf {
+    std::env::var_os("SCRIPTRS_NEMO_REF")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_REFERENCE_DIR))
+}
+
 impl NemoReference {
     pub(crate) fn open(version: ParakeetVersion, set: &str) -> Self {
-        let root = std::env::var_os("SCRIPTRS_NEMO_REF")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_REFERENCE_DIR));
+        let root = reference_root();
         // the profile wrote the v3 sets at the root; later versions get a subdirectory
         let dir = match version {
             ParakeetVersion::V2 => root.join("v2"),
             ParakeetVersion::V3 => root,
         };
+        Self::open_in(dir, set)
+    }
+
+    /// Silero VAD v5 probabilities for one LibriSpeech file (`silero-v5/vad`)
+    #[cfg(all(feature = "cuda", feature = "vad"))]
+    pub(crate) fn silero() -> Self {
+        Self::open_in(reference_root().join("silero-v5"), "vad")
+    }
+
+    fn open_in(dir: PathBuf, set: &str) -> Self {
         let path = dir.join(format!("{set}.safetensors"));
         let file = File::open(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
         // SAFETY: reference files are written once and only read while tests run

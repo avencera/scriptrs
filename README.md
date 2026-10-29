@@ -99,7 +99,7 @@ models/
 
 The `cuda` feature runs Parakeet on an NVIDIA GPU with no ONNX Runtime or
 PyTorch. It is built from this repository only for now. It supports the v3
-language filter; VAD is not supported yet.
+language filter and, with `vad`, VAD-backed long-form planning.
 
 It loads native weights rather than Core ML models:
 
@@ -111,6 +111,8 @@ models/
   parakeet-v3/
     model.safetensors
     parakeet_vocab.json
+  vad/
+    silero-vad-v5.safetensors    # with `vad`
 ```
 
 ```rust,ignore
@@ -155,6 +157,23 @@ set:
 
 WER is pooled over each set's recordings, both sides through Whisper's English
 normalizer.
+
+With `vad`, Silero VAD v5 runs on the CPU, at about 0.3 s per hour of audio. On a
+GPU each step of its recurrence costs more in launches than the whole step costs on
+the CPU. VAD planning helps when most of a recording is not speech, and costs
+accuracy and speed on dense or far-field speech:
+
+| Set | Overlap WER | VAD WER | Overlap speed | VAD speed |
+|---|---:|---:|---:|---:|
+| Sparse speech, 24 % speech (4.2 h) | 14.8 % | **3.1 %** | 2340x | **3060x** |
+| Earnings-21 earnings calls | **8.2 %** | 8.6 % | **2500x** | 1540x |
+| AMI meetings, headset mix | 21.5 % | **21.2 %** | **2380x** | 1330x |
+| AMI meetings, far-field microphone | **23.2 %** | 26.6 % | **2370x** | 1320x |
+| CHiME-6 dinner parties | **44.0 %** | 54.8 % | **2360x** | 1480x |
+
+The sparse set is LibriSpeech test-clean utterances separated by 15 to 75 s of
+film music, effects, ambience and low-level noise. VAD runs use the default 0.5
+speech threshold.
 
 The encoder's matrix multiplies use TF32 tensor cores on Ampere and newer GPUs.
 Older GPUs run them in FP32. For output that matches NeMo's FP32 decode token for
@@ -257,7 +276,7 @@ fn load_mono_16khz_audio() -> Vec<f32> {
 }
 ```
 
-Enable `vad` when you want VAD-backed speech region planning for sparse speech, long silences, or recordings with a lot of non-speech audio:
+Enable `vad` when you want VAD-backed speech region planning for sparse speech, long silences, or recordings with a lot of non-speech audio. Windows with a speech probability of at least `config.vad.default_threshold` (0.5 by default) count as speech:
 
 ```rust
 use scriptrs::{LongFormConfig, LongFormMode, LongFormTranscriptionPipeline};
@@ -300,4 +319,4 @@ The example expects mono 16kHz WAV input.
 - The public API is still moving
 - `scriptrs` currently targets the exact file layout and model I/O shipped in `avencera/scriptrs-models`; if you swap in a different CoreML Parakeet export, you may need runtime code changes
 - Use `long-form` for the fastest path on clean, dense speech
-- Add `vad` when you need better robustness on sparse-speech or non-speech-heavy recordings
+- Add `vad` when you need better robustness on sparse-speech or non-speech-heavy recordings; on dense or far-field speech it costs accuracy
