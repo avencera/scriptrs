@@ -15,7 +15,12 @@ pub(crate) fn native_root() -> PathBuf {
 /// Native bundle from [`native_root`] in FP32, the precision the NeMo references
 /// were decoded in; the TF32 default only stays near them
 pub(crate) fn nemo_parity_bundle(deployment: ParakeetDeployment) -> ModelBundle {
-    ModelBundle::from_native_dir(native_root(), deployment).with_precision(Precision::Fp32)
+    native_bundle(deployment, Precision::Fp32)
+}
+
+/// Native bundle from [`native_root`] at `precision`
+pub(crate) fn native_bundle(deployment: ParakeetDeployment, precision: Precision) -> ModelBundle {
+    ModelBundle::from_native_dir(native_root(), deployment).with_precision(precision)
 }
 
 /// Exported native weights for `version`, from [`native_root`]

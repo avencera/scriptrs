@@ -372,7 +372,7 @@ mod tests {
     use super::{CudaModel, MEL_BUCKET};
     use crate::backend::{DecodePolicy, EncoderChunk};
     use crate::config::TranscriptionConfig;
-    use crate::cuda::test_support::{native_root, nemo_parity_bundle};
+    use crate::cuda::test_support::{native_bundle, native_root, nemo_parity_bundle};
     use crate::decode::RawTranscription;
     use crate::deployment::{ParakeetDeployment, ParakeetVersion};
     use crate::frontend::ParakeetFeatureExtractor;
@@ -549,22 +549,14 @@ mod tests {
 
     /// Runs the 120 s long-full audio through native long-form, its six windows
     /// batched into one model call and then one window at a time, and holds the two
-    /// to the same tokens
+    /// to the same tokens, in FP32 and in FP16, whose tensor-core GEMMs are the most
+    /// likely to round differently across batch shapes
     #[cfg(feature = "long-form")]
     #[test]
     #[ignore = "needs a CUDA GPU, the native weights and the NeMo references; `just gpu-parity` runs it on gpu0"]
     fn gpu_batched_long_form_matches_serial_windows() {
         use crate::long_form::{LongFormConfig, LongFormTranscriptionPipeline};
 
-        let bundle = nemo_parity_bundle(ParakeetDeployment::v3());
-        let batched = LongFormConfig::for_bundle(&bundle);
-        assert!(batched.batch_size >= 6, "the windows must share one batch");
-        let serial = LongFormConfig {
-            batch_size: 1,
-            worker_count: 1,
-            ..batched.clone()
-        };
-        let pipeline = LongFormTranscriptionPipeline::from_bundle(bundle).expect("pipeline");
         let reference = NemoReference::open(ParakeetVersion::V3, "long-full");
         let audio: Vec<f32> = reference
             .f32("audio")
@@ -572,29 +564,46 @@ mod tests {
             .take(reference.i64("audio_len")[0] as usize)
             .copied()
             .collect();
-
-        let batched = pipeline.run_with_config(&audio, &batched).expect("batched");
-        let serial = pipeline.run_with_config(&audio, &serial).expect("serial");
-        let ids = |result: &crate::types::TranscriptionResult| -> Vec<u32> {
+        let ids = |result: &TranscriptionResult| -> Vec<u32> {
             result.tokens.iter().map(|token| token.token_id).collect()
         };
-        assert!(!batched.tokens.is_empty(), "no tokens");
-        assert_eq!(ids(&batched), ids(&serial), "token ids");
-        assert_eq!(batched.text, serial.text);
+
+        for precision in [Precision::Fp32, Precision::Fp16] {
+            let bundle = native_bundle(ParakeetDeployment::v3(), precision);
+            let batched = LongFormConfig::for_bundle(&bundle);
+            assert!(batched.batch_size >= 6, "the windows must share one batch");
+            let serial = LongFormConfig {
+                batch_size: 1,
+                worker_count: 1,
+                ..batched.clone()
+            };
+            let pipeline = LongFormTranscriptionPipeline::from_bundle(bundle).expect("pipeline");
+
+            let batched = pipeline.run_with_config(&audio, &batched).expect("batched");
+            let serial = pipeline.run_with_config(&audio, &serial).expect("serial");
+            assert!(!batched.tokens.is_empty(), "{precision:?}: no tokens");
+            assert_eq!(ids(&batched), ids(&serial), "{precision:?} token ids");
+            assert_eq!(batched.text, serial.text, "{precision:?} text");
+        }
     }
 
     /// Transcribes the reference audio through the public pipeline on a native
     /// bundle, twice per utterance so the second pass replays the captured graphs,
-    /// and holds the text against NeMo's
+    /// and holds the text against NeMo's, in FP32 and in FP16, whose transcripts
+    /// should not change on this clean audio
     #[test]
     #[ignore = "needs a CUDA GPU, the native weights and the NeMo references; `just gpu-parity` runs it on gpu0"]
     fn gpu_pipeline_transcribes_like_nemo() {
-        for version in [ParakeetVersion::V2, ParakeetVersion::V3] {
+        let versions = [ParakeetVersion::V2, ParakeetVersion::V3];
+        for (version, precision) in versions
+            .into_iter()
+            .flat_map(|version| [(version, Precision::Fp32), (version, Precision::Fp16)])
+        {
             let deployment = match version {
                 ParakeetVersion::V2 => ParakeetDeployment::v2(),
                 ParakeetVersion::V3 => ParakeetDeployment::v3(),
             };
-            let pipeline = TranscriptionPipeline::from_bundle(nemo_parity_bundle(deployment))
+            let pipeline = TranscriptionPipeline::from_bundle(native_bundle(deployment, precision))
                 .expect("pipeline");
 
             for set in ["b1", "b8"] {
@@ -610,7 +619,10 @@ mod tests {
                         .collect();
                     for pass in ["eager", "graph"] {
                         let text = pipeline.run(&samples).expect("transcribe").text;
-                        assert_eq!(&text, expected, "{version:?} {set} row {row} ({pass})");
+                        assert_eq!(
+                            &text, expected,
+                            "{version:?} {precision:?} {set} row {row} ({pass})"
+                        );
                     }
                 }
             }
