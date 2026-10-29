@@ -168,9 +168,9 @@ The multilingual check is nearly 6 times the size of LibriSpeech: FLEURS and MLS
 31.6 h over ten language sets in six languages (de, es, fr, it, nl, pt), one
 utterance at a time with automatic language selection. The FP32 mode matches NeMo
 layer by layer and gives NeMo's exact text in the parity tests, and the FP16
-default scores the same WER as FP32:
+default scores the same WER as FP32. Speed is for the FP16 default:
 
-| Set | Speed, FP16 default | WER, FP16 default | WER, FP32 |
+| Set | Speed (x real time) | WER, FP16 | WER, FP32 |
 |---|---|---|---|
 | FLEURS de, es, fr, it, nl, pt (15.8 h) | 1839x | 4.57 % | 4.57 % |
 | MLS es, fr, it, pt (15.8 h) | 1921x | 6.25 % | 6.26 % |
