@@ -10,7 +10,7 @@ use cudakit::cudarc::driver::CudaSlice;
 use cudakit::{DeviceTensor, Math, Sgemm, SgemmBatched};
 
 use crate::cuda::kernels::{CudaRuntime, EncoderKernels, FeatureMap, Heads};
-use crate::cuda::{linear, upload, upload_host, zeros};
+use crate::cuda::{Direction, HostStaging, linear, upload, upload_host, zeros};
 use crate::error::TranscriptionError;
 use crate::native::spec::EncoderSpec;
 use crate::native::weights::WeightFile;
@@ -91,6 +91,8 @@ pub(crate) struct EncoderWorkspace {
     frames: usize,
     /// `[batch, mel_frames, features]`
     mel: CudaSlice<f32>,
+    /// Pinned host copy of `mel` that [`CudaEncoder::set_input`] fills
+    mel_host: HostStaging<f32>,
     /// Valid frames per batch row before and after each subsampling stage
     lens: [CudaSlice<u32>; 4],
     host_lens: Vec<usize>,
@@ -117,6 +119,11 @@ pub(crate) struct EncoderWorkspace {
 }
 
 impl EncoderWorkspace {
+    /// Mel frames per batch row of the input
+    pub(crate) fn mel_frames(&self) -> usize {
+        self.mel_frames
+    }
+
     pub(crate) fn frames(&self) -> usize {
         self.frames
     }
@@ -307,6 +314,11 @@ impl CudaEncoder {
             mel_frames,
             frames,
             mel: zeros(stream, batch * mel_frames * spec.features)?,
+            mel_host: HostStaging::new(
+                stream,
+                batch * mel_frames * spec.features,
+                Direction::Upload,
+            )?,
             lens: [
                 zeros(stream, batch)?,
                 zeros(stream, batch)?,
@@ -354,21 +366,23 @@ impl CudaEncoder {
         [mel, first, second, next(second)]
     }
 
-    /// Uploads a padded batch: `mel` is `[batch, mel_frames, features]` (time-major)
-    /// and `lens` the valid mel frames of each row
+    /// Queues the upload of a padded batch: `fill` writes every value of the
+    /// `[batch, mel_frames, features]` (time-major) input, and `lens` holds the valid
+    /// mel frames of each row
+    ///
+    /// `fill` writes straight into pinned memory, so the upload queues behind earlier
+    /// work instead of blocking the host
     pub(crate) fn set_input(
         &self,
         runtime: &CudaRuntime,
         workspace: &mut EncoderWorkspace,
-        mel: &[f32],
         lens: &[usize],
+        fill: impl FnOnce(&mut [f32]),
     ) -> Result<(), TranscriptionError> {
-        if lens.len() != workspace.batch || mel.len() != workspace.mel.len() {
+        if lens.len() != workspace.batch {
             return Err(TranscriptionError::InvalidConfiguration(format!(
-                "encoder input holds {} values for {} rows; the workspace takes {} values for {} rows",
-                mel.len(),
+                "encoder input has {} rows; the workspace takes {}",
                 lens.len(),
-                workspace.mel.len(),
                 workspace.batch
             )));
         }
@@ -383,7 +397,8 @@ impl CudaEncoder {
         }
 
         let stream = runtime.stream();
-        stream.memcpy_htod(mel, &mut workspace.mel)?;
+        fill(workspace.mel_host.write()?);
+        workspace.mel_host.upload(stream, &mut workspace.mel)?;
         let mut stage: Vec<usize> = lens.to_vec();
         for buffer in &mut workspace.lens {
             let values: Vec<u32> = stage.iter().map(|len| *len as u32).collect();
@@ -898,7 +913,9 @@ mod tests {
                     .workspace(&runtime, batch, mel_frames)
                     .expect("workspace");
                 encoder
-                    .set_input(&runtime, &mut ws, &time_major, &lens)
+                    .set_input(&runtime, &mut ws, &lens, |mel| {
+                        mel.copy_from_slice(&time_major)
+                    })
                     .expect("input");
                 let out_lens: Vec<usize> = reference
                     .i64("encoder.out_len")
@@ -987,7 +1004,9 @@ mod tests {
                         .workspace(&runtime, batch, mel_frames)
                         .expect("workspace");
                     encoder
-                        .set_input(&runtime, &mut ws, &time_major, &lens)
+                        .set_input(&runtime, &mut ws, &lens, |mel| {
+                            mel.copy_from_slice(&time_major)
+                        })
                         .expect("input");
                     encoder.enqueue(&runtime, &mut ws).expect("encode");
                     let output = runtime.stream().clone_dtoh(ws.output()).expect("download");
@@ -1043,7 +1062,9 @@ mod tests {
                 .workspace(&runtime, batch, mel_frames)
                 .expect("workspace");
             encoder
-                .set_input(&runtime, &mut ws, &time_major, &lens)
+                .set_input(&runtime, &mut ws, &lens, |mel| {
+                    mel.copy_from_slice(&time_major)
+                })
                 .expect("input");
 
             // the eager pass also finishes cuBLAS's lazy setup before capture
