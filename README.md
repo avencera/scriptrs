@@ -10,8 +10,10 @@ Fast [NVIDIA Parakeet TDT](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) s
 
 On an RTX 5090, the CUDA backend transcribes LibriSpeech test-clean at 1534x real
 time, 3.2x as fast as NVIDIA NeMo and 6.1x as fast as parakeet-rs, at the same
-word error rate. Through the batching queue it runs at 4770x. See [CUDA](#cuda)
-for the numbers.
+word error rate. Through the batching queue it runs at 4770x. On 31.6 h of
+multilingual speech the default FP16 mode scores the same WER as the FP32 mode,
+which matches NeMo. On six harder English sets it has a lower WER than Whisper
+large-v3 at about 12x its speed. See [CUDA](#cuda) for the numbers.
 
 `scriptrs` is early: the public API is still moving.
 
@@ -107,8 +109,9 @@ models/
 ## CUDA
 
 The `cuda` feature runs Parakeet on an NVIDIA GPU with no ONNX Runtime or
-PyTorch. It supports the v3 language filter and, with `vad`, VAD-backed
-long-form planning.
+PyTorch. It uses NVIDIA's weights unchanged, and its word error rate matches
+NeMo's. It supports the v3 language filter and, with `vad`, VAD-backed long-form
+planning.
 
 It loads native weights rather than Core ML models. With the default `online`
 feature, `from_pretrained_native` downloads them from the same pinned
@@ -150,16 +153,27 @@ shorter overlaps lose accuracy on long recordings.
 On an RTX 5090, Parakeet v3 on LibriSpeech test-clean (5.4 h), one utterance at a
 time:
 
-| | Speed (x real time) | vs parakeet-rs | WER |
+| | Speed (x real time) | vs NeMo | WER |
 |---|---|---|---|
-| scriptrs | 1534x | 6.1x | 1.93 % |
-| NVIDIA NeMo | 477x | 1.9x | 1.93 % |
-| parakeet-rs 0.4.3 (ONNX Runtime) | 253x | 1x | 1.93 % |
+| scriptrs | 1534x | 3.2x | 1.93 % |
+| NVIDIA NeMo | 477x | 1x | 1.93 % |
+| parakeet-rs 0.4.3 (ONNX Runtime) | 253x | 0.53x | 1.93 % |
 
 Through the [queue](#many-short-inputs), which prepares the next inputs on the CPU
 while the GPU runs, the same set runs at 1761x one at a time with identical
 transcripts, and at 4770x in batches of up to 16 (the default). Batching changes 2
 of the 2620 transcripts by one word or punctuation mark, and WER stays 1.93 %.
+
+The multilingual check is nearly 6 times the size of LibriSpeech: FLEURS and MLS,
+31.6 h over ten language sets in six languages (de, es, fr, it, nl, pt), one
+utterance at a time with automatic language selection. The FP32 mode matches NeMo
+layer by layer and gives NeMo's exact text in the parity tests, and the FP16
+default scores the same WER as FP32:
+
+| Set | Speed, FP16 default | WER, FP16 default | WER, FP32 |
+|---|---|---|---|
+| FLEURS de, es, fr, it, nl, pt (15.8 h) | 1839x | 4.57 % | 4.57 % |
+| MLS es, fr, it, pt (15.8 h) | 1921x | 6.25 % | 6.26 % |
 
 On all 44 Earnings-21 calls (39 h), long-form with the defaults runs at 3630x with
 8.24 % pooled WER; NeMo transcribing each whole call with local attention scores
