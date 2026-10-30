@@ -1,7 +1,8 @@
 //! Throughput and request latency of the transcription scheduler under concurrent
 //! load, against the same requests served one at a time
 //!
-//! `--clients 1,8,32` runs one pass per client count. Each client sends its next
+//! `--clients 1,8,32` runs one pass per client count, starting with one client,
+//! the pass the others are held against. Each client sends its next
 //! request as soon as the last one returns, until every request has run once; a
 //! request's latency runs from its submit to its result. The scheduler batches
 //! windows across the requests in flight. The baseline is today's server: one
@@ -21,7 +22,7 @@
 //!     --models /shared/models/scriptrs-native --clients 1,8,32,128 --out bench/short.json
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -408,6 +409,16 @@ fn load_requests(args: &Args) -> Result<Vec<Request>> {
         });
     }
 
+    // transcripts are saved by id, so a repeated id would hide one of them
+    let mut ids = BTreeSet::new();
+    if let Some(request) = short
+        .iter()
+        .chain(&long)
+        .find(|request| !ids.insert(&request.id))
+    {
+        bail!("request id {} appears twice", request.id);
+    }
+
     // spread the long requests evenly among the short ones
     if long.is_empty() || short.is_empty() {
         short.extend(long);
@@ -486,6 +497,9 @@ fn parse_args() -> Result<Args> {
     }
     if args.manifest.is_none() && args.long.is_empty() {
         bail!("give --librispeech, --manifest <jsonl> or --long <wav or directory>");
+    }
+    if args.clients.first() != Some(&1) {
+        bail!("--clients must start with 1, the pass the others are held against");
     }
     Ok(args)
 }

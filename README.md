@@ -567,7 +567,9 @@ started; windows already decoding finish and are discarded. Empty or overlong
 audio fails at `submit` without affecting other requests, as does audio with a
 non-finite sample under the long-form pipeline.
 `TranscriptionPipeline::into_scheduler` takes inputs up to the single-input
-limit, as `run` does.
+limit, as `run` does. When a batch fails on the GPU, each request with a window
+in it fails with `TranscriptionError::BatchFailed`, which holds the batch's
+error.
 
 The scheduler holds at most `SchedulerConfig::max_requests` unfinished requests
 (1024 by default). Past that, `submit` waits for one to finish, which paces a

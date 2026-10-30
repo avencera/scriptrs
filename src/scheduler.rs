@@ -517,18 +517,13 @@ impl TranscriptionScheduler {
             shared: Arc::clone(shared),
             waited: false,
         };
-        if request.windows.is_empty() {
-            // a VAD plan that found no speech
-            request.finish(Ok(()));
-            return Ok(pending);
-        }
-
         let mut state = shared.lock();
         loop {
             if let Some(reason) = &state.stopped {
                 return Err(TranscriptionError::SchedulerStopped(reason.clone()));
             }
-            if !shared.full(&state) {
+            // a VAD plan that found no speech has no windows to hold room for
+            if request.windows.is_empty() || !shared.full(&state) {
                 break;
             }
             if !wait_for_room {
@@ -539,6 +534,12 @@ impl TranscriptionScheduler {
                 .wait(state)
                 .unwrap_or_else(PoisonError::into_inner);
         }
+        if request.windows.is_empty() {
+            drop(state);
+            request.finish(Ok(()));
+            return Ok(pending);
+        }
+
         state.live.insert(request.id, Arc::clone(&request));
         state.pending.push_back(request);
         drop(state);
@@ -975,9 +976,11 @@ impl ModelLoop<'_> {
                     self.rows.insert(row, (ready.request, ready.index));
                 }
             }
-            // the batch failed before its windows took rows, so the windows already
-            // decoding go on; an error that broke the device fails them at the next
-            // advance
+            // the windows already decoding go on. A failure while the decoder was
+            // starting the batch's rows can leave some of them running with no
+            // window mapped to them; they retire within their frames' steps, and
+            // `advance` drops their output. An error that broke the device fails
+            // every window at the next advance
             Err(error) => {
                 tracing::warn!(%error, "scheduler encoder batch failed");
                 let requests = windows.into_iter().map(|ready| ready.request);
@@ -1031,19 +1034,18 @@ impl ModelLoop<'_> {
     }
 }
 
-/// Fails each of `requests` with `error`; the first keeps its original kind
+/// Fails each of `requests` with the one `error` they shared
 fn fail_each(
     shared: &Shared,
     requests: impl IntoIterator<Item = Arc<Request>>,
     error: TranscriptionError,
 ) {
-    let message = error.to_string();
-    let mut error = Some(error);
+    let error = Arc::new(error);
     for request in requests {
-        let error = error
-            .take()
-            .unwrap_or_else(|| TranscriptionError::InvalidModelOutput(message.clone()));
-        shared.fail(&request, error);
+        shared.fail(
+            &request,
+            TranscriptionError::BatchFailed(Arc::clone(&error)),
+        );
     }
 }
 

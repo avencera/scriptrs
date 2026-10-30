@@ -73,7 +73,7 @@ speech instead.
 
 To transcribe many clips, such as utterances, use `transcribe_many`. It
 prepares the next clips while the model runs and, on CUDA, batches the clips'
-windows together, up to 32 in one pass:
+windows together, up to `max_batch` in one pass (32 by default, at most 64):
 
 ```python
 results = pipeline.transcribe_many([clip_a, clip_b, clip_c])

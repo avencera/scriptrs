@@ -38,6 +38,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Instant;
 
 use eyre::{Result, bail, eyre};
@@ -71,7 +72,8 @@ struct Args {
 
 struct Utterance {
     id: String,
-    audio: Vec<f32>,
+    // shared, so submitting every clip to the scheduler at once copies no audio
+    audio: Arc<[f32]>,
 }
 
 fn main() -> ExitCode {
@@ -195,7 +197,7 @@ fn bench_manifest(
             Some(scheduler) => {
                 let pending = utterances
                     .iter()
-                    .map(|utterance| scheduler.submit(utterance.audio.clone()))
+                    .map(|utterance| scheduler.submit(Arc::clone(&utterance.audio)))
                     .collect::<Result<Vec<_>, _>>()?;
                 for (utterance, pending) in utterances.iter().zip(pending) {
                     texts.insert(utterance.id.clone(), pending.wait()?.text);
@@ -415,7 +417,7 @@ fn load_manifest(path: &Path) -> Result<Vec<Utterance>> {
             };
             Ok(Utterance {
                 id: field("id")?,
-                audio: read_wav(Path::new(&field("audio_filepath")?))?,
+                audio: read_wav(Path::new(&field("audio_filepath")?))?.into(),
             })
         })
         .collect()

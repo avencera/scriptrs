@@ -55,6 +55,8 @@ pub(crate) fn transcription_code(error: &TranscriptionError) -> &'static str {
         TranscriptionError::CoreMl(_) => "coreml",
         TranscriptionError::Io(_) => "io",
         TranscriptionError::SchedulerStopped(_) | TranscriptionError::SchedulerFull => "scheduler",
+        // a request in a failed batch reports why the batch failed
+        TranscriptionError::BatchFailed(error) => transcription_code(error),
         _ => "transcription",
     }
 }

@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::deployment::ParakeetVersion;
 
@@ -106,6 +107,10 @@ pub enum TranscriptionError {
     /// `SchedulerConfig::max_requests` unfinished requests already
     #[error("the transcription scheduler is full")]
     SchedulerFull,
+    /// A batch failed, failing every request with a window in it; each of them
+    /// holds the same error
+    #[error("a batch shared with other requests failed: {0}")]
+    BatchFailed(Arc<TranscriptionError>),
     /// The current platform does not support native CoreML inference
     #[error("native CoreML transcription is only supported on macOS")]
     UnsupportedPlatform,
