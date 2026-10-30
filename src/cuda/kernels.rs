@@ -15,6 +15,10 @@ use cudakit::{
 
 use crate::cuda::fp16;
 
+mod stream;
+
+pub(crate) use stream::{StreamGeometry, StreamKernels, StreamRows};
+
 /// Build-wide CUDA policy: cuBLAS is allowed while the encoder is library-first, and
 /// only the `sm_75` baseline PTX ships. The FP16 encoder GEMMs call `cublasGemmEx`
 /// directly
@@ -37,6 +41,8 @@ pub(crate) static PROFILE: Profile = Profile {
 pub(crate) enum KernelModule {
     Encoder,
     Decode,
+    #[cfg(feature = "low-precision")]
+    Quant,
 }
 
 impl KernelArea for KernelModule {
@@ -46,6 +52,8 @@ impl KernelArea for KernelModule {
         match self {
             Self::Encoder => "encoder",
             Self::Decode => "decode",
+            #[cfg(feature = "low-precision")]
+            Self::Quant => "quant",
         }
     }
 
@@ -62,6 +70,11 @@ impl KernelArea for KernelModule {
                 text: include_str!("ptx/decode.sm75.ptx"),
                 cubins: &[],
             })),
+            #[cfg(feature = "low-precision")]
+            Self::Quant => AreaPtx::baseline(Some(EmbeddedPtx {
+                text: include_str!("ptx/quant.sm75.ptx"),
+                cubins: &[],
+            })),
         }
     }
 }
@@ -69,7 +82,7 @@ impl KernelArea for KernelModule {
 pub(crate) type CudaRuntime = Runtime<KernelModule>;
 
 /// Threads per block for the one-thread-per-element kernels
-const ELEMENT_THREADS: u32 = 256;
+pub(crate) const ELEMENT_THREADS: u32 = 256;
 
 /// Threads per block for the row kernels (LayerNorm, softmax)
 const ROW_THREADS: u32 = 256;
@@ -115,7 +128,7 @@ const DECIDE_THREADS: u32 = 1024;
 
 /// Class logits each `decode_decide` thread holds in registers, the kernel's
 /// `DECIDE_VALUES`
-const DECIDE_VALUES: usize = 12;
+const DECIDE_VALUES: usize = 13;
 
 /// Threads per block of `decode_lstm` and `decode_project`, one block per output,
 /// the kernels' `ROW_WARPS` warps
@@ -139,7 +152,7 @@ fn check_weight_row(hidden: usize) -> Result<(), Error> {
     Ok(())
 }
 
-fn elements(count: usize) -> Result<LaunchConfig, Error> {
+pub(crate) fn elements(count: usize) -> Result<LaunchConfig, Error> {
     let count = u32::try_from(count).map_err(|_| Error::DimensionOverflow {
         context: "kernel grid",
         value: count,
@@ -160,7 +173,7 @@ fn rows(count: usize) -> Result<LaunchConfig, Error> {
     })
 }
 
-fn u32_of(context: &'static str, value: usize) -> Result<u32, Error> {
+pub(crate) fn u32_of(context: &'static str, value: usize) -> Result<u32, Error> {
     u32::try_from(value).map_err(|_| Error::DimensionOverflow { context, value })
 }
 
@@ -169,11 +182,11 @@ fn count(context: &'static str, shape: &[usize]) -> Result<usize, Error> {
     element_count(context, shape)
 }
 
-fn len<T>(view: &CudaView<'_, T>) -> u64 {
+pub(crate) fn len<T>(view: &CudaView<'_, T>) -> u64 {
     view.len() as u64
 }
 
-fn len_mut<T>(view: &CudaViewMut<'_, T>) -> u64 {
+pub(crate) fn len_mut<T>(view: &CudaViewMut<'_, T>) -> u64 {
     view.len() as u64
 }
 

@@ -28,6 +28,8 @@ The base crate exposes a single-chunk `TranscriptionPipeline`. Fast long-audio c
 - Background queue for many short inputs, batched on CUDA
 - Native CoreML inference on macOS
 - CUDA inference on Linux (`cuda` feature)
+- Streaming transcription of many live streams at once with Nemotron Speech
+  Streaming EN 0.6B and Nemotron 3.5 ASR Streaming 0.6B on CUDA
 - Hugging Face download support with optional local model loading
 - Python package on PyPI, with wheels for macOS arm64 and Linux x86_64
 
@@ -35,7 +37,7 @@ The base crate exposes a single-chunk `TranscriptionPipeline`. Fast long-audio c
 
 - Windows support
 - Other ASR models
-- Streaming transcription
+- Streaming on Core ML
 - Stable public guarantees around model layout or long-form behavior
 
 ## Install
@@ -246,21 +248,30 @@ accuracy and speed on dense or far-field speech:
 
 | Set | Overlap WER | VAD WER | Overlap speed | VAD speed |
 |---|---:|---:|---:|---:|
-| Sparse speech, 24 % speech (4.2 h) | 14.8 % | **3.1 %** | 3430x | **3990x** |
-| Earnings-21 earnings calls | **8.2 %** | 8.6 % | **3630x** | 2030x |
-| AMI meetings, headset mix | 21.5 % | **21.2 %** | **3480x** | 1800x |
-| AMI meetings, far-field microphone | **23.2 %** | 26.6 % | **3480x** | 1790x |
-| CHiME-6 dinner parties | **44.0 %** | 54.8 % | **3490x** | 1970x |
+| Sparse speech, 24 % speech (4.2 h) | 14.8 % | **2.3 %** | 3430x | **3990x** |
+| Earnings-21 earnings calls | **8.2 %** | 8.4 % | **3630x** | 2030x |
+| AMI meetings, headset mix | 21.5 % | **21.1 %** | **3480x** | 1800x |
+| AMI meetings, far-field microphone | **23.2 %** | 26.0 % | **3480x** | 1790x |
+| CHiME-6 dinner parties | **44.0 %** | 54.0 % | **3490x** | 1970x |
 
 The sparse set is LibriSpeech test-clean utterances separated by 15 to 75 s of
 film music, effects, ambience and low-level noise. VAD runs use the default 0.5
-speech threshold.
+speech threshold and pad each speech region by 0.2 s on both sides, including both
+sides of a split inside a region longer than the model window. Silero is slow to
+react to a soft first word, such as the "a" in "a cold", and 0.1 s of padding cut
+it off. 0.2 s lowered WER on every set; larger padding cost AMI headset accuracy.
+The speed columns were measured with 0.1 s padding; in the padding sweep, 0.2 s
+was no slower.
 
 By default the encoder layers' linear weights are stored in FP16, which has TF32's
 10-bit mantissa, and their matrix multiplies run on FP16 tensor cores with FP32
-accumulation. `Precision::Tf32` keeps the weights in FP32 and uses TF32 tensor
-cores on Ampere and newer GPUs, or FP32 on older ones. `Precision::Fp32` matches
-NeMo's FP32 decode token for token on any GPU:
+accumulation. Use this default: it is the fastest and scores the same WER as FP32.
+
+`Precision::Tf32` and `Precision::Fp32` are for compatibility, when you need to
+keep matching transcripts you already produced at that precision. `Precision::Tf32`
+keeps the weights in FP32 and uses TF32 tensor cores on Ampere and newer GPUs, or
+FP32 on older ones. `Precision::Fp32` matches NeMo's FP32 decode token for token on
+any GPU:
 
 ```rust,ignore
 use scriptrs::{ModelBundle, ParakeetDeployment, Precision};
@@ -273,7 +284,7 @@ On an RTX 5090 with Parakeet v3 (speed in x real time, then WER):
 
 | | FP16 (default) | TF32 | FP32 |
 |---|---|---|---|
-| LibriSpeech test-clean, one utterance at a time | 1534x, 1.93 % | 1179x, 1.93 % | — |
+| LibriSpeech test-clean, one utterance at a time | 1534x, 1.93 % | 1179x, 1.93 % | 848x, 1.93 % |
 | LibriSpeech test-clean, queue in batches of 16 | 4767x, 1.93 % | 3364x, 1.92 % | — |
 | Earnings-21, long-form | 3633x, 8.24 % | 2633x, 8.24 % | — |
 | FLEURS de, es, fr, it, nl, pt (15.8 h) | 1839x, 4.57 % | 1450x, 4.57 % | 966x, 4.57 % |
@@ -284,6 +295,14 @@ are scored with Whisper's basic normalizer. On each of their ten language sets,
 FP16 is within one word error of TF32. On LibriSpeech one utterance at a time,
 FP16 gives the same transcripts as TF32. Batching changes a few transcripts in
 either precision, so the queued FP16 and TF32 transcripts differ slightly.
+
+The `low-precision` feature adds FP8, INT8 and NVFP4 modes for offline
+transcription, and the weight files that store them. Most users should leave it
+off. None of the three is faster than FP16 one utterance at a time, and they save
+little GPU memory: 0.4 to 0.7 GB of FP16's peak of about 7 GB on an RTX 5090. FP8
+and INT8 only halve the download at FP16's WER, and NVFP4 is faster only in large
+batches on Blackwell GPUs, at a WER cost. The `Precision` docs give the GPU
+requirements and measurements.
 
 ## Usage
 
@@ -452,6 +471,89 @@ fn load_mono_16khz_audio() -> Vec<f32> {
     Vec::new()
 }
 ```
+
+### Streaming (CUDA)
+
+`StreamingModel` runs NVIDIA's cache-aware [Nemotron Speech Streaming EN
+0.6B](https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b) and
+multilingual [Nemotron 3.5 ASR Streaming
+0.6B](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b) on live audio,
+with the `cuda` feature. Push audio to each `Stream` as it arrives and call
+`process`: it encodes every chunk the streams have audio for, one
+chunk from each stream per batch, and keeps each stream's encoder caches and
+decoder state on the GPU between calls. `lookahead` picks the chunk size the model
+was trained with: for the English model, 0, 1, 6 or 13 encoder frames of
+lookahead give chunks of 80, 160, 560 or 1120 ms, trading latency for accuracy;
+Nemotron 3.5 takes 0, 3, 6 or 13. Nemotron 3.5 streams open with
+`open_stream_in` in one of `languages()`, such as `de-DE`, or `auto` to let the
+model pick; `open_stream` is for the English model.
+
+`dev-tools/nemo/export_native.py --only nemotron-en` (or `--only nemotron-3.5`)
+writes the weights:
+
+```rust,ignore
+use scriptrs::{StreamingConfig, StreamingModel};
+
+let model = StreamingModel::from_native_dir(
+    "models/nemotron-speech-streaming-en-0.6b",
+    &StreamingConfig::new(1),
+)?;
+let mut stream = model.open_stream()?;
+for piece in live_audio() {
+    stream.push(&piece)?;
+    model.process(&mut [&mut stream])?;
+    println!("{}", stream.transcript().text);
+}
+stream.finish()?;
+model.process(&mut [&mut stream])?;
+println!("{}", stream.transcript().text);
+```
+
+`StreamingConfig` also sets the most streams open at once (`max_streams`, 64 by
+default; each holds about 15 MB of GPU cache) and the most chunks per batch
+(`max_batch`, 32). `examples/stream_bench.rs` measures per-chunk latency and
+throughput on LibriSpeech test-clean.
+
+`precision` defaults to FP16 encoder GEMMs, which run 1.4 to 1.9 times as fast as
+FP32 and change a few transcripts, with WER within 0.003 points. With
+`Precision::Fp32`, streams give NeMo's streaming tokens exactly: at every chunk
+size of the English model, and for Nemotron 3.5 in `en-US` at 320 and 1120 ms, the
+sizes checked.
+
+On an RTX 5090, Nemotron Speech Streaming EN on LibriSpeech test-clean (5.4 h),
+one stream, audio pushed a chunk at a time as fast as it is processed. Each cell
+is the mean time per chunk, then speed in x real time. scriptrs times the mel,
+encoder and decode of each chunk; NeMo computes the mel up front and times the
+rest. [NeMo-Speech.cpp](https://github.com/NVIDIA/NeMo-Speech.cpp) runs its
+8-bit `Q8_0` model with batching off:
+
+| Chunk (lookahead) | scriptrs FP32 | scriptrs FP16 | NeMo-Speech.cpp | NeMo | WER |
+|---|---|---|---|---|---|
+| 80 ms (0) | 2.8 ms, 28x | | | 10.5 ms, 8x | 3.03 % |
+| 160 ms (1) | 4.0 ms, 40x | 2.7 ms, 58x | **1.7 ms, 88x** | 10.9 ms, 15x | 2.68 % |
+| 560 ms (6) | 4.6 ms, 118x | | | 11.1 ms, 49x | 2.48 % |
+| 1120 ms (13) | 5.6 ms, 187x | 3.0 ms, **345x** | **2.9 ms**, 275x | 12.4 ms, 84x | 2.32 % |
+
+The WER column is NeMo's and both scriptrs precisions'; NeMo-Speech.cpp's 8-bit
+model scores 2.52 % at 160 ms and 2.43 % at 1120 ms.
+
+With many streams at 160 ms chunks, each cell is total speed in x real time, then
+the 99th-percentile time per chunk. The scriptrs bench steps every stream once per
+round and batches them all together (`max_batch` set to the stream count);
+NeMo-Speech.cpp runs a thread per stream through its batcher, which took about
+18 ms per chunk even with one stream:
+
+| Streams | scriptrs FP32 | scriptrs FP16 | NeMo-Speech.cpp |
+|---|---|---|---|
+| 8 | 241x, 5.3 ms | **414x, 3.1 ms** | 65x, 23.6 ms |
+| 16 | 479x, 5.3 ms | **741x, 3.4 ms** | 123x, 25.8 ms |
+| 32 | 795x, 10.2 ms | **1163x, 7.0 ms** | 222x, 27.9 ms |
+| 64 | 1038x, 13.5 ms | **1573x, 9.1 ms** | 351x, 39.8 ms |
+| 128 | 1135x, 21.1 ms | **1884x, 13.0 ms** | 427x, 89.1 ms |
+| 256 | 1305x, 33.3 ms | **2069x, 21.4 ms** | 511x, 143.9 ms |
+
+At every stream count, scriptrs FP32 gives NeMo's WER of 2.68 %; FP16 stays
+within 0.002 points of it.
 
 ## Example
 

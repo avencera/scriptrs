@@ -334,8 +334,13 @@ mod tests {
 
     #[test]
     fn v2_vocab_txt_blank_is_blk() {
-        let vocab = Vocabulary::from_file(fixture_path("fixtures/models/parakeet-v2/vocab.txt"))
-            .expect("v2 vocab fixture should parse");
+        // the v2 `vocab.txt` shape: 1024 SentencePiece pieces, then the blank
+        let mut data: String = (0..1_024).map(|id| format!("▁t{id} {id}\n")).collect();
+        data.push_str("<blk> 1024\n");
+        let path = tempfile::NamedTempFile::new().expect("temporary vocabulary should exist");
+        std::fs::write(path.path(), data).expect("temporary vocabulary should be written");
+
+        let vocab = Vocabulary::from_file(path.path()).expect("v2 vocab should parse");
         assert_eq!(vocab.blank_id(), 1_024);
         assert_eq!(vocab.token(vocab.blank_id()), Some("<blk>"));
         ParakeetDeployment::v2()

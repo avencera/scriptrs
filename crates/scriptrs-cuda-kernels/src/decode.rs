@@ -150,7 +150,7 @@ fn key_value(key: u32) -> f32 {
 
 /// Class logits each `decode_decide` thread holds in registers, so the decision
 /// reads the row from memory once and every load of a thread is in flight at once
-pub const DECIDE_VALUES: usize = 12;
+pub const DECIDE_VALUES: usize = 13;
 
 /// The first maximum of the duration logits, one per lane of warp 0 (`index` is
 /// `u32::MAX` past them), and whether they are all finite, on every lane

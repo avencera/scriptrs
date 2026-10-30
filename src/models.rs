@@ -51,20 +51,124 @@ pub(crate) enum RuntimeBundle {
 ///
 /// The residual stream, the matrix multiplies' outputs and their accumulation stay
 /// FP32 at every precision, and decoding always runs in FP32
+///
+/// # Which to use
+///
+/// Use the default, [`Precision::Fp16`]. It is the fastest one utterance at a time
+/// and scores the same WER as FP32
+///
+/// [`Precision::Fp32`] and [`Precision::Tf32`] are for compatibility: use them only
+/// to keep matching transcripts you already produced at that precision, such as
+/// NeMo's FP32 output token for token. They are slower and no more accurate
+///
+/// `Precision::Fp8`, `Precision::Int8` and `Precision::Nvfp4` (`low-precision`
+/// feature) are not recommended, and most users should leave the feature off. They
+/// are not faster: all three are slower than FP16 one utterance at a time. Nor do
+/// they save much GPU memory, since most of a running model's memory is not its
+/// weights: on an RTX 5090 with Parakeet v3 they cut FP16's peak of about 7 GB by
+/// only 0.4 to 0.7 GB. Reach for one only when one of these outweighs the speed:
+///
+/// - FP8 and INT8 keep FP16's WER at about half the download (around 700 MB against
+///   1300 MB), for deployments where download or disk size is the constraint
+/// - NVFP4 is faster than FP16 in large batches and on long-form audio on Blackwell
+///   GPUs, at a measurable WER loss; it suits high-volume batch work that can accept
+///   that loss
+///
+/// The three apply to offline transcription only: a streaming model fails to load
+/// with them
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Precision {
+    /// The default, and the right choice for almost every use
+    ///
     /// FP16 weights and operands for the Conformer layers' linear layers, with FP32
     /// accumulation; the rest of the encoder runs as [`Precision::Tf32`]. FP16 keeps
     /// TF32's 10-bit mantissa, so the weights take half the memory and the multiplies
     /// run at the faster FP16 tensor-core rate. Activations past ±65504 would overflow
     #[default]
     Fp16,
+    /// For compatibility with transcripts already produced in TF32; slower than
+    /// [`Precision::Fp16`] at the same WER
+    ///
     /// TF32 tensor-core multiplies (10-bit mantissa) on Ampere and newer GPUs, with
     /// FP32 weights and operands; cuBLAS runs them as FP32 on older GPUs
     Tf32,
-    /// Full FP32 multiplies, matching NeMo's FP32 decode token for token
+    /// For compatibility: matches NeMo's FP32 decode token for token, so use it only
+    /// when you need that exact output, such as to stay consistent with transcripts
+    /// you already produced in FP32. About half as fast as [`Precision::Fp16`] at the
+    /// same WER
     Fp32,
+    /// For limited cases only: half the download of [`Precision::Fp16`] at the same
+    /// WER, but slower one utterance at a time
+    ///
+    /// FP8 E4M3 weights with one scale per weight tensor, and FP8 activations with one
+    /// dynamic scale per product, through cuBLASLt with FP32 accumulation and output.
+    /// Needs an Ada (sm_89) or newer GPU; loading fails on GPUs whose cuBLASLt runs
+    /// no FP8 products. Needs the `low-precision` feature
+    ///
+    /// On an RTX 5090 with Parakeet v3, WER stays within 0.03 points of
+    /// [`Precision::Fp16`] on every set measured: 1.94 % against 1.93 % on LibriSpeech
+    /// test-clean, 8.22 % against 8.24 % on Earnings-21, 4.56 % against 4.57 % on
+    /// FLEURS (de, es, fr, it, nl, pt) and 6.28 % against 6.25 % on MLS (es, fr, it,
+    /// pt). It runs about 7 % slower than FP16 one utterance at a time and 2 % faster
+    /// in batches of 16, and its weight file is 697 MB against FP16's 1300 MB
+    ///
+    /// cuBLASLt's algorithm for each product shape is chosen by timing the first time
+    /// that shape runs, so the first transcription of each new size waits for the
+    /// timing, and a few transcripts can differ between processes
+    #[cfg(feature = "low-precision")]
+    Fp8,
+    /// For limited cases only: half the download of [`Precision::Fp16`] at the same
+    /// WER on GPUs without FP8, but slower than FP16
+    ///
+    /// INT8 weights with one scale per 128 inputs, dequantized to FP16 before each
+    /// [`Precision::Fp16`] product, so it runs on any GPU FP16 does. Needs the
+    /// `low-precision` feature
+    ///
+    /// On an RTX 5090 with Parakeet v3, WER stays within 0.04 points of FP16 on every
+    /// set measured: 1.93 % against 1.93 % on LibriSpeech test-clean, 8.26 % against
+    /// 8.24 % on Earnings-21, 4.57 % against 4.57 % on FLEURS and 6.28 % against
+    /// 6.25 % on MLS. Dequantizing costs about 25 % of FP16's speed one utterance at a
+    /// time and 7 % in batches of 16; its weight file is 715 MB
+    #[cfg(feature = "low-precision")]
+    Int8,
+    /// For limited cases only: high-volume batch work on Blackwell GPUs that can
+    /// accept a small WER loss
+    ///
+    /// NVFP4: E2M1 weights and activations in blocks of 16 with E4M3 scales and one
+    /// scale per tensor, through cuBLASLt's block-scaled products. Needs a Blackwell
+    /// GPU (compute capability 10.0 or newer; measured only on sm_120); loading fails
+    /// on GPUs whose cuBLASLt runs no NVFP4 products. Needs the `low-precision` feature
+    ///
+    /// On an RTX 5090 with Parakeet v3 it runs 16 %
+    /// faster than [`Precision::Fp16`] in batches of 16 and 26 % faster on long-form
+    /// Earnings-21 calls, but 22 % slower one utterance at a time, and WER rises by
+    /// about 0.08 points on LibriSpeech test-clean (2.01 % against 1.93 %), 0.25 on
+    /// FLEURS (4.82 % against 4.57 %) and 0.4 on MLS (6.64 % against 6.25 %). Its
+    /// weight file is 432 MB
+    ///
+    /// cuBLASLt's algorithm for each product shape is chosen by timing the first time
+    /// that shape runs, so the first transcription of each new size waits for the
+    /// timing, and a few transcripts can differ between processes
+    #[cfg(feature = "low-precision")]
+    Nvfp4,
+}
+
+#[cfg(feature = "low-precision")]
+impl Precision {
+    /// The `<name>` of the `model-<name>.safetensors` weight file
+    /// [`write_native_weights`](crate::write_native_weights) writes for this precision,
+    /// which a native bundle loads instead of `model.safetensors` when it is present;
+    /// `None` for [`Precision::Tf32`] and [`Precision::Fp32`], which read the FP32 file
+    pub fn weights_name(self) -> Option<&'static str> {
+        match self {
+            Self::Tf32 | Self::Fp32 => None,
+            Self::Fp16 => Some("fp16"),
+            Self::Fp8 => Some("fp8"),
+            Self::Int8 => Some("int8"),
+            Self::Nvfp4 => Some("nvfp4"),
+        }
+    }
 }
 
 /// Native fp32 weights and vocabulary for one deployment, as
@@ -94,17 +198,36 @@ impl NativeLayout {
     fn validate_base(&self) -> Result<(), TranscriptionError> {
         // a sibling deployment's weights are caught when the weight file's config is
         // checked against the deployment
-        let missing = [&self.weights_path, &self.vocab_path]
+        // with `low-precision`, a bundle holding only the precision's own weight file
+        // needs no FP32 file
+        let missing = [self.weights_path(), self.vocab_path.clone()]
             .into_iter()
             .find(|path| !path.exists());
         match missing {
-            Some(path) => Err(TranscriptionError::MissingModelAsset { path: path.clone() }),
+            Some(path) => Err(TranscriptionError::MissingModelAsset { path }),
             None => Ok(()),
         }
     }
 
-    pub(crate) fn weights_path(&self) -> &Path {
-        &self.weights_path
+    /// The FP32 weight file, or with `low-precision` the precision's own weight file
+    /// beside it when that is present (see `Precision::weights_name`)
+    pub(crate) fn weights_path(&self) -> PathBuf {
+        #[cfg(feature = "low-precision")]
+        if let Some(own) = self.own_weights_path() {
+            return own;
+        }
+        self.weights_path.clone()
+    }
+
+    /// `model-<name>.safetensors` beside `model.safetensors`, if it exists
+    #[cfg(feature = "low-precision")]
+    fn own_weights_path(&self) -> Option<PathBuf> {
+        let name = self.precision.weights_name()?;
+        let stem = self.weights_path.file_stem()?.to_str()?;
+        let own = self
+            .weights_path
+            .with_file_name(format!("{stem}-{name}.safetensors"));
+        own.exists().then_some(own)
     }
 
     #[cfg(feature = "vad")]
@@ -271,9 +394,16 @@ impl ModelBundle {
 
     /// Set the precision of the CUDA encoder's matrix multiplies, FP16 by default
     ///
+    /// Most users should keep the default; see [`Precision`] for when another fits.
     /// [`Precision::Tf32`] keeps the weights and operands in FP32, out of FP16's
     /// overflow range, and [`Precision::Fp32`] gives up the tensor-core speedup for
     /// output that matches NeMo's FP32 decode exactly. Core ML bundles ignore it
+    #[cfg_attr(
+        feature = "low-precision",
+        doc = "",
+        doc = "A native bundle reads the precision's own weight file when it is present \
+               (see [`Precision::weights_name`])"
+    )]
     #[cfg(feature = "cuda")]
     pub fn with_precision(mut self, precision: Precision) -> Self {
         if let RuntimeBundle::Native(layout) = &mut self.runtime {
@@ -678,11 +808,17 @@ mod tests {
     use crate::deployment::{ParakeetDeployment, ParakeetVersion};
     use crate::error::TranscriptionError;
     use std::fs;
-    use std::path::PathBuf;
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
 
-    fn fixture_models() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/models")
+    /// An empty v2 Core ML layout: what `validate_base` checks is which paths exist
+    fn v2_layout() -> TempDir {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let layout = ParakeetDeployment::v2().layout();
+        for dir in [layout.encoder(), layout.decoder(), layout.joint_decision()] {
+            fs::create_dir_all(temp_dir.path().join(dir)).expect("v2 bundle dir should be created");
+        }
+        fs::write(temp_dir.path().join(layout.vocab()), []).expect("v2 vocab should be created");
+        temp_dir
     }
 
     fn coreml_layout(bundle: &ModelBundle) -> &CoreMlLayout {
@@ -695,7 +831,8 @@ mod tests {
 
     #[test]
     fn v2_bundle_resolves_existing_fixture_paths() {
-        let bundle = ModelBundle::from_dir(fixture_models());
+        let layout = v2_layout();
+        let bundle = ModelBundle::from_dir(layout.path());
         bundle
             .validate_base()
             .expect("v2 fixture layout should validate");
@@ -710,8 +847,8 @@ mod tests {
 
     #[test]
     fn v3_deployment_rejects_a_v2_layout() {
-        let bundle =
-            ModelBundle::from_dir_with_deployment(fixture_models(), ParakeetDeployment::v3());
+        let layout = v2_layout();
+        let bundle = ModelBundle::from_dir_with_deployment(layout.path(), ParakeetDeployment::v3());
         let error = bundle
             .validate_base()
             .expect_err("v3 must reject the v2 fixture layout");

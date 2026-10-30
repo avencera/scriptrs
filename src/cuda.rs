@@ -7,7 +7,14 @@ pub(crate) mod decoder;
 pub(crate) mod encoder;
 pub(crate) mod fp16;
 pub(crate) mod kernels;
+#[cfg(feature = "low-precision")]
+pub(crate) mod lt;
 pub(crate) mod model;
+#[cfg(feature = "low-precision")]
+pub(crate) mod quant;
+#[cfg(feature = "low-precision")]
+pub(crate) mod stored;
+pub(crate) mod streaming;
 #[cfg(test)]
 pub(crate) mod test_support;
 
@@ -21,6 +28,8 @@ use cudakit::{DeviceTensor, Error, Math, Sgemm};
 
 use crate::cuda::encoder::EncoderMath;
 use crate::cuda::kernels::CudaRuntime;
+#[cfg(feature = "low-precision")]
+use crate::cuda::quant::Scheme;
 use crate::error::TranscriptionError;
 use crate::models::Precision;
 use crate::native::weights::WeightFile;
@@ -149,6 +158,12 @@ pub(crate) fn math(precision: Precision) -> EncoderMath {
         Precision::Fp32 => EncoderMath::Single(Math::Fp32),
         Precision::Tf32 => EncoderMath::Single(Math::Tf32),
         Precision::Fp16 => EncoderMath::Fp16,
+        #[cfg(feature = "low-precision")]
+        Precision::Fp8 => EncoderMath::Quantized(Scheme::Fp8),
+        #[cfg(feature = "low-precision")]
+        Precision::Int8 => EncoderMath::Quantized(Scheme::Int8),
+        #[cfg(feature = "low-precision")]
+        Precision::Nvfp4 => EncoderMath::Quantized(Scheme::Nvfp4),
     }
 }
 

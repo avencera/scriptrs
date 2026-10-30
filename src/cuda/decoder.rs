@@ -12,12 +12,12 @@ use cudakit::{DeviceTensor, Math};
 use crate::backend::LanguageMask;
 use crate::cuda::kernels::{
     CudaRuntime, DecodeFilter, DecodeKernels, DecodeOutput, DecodeShape, DecodeState,
-    EncoderKernels, LstmInput, LstmState, LstmWeights, MAX_FILTER_TOP_K, Projection,
+    EncoderKernels, LstmInput, LstmState, LstmWeights, MAX_FILTER_TOP_K, Projection, StreamKernels,
 };
 use crate::cuda::{Direction, HostStaging, linear, upload, upload_host, zeros};
 use crate::decode::RawTranscription;
 use crate::error::TranscriptionError;
-use crate::native::spec::ParakeetSpec;
+use crate::native::spec::TransducerSpec;
 use crate::native::weights::WeightFile;
 
 /// A PyTorch `Linear` with bias
@@ -57,6 +57,32 @@ pub(crate) struct CudaDecoder {
     kernels: DecodeKernels,
     /// `fill_rows` for the GEMM biases
     encoder_kernels: EncoderKernels,
+    /// Slot gathers and scatters for [`DecoderStates`]
+    stream_kernels: StreamKernels,
+}
+
+/// Each stream's predictor between its chunks, one slot per stream
+///
+/// A chunk's decode resumes from the state its stream's last chunk left: the LSTM
+/// after the last token and the joint's projection of it, as NeMo's label-looping
+/// decode carries them between `conformer_stream_step` calls
+pub(crate) struct DecoderStates {
+    slots: usize,
+    /// `[slots, layers, hidden]` each
+    h: CudaSlice<f32>,
+    c: CudaSlice<f32>,
+    /// `[slots, joint_hidden]`
+    pred_proj: CudaSlice<f32>,
+}
+
+/// One stream's row in a chunk decode
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DecodeRow {
+    /// The stream's slot in the [`DecoderStates`]
+    pub slot: usize,
+    /// The stream's first chunk, which starts from the blank instead of a saved
+    /// state
+    pub fresh: bool,
 }
 
 /// Device buffers for one `(batch, encoder frames)` shape
@@ -91,6 +117,8 @@ pub(crate) struct DecodeWorkspace {
     /// `[1]`, the language filter's top-K width, 0 for none; a buffer rather than a
     /// launch argument so captured graphs follow [`CudaDecoder::set_language`]
     filter_top_k: CudaSlice<u32>,
+    /// `[batch]` each row's stream slot, for [`CudaDecoder::resume`]
+    slots: CudaSlice<u32>,
     host: DecodeReadback,
 }
 
@@ -131,6 +159,7 @@ impl DecodeWorkspace {
             &self.token_durations,
             &self.allowed,
             &self.filter_top_k,
+            &self.slots,
         ];
         floats.into_iter().map(CudaSlice::num_bytes).sum::<usize>()
             + state.into_iter().map(CudaSlice::num_bytes).sum::<usize>()
@@ -146,15 +175,19 @@ impl DecodeWorkspace {
 
 impl CudaDecoder {
     /// Uploads the predictor and joint weights and loads the kernels
+    ///
+    /// An RNNT joint gets one zero duration logit appended, so it runs on the TDT
+    /// decision as a single duration of 0: a blank then moves to the next frame and
+    /// a token stays on its frame until `max_symbols`, NeMo's RNNT greedy rule
     pub(crate) fn load(
         runtime: &CudaRuntime,
         file: &WeightFile,
-        spec: &ParakeetSpec,
+        spec: &TransducerSpec,
     ) -> Result<Self, TranscriptionError> {
         let hidden = spec.predictor.hidden;
         let classes = spec.predictor.vocab_size + 1;
         let joint_hidden = spec.joint.hidden;
-        let encoder_hidden = spec.encoder.d_model;
+        let encoder_hidden = spec.encoder_hidden;
         let gates = 4 * hidden;
         if spec.predictor.layers == 0 {
             return Err(TranscriptionError::InvalidWeights(
@@ -182,9 +215,26 @@ impl CudaDecoder {
                     bias: upload(runtime, file, &format!("{prefix}.bias"), &[out])?,
                 })
             };
-        let max_advance = spec.durations.iter().copied().max().unwrap_or(0).max(1);
-        let durations: Vec<u32> = spec
-            .durations
+        let (joint_out, outputs, durations) = if spec.durations.is_empty() {
+            let weight = file.tensor("joint.joint_net.2.weight", &[classes, joint_hidden])?;
+            let bias = file.tensor("joint.joint_net.2.bias", &[classes])?;
+            let weight: Vec<f32> = weight
+                .iter()
+                .copied()
+                .chain(std::iter::repeat_n(0.0, joint_hidden))
+                .collect();
+            let bias: Vec<f32> = bias.iter().copied().chain([0.0]).collect();
+            let joint_out = Linear {
+                weight: upload_host(runtime, &weight)?,
+                bias: upload_host(runtime, &bias)?,
+            };
+            (joint_out, classes + 1, vec![0])
+        } else {
+            let joint_out = linear_weights("joint.joint_net.2", spec.joint.outputs, joint_hidden)?;
+            (joint_out, spec.joint.outputs, spec.durations.clone())
+        };
+        let max_advance = durations.iter().copied().max().unwrap_or(0).max(1);
+        let durations: Vec<u32> = durations
             .iter()
             .map(|duration| {
                 u32::try_from(*duration).map_err(|_| {
@@ -198,7 +248,7 @@ impl CudaDecoder {
             joint_hidden,
             encoder_hidden,
             classes,
-            outputs: spec.joint.outputs,
+            outputs,
             max_symbols: spec.max_symbols,
             max_advance,
             embed: upload(
@@ -210,10 +260,27 @@ impl CudaDecoder {
             lstm,
             joint_enc: linear_weights("joint.enc", joint_hidden, encoder_hidden)?,
             joint_pred: linear_weights("joint.pred", joint_hidden, hidden)?,
-            joint_out: linear_weights("joint.joint_net.2", spec.joint.outputs, joint_hidden)?,
+            joint_out,
             durations: runtime.stream().clone_htod(&durations)?,
             kernels: DecodeKernels::load(runtime)?,
             encoder_kernels: EncoderKernels::load(runtime)?,
+            stream_kernels: StreamKernels::load(runtime)?,
+        })
+    }
+
+    /// Zeroed predictor states for `slots` streams
+    pub(crate) fn states(
+        &self,
+        runtime: &CudaRuntime,
+        slots: usize,
+    ) -> Result<DecoderStates, TranscriptionError> {
+        let stream = runtime.stream();
+        let lstm = slots * self.lstm.len() * self.hidden;
+        Ok(DecoderStates {
+            slots,
+            h: zeros(stream, lstm)?,
+            c: zeros(stream, lstm)?,
+            pred_proj: zeros(stream, slots * self.joint_hidden)?,
         })
     }
 
@@ -253,6 +320,7 @@ impl CudaDecoder {
             confidences: zeros(stream, batch * capacity)?,
             allowed: state(self.classes)?,
             filter_top_k: state(1)?,
+            slots: state(batch)?,
             host: DecodeReadback {
                 frame: readback(batch)?,
                 counts: readback(batch)?,
@@ -312,6 +380,153 @@ impl CudaDecoder {
         encoder_out: &CudaSlice<f32>,
         lens: &[usize],
     ) -> Result<(), TranscriptionError> {
+        self.project_encoder(runtime, ws, encoder_out, lens)?;
+        let stream = runtime.stream();
+        stream.memset_zeros(&mut ws.h)?;
+        stream.memset_zeros(&mut ws.c)?;
+        self.reset_cursors(runtime, ws, &vec![1u32; ws.batch])?;
+        self.predict(runtime, ws)
+    }
+
+    /// [`Self::start`] for a chunk of each row's stream: a fresh row starts from the
+    /// blank, and every other row resumes from its slot in `states`
+    pub(crate) fn resume(
+        &self,
+        runtime: &CudaRuntime,
+        ws: &mut DecodeWorkspace,
+        encoder_out: &CudaSlice<f32>,
+        lens: &[usize],
+        states: &mut DecoderStates,
+        rows: &[DecodeRow],
+    ) -> Result<(), TranscriptionError> {
+        let mut seen = vec![false; states.slots];
+        for row in rows {
+            match seen.get_mut(row.slot) {
+                Some(seen) if !*seen => *seen = true,
+                _ => {
+                    return Err(TranscriptionError::InvalidConfiguration(format!(
+                        "decoder slot {} is repeated or outside the {} slots",
+                        row.slot, states.slots
+                    )));
+                }
+            }
+        }
+        if rows.len() != ws.batch {
+            return Err(TranscriptionError::InvalidConfiguration(format!(
+                "{} decode rows for a batch of {}",
+                rows.len(),
+                ws.batch
+            )));
+        }
+        self.project_encoder(runtime, ws, encoder_out, lens)?;
+
+        let stream = runtime.stream();
+        // a fresh stream's slot may hold a finished stream's state
+        let lstm = self.lstm.len() * self.hidden;
+        for row in rows.iter().filter(|row| row.fresh) {
+            let range = row.slot * lstm..(row.slot + 1) * lstm;
+            stream.memset_zeros(&mut states.h.slice_mut(range.clone()))?;
+            stream.memset_zeros(&mut states.c.slice_mut(range))?;
+        }
+        let slots: Vec<u32> = rows.iter().map(|row| row.slot as u32).collect();
+        stream.memcpy_htod(&slots, &mut ws.slots)?;
+        let layers = self.lstm.len();
+        let kernels = &self.stream_kernels;
+        kernels.gather(
+            stream,
+            &states.h.slice(..),
+            &ws.slots.slice(..),
+            &mut ws.h.slice_mut(..),
+            layers,
+        )?;
+        kernels.gather(
+            stream,
+            &states.c.slice(..),
+            &ws.slots.slice(..),
+            &mut ws.c.slice_mut(..),
+            layers,
+        )?;
+        kernels.gather(
+            stream,
+            &states.pred_proj.slice(..),
+            &ws.slots.slice(..),
+            &mut ws.pred_proj.slice_mut(..),
+            1,
+        )?;
+
+        // a resumed row's predictor already holds its last token, so it only
+        // computes the first frame's joint input
+        let emit: Vec<u32> = rows.iter().map(|row| u32::from(row.fresh)).collect();
+        self.reset_cursors(runtime, ws, &emit)?;
+        self.predict(runtime, ws)
+    }
+
+    /// Saves each row's predictor to its slot after a [`Self::resume`] decode
+    pub(crate) fn save(
+        &self,
+        runtime: &CudaRuntime,
+        ws: &DecodeWorkspace,
+        states: &mut DecoderStates,
+    ) -> Result<(), TranscriptionError> {
+        let stream = runtime.stream();
+        let layers = self.lstm.len();
+        let kernels = &self.stream_kernels;
+        kernels.scatter(
+            stream,
+            &ws.h.slice(..),
+            &ws.slots.slice(..),
+            &mut states.h.slice_mut(..),
+            layers,
+        )?;
+        kernels.scatter(
+            stream,
+            &ws.c.slice(..),
+            &ws.slots.slice(..),
+            &mut states.c.slice_mut(..),
+            layers,
+        )?;
+        kernels.scatter(
+            stream,
+            &ws.pred_proj.slice(..),
+            &ws.slots.slice(..),
+            &mut states.pred_proj.slice_mut(..),
+            1,
+        )?;
+        Ok(())
+    }
+
+    /// Puts every cursor on frame 0 with no tokens and marks the rows in `emit` to
+    /// feed the blank
+    fn reset_cursors(
+        &self,
+        runtime: &CudaRuntime,
+        ws: &mut DecodeWorkspace,
+        emit: &[u32],
+    ) -> Result<(), TranscriptionError> {
+        let stream = runtime.stream();
+        for buffer in [
+            &mut ws.frame,
+            &mut ws.emitted,
+            &mut ws.counts,
+            &mut ws.faults,
+        ] {
+            stream.memset_zeros(buffer)?;
+        }
+        // the blank is NeMo's start symbol, and every fresh row feeds it once
+        let blank = vec![(self.classes - 1) as u32; ws.batch];
+        stream.memcpy_htod(&blank, &mut ws.label)?;
+        stream.memcpy_htod(emit, &mut ws.emit)?;
+        Ok(())
+    }
+
+    /// Projects `encoder_out` for the joint and records the rows' valid frames
+    fn project_encoder(
+        &self,
+        runtime: &CudaRuntime,
+        ws: &mut DecodeWorkspace,
+        encoder_out: &CudaSlice<f32>,
+        lens: &[usize],
+    ) -> Result<(), TranscriptionError> {
         if lens.len() != ws.batch || lens.iter().any(|len| *len > ws.frames) {
             return Err(TranscriptionError::InvalidConfiguration(format!(
                 "decode lengths {lens:?} do not fit a batch of {} with {} frames",
@@ -343,21 +558,7 @@ impl CudaDecoder {
         ws.host_lens.copy_from_slice(lens);
         let lens: Vec<u32> = lens.iter().map(|len| *len as u32).collect();
         stream.memcpy_htod(&lens, &mut ws.lens)?;
-        stream.memset_zeros(&mut ws.h)?;
-        stream.memset_zeros(&mut ws.c)?;
-        for buffer in [
-            &mut ws.frame,
-            &mut ws.emitted,
-            &mut ws.counts,
-            &mut ws.faults,
-        ] {
-            stream.memset_zeros(buffer)?;
-        }
-        // the blank is NeMo's start symbol, and every row feeds it once
-        let blank = vec![(self.classes - 1) as u32; ws.batch];
-        stream.memcpy_htod(&blank, &mut ws.label)?;
-        stream.memcpy_htod(&vec![1u32; ws.batch], &mut ws.emit)?;
-        self.predict(runtime, ws)
+        Ok(())
     }
 
     /// Feeds each emitting row's label through the LSTM and projects the top layer
@@ -726,7 +927,7 @@ mod tests {
         for version in [ParakeetVersion::V2, ParakeetVersion::V3] {
             let file = weights(version);
             let spec = file.parakeet_spec(&deployment(version)).expect("spec");
-            let decoder = CudaDecoder::load(&runtime, &file, &spec).expect("decoder");
+            let decoder = CudaDecoder::load(&runtime, &file, &spec.transducer).expect("decoder");
             let encoder = CudaEncoder::load(
                 &runtime,
                 &file,
@@ -796,7 +997,7 @@ mod tests {
         let version = ParakeetVersion::V3;
         let file = weights(version);
         let spec = file.parakeet_spec(&deployment(version)).expect("spec");
-        let decoder = CudaDecoder::load(&runtime, &file, &spec).expect("decoder");
+        let decoder = CudaDecoder::load(&runtime, &file, &spec.transducer).expect("decoder");
 
         for set in SETS {
             let reference = NemoReference::open(version, set);
@@ -1050,7 +1251,7 @@ mod tests {
         let deployment = ParakeetDeployment::v3();
         let file = weights(ParakeetVersion::V3);
         let spec = file.parakeet_spec(&deployment).expect("spec");
-        let decoder = CudaDecoder::load(&runtime, &file, &spec).expect("decoder");
+        let decoder = CudaDecoder::load(&runtime, &file, &spec.transducer).expect("decoder");
         let vocab = ModelBundle::from_native_dir(native_root(), deployment.clone())
             .vocabulary()
             .expect("vocabulary");

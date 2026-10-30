@@ -4,12 +4,15 @@
 //! `src/cuda/ptx/<area>.ptx` of the scriptrs tree (`just cuda-kernels`). Entry names
 //! carry the area prefix because the host looks kernels up by name
 
-// the encoder writes FP16 GEMM operands through Rust's `f16` casts
+// the encoder writes FP16 GEMM operands through Rust's `f16` casts, and the quant
+// area reads them back
 #![feature(f16)]
 
-#[cfg(any(feature = "encoder", feature = "decode"))]
+#[cfg(any(feature = "encoder", feature = "decode", feature = "quant"))]
 mod common;
 #[cfg(feature = "decode")]
 pub mod decode;
 #[cfg(feature = "encoder")]
 pub mod encoder;
+#[cfg(feature = "quant")]
+pub mod quant;
