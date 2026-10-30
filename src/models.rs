@@ -4,6 +4,8 @@ use crate::deployment::ParakeetDeployment;
 use crate::error::TranscriptionError;
 use crate::vocab::Vocabulary;
 
+#[cfg(feature = "low-precision")]
+use crate::cuda::encoder::EncoderMath;
 #[cfg(all(feature = "online", feature = "cuda"))]
 use crate::deployment::ParakeetVersion;
 #[cfg(feature = "online")]
@@ -165,12 +167,11 @@ impl Precision {
     /// which a native bundle loads instead of `model.safetensors` when it is present;
     /// `None` for [`Precision::Tf32`] and [`Precision::Fp32`], which read the FP32 file
     pub fn weights_name(self) -> Option<&'static str> {
-        match self {
-            Self::Tf32 | Self::Fp32 => None,
-            Self::Fp16 => Some("fp16"),
-            Self::Fp8 => Some("fp8"),
-            Self::Int8 => Some("int8"),
-            Self::Nvfp4 => Some("nvfp4"),
+        // the names are the `linear_weights` values the weight files store
+        match crate::cuda::math(self) {
+            EncoderMath::Single(_) => None,
+            EncoderMath::Fp16 => Some(crate::cuda::stored::FP16),
+            EncoderMath::Quantized(scheme) => Some(scheme.name()),
         }
     }
 }
