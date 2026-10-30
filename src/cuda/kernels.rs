@@ -166,10 +166,7 @@ fn check_weight_row(hidden: usize) -> Result<(), Error> {
 }
 
 pub(crate) fn elements(count: usize) -> Result<LaunchConfig, Error> {
-    let count = u32::try_from(count).map_err(|_| Error::DimensionOverflow {
-        context: "kernel grid",
-        value: count,
-    })?;
+    let count = u32_of("kernel grid", count)?;
     Ok(LaunchConfig {
         grid_dim: (count.div_ceil(ELEMENT_THREADS), 1, 1),
         block_dim: (ELEMENT_THREADS, 1, 1),
@@ -188,11 +185,6 @@ fn rows(count: usize) -> Result<LaunchConfig, Error> {
 
 pub(crate) fn u32_of(context: &'static str, value: usize) -> Result<u32, Error> {
     u32::try_from(value).map_err(|_| Error::DimensionOverflow { context, value })
-}
-
-/// Elements in `shape`, failing on overflow
-fn count(context: &'static str, shape: &[usize]) -> Result<usize, Error> {
-    element_count(context, shape)
 }
 
 pub(crate) fn len<T>(view: &CudaView<'_, T>) -> u64 {
@@ -215,37 +207,44 @@ pub(crate) struct Heads {
 impl Heads {
     /// Elements in one `[batch, heads, frames, head_dim]` tensor
     fn len(self) -> Result<usize, Error> {
-        count(
+        element_count(
             "attention heads",
             &[self.batch, self.frames, self.heads, self.head_dim],
         )
     }
 }
 
-/// Checks the buffers of a 3x3 subsampling convolution against its output map
+/// Checks the buffers of a 3x3 subsampling convolution, offline or streaming,
+/// against its output map
 fn check_subsampling(
     input: FeatureMap,
     output: FeatureMap,
-    lens: usize,
     weight: usize,
     bias: usize,
     out: usize,
 ) -> Result<(), Error> {
-    if input.batch != output.batch {
-        return Err(Error::BufferLength {
-            context: "subsampling batch",
-            expected: output.batch,
-            actual: input.batch,
-        });
-    }
-    check_len("subsampling lengths", output.batch, lens)?;
+    check_len("subsampling batch", output.batch, input.batch)?;
     check_len(
         "subsampling weight",
-        count("subsampling weight", &[output.channels, 9])?,
+        element_count("subsampling weight", &[output.channels, 9])?,
         weight,
     )?;
     check_len("subsampling bias", output.channels, bias)?;
     check_len("subsampling output", output.len(), out)
+}
+
+/// The dimensions a 3x3 subsampling convolution kernel takes, in its parameter
+/// order: the output's batch and channels, then the input's and the output's frames
+/// and features
+fn subsampling_dims(input: FeatureMap, output: FeatureMap) -> Result<[u32; 6], Error> {
+    Ok([
+        u32_of("batch", output.batch)?,
+        u32_of("channels", output.channels)?,
+        u32_of("frames", input.frames)?,
+        u32_of("features", input.features)?,
+        u32_of("frames", output.frames)?,
+        u32_of("features", output.features)?,
+    ])
 }
 
 /// The output of a kernel that feeds a GEMM: FP32 for an FP32 or TF32 GEMM, or FP16
@@ -510,8 +509,8 @@ impl EncoderKernels {
         shape: Heads,
     ) -> Result<(), Error> {
         let n = shape.len()?;
-        let width = count("qkv width", &[shape.heads, shape.head_dim])?;
-        check_len("qkv input", count("qkv input", &[3, n])?, qkv.len())?;
+        let width = element_count("qkv width", &[shape.heads, shape.head_dim])?;
+        check_len("qkv input", element_count("qkv input", &[3, n])?, qkv.len())?;
         check_len("pos_bias_u", width, bias_u.len())?;
         check_len("pos_bias_v", width, bias_v.len())?;
         for (context, buffer) in [("q + u", &*q_u), ("q + v", &*q_v), ("k", &*k), ("v", &*v)] {
@@ -570,7 +569,7 @@ impl EncoderKernels {
         heads: usize,
         head_dim: usize,
     ) -> Result<(), Error> {
-        let n = count("split heads", &[rows_count, heads, head_dim])?;
+        let n = element_count("split heads", &[rows_count, heads, head_dim])?;
         check_len("split heads input", n, x.len())?;
         check_len("split heads output", n, out.len())?;
         let config = elements(n)?;
@@ -631,17 +630,17 @@ impl EncoderKernels {
         shape: Heads,
     ) -> Result<(), Error> {
         let (batch, heads, frames) = (shape.batch, shape.heads, shape.frames);
-        let score_rows = count("score rows", &[batch, heads, frames])?;
+        let score_rows = element_count("score rows", &[batch, heads, frames])?;
         check_len(
             "scores",
-            count("scores", &[score_rows, frames])?,
+            element_count("scores", &[score_rows, frames])?,
             scores.len(),
         )?;
         // one row of 2T - 1 relative positions per query
         let positions = (2 * frames).saturating_sub(1);
         check_len(
             "position scores",
-            count("position scores", &[score_rows, positions])?,
+            element_count("position scores", &[score_rows, positions])?,
             bd.len(),
         )?;
         check_len("frame lengths", batch, lens_frames.len())?;
@@ -692,16 +691,16 @@ impl EncoderKernels {
         channels: usize,
         kernel_size: usize,
     ) -> Result<(), Error> {
-        let n = count("conv module", &[batch, frames, channels])?;
+        let n = element_count("conv module", &[batch, frames, channels])?;
         check_len(
             "conv pw1 output",
-            count("conv pw1 output", &[2, n])?,
+            element_count("conv pw1 output", &[2, n])?,
             pw1.len(),
         )?;
         check_len("frame lengths", batch, lens_frames.len())?;
         check_len(
             "depthwise weight",
-            count("depthwise weight", &[channels, kernel_size])?,
+            element_count("depthwise weight", &[channels, kernel_size])?,
             weight.len(),
         )?;
         check_len("batch norm scale", channels, scale.len())?;
@@ -792,20 +791,14 @@ impl EncoderKernels {
         // the first convolution reads one channel
         check_len(
             "subsampling input",
-            count(
+            element_count(
                 "subsampling input",
                 &[input.batch, input.frames, input.features],
             )?,
             mel.len(),
         )?;
-        check_subsampling(
-            input,
-            output,
-            in_lens.len(),
-            weight.len(),
-            bias.len(),
-            out.len(),
-        )?;
+        check_subsampling(input, output, weight.len(), bias.len(), out.len())?;
+        check_len("subsampling lengths", output.batch, in_lens.len())?;
         check_len("input lengths", output.batch, out_lens.len())?;
         let config = elements(output.len())?;
         let lens = [
@@ -816,14 +809,7 @@ impl EncoderKernels {
             len(bias),
             len_mut(out),
         ];
-        let dims = [
-            u32_of("batch", output.batch)?,
-            u32_of("channels", output.channels)?,
-            u32_of("frames", input.frames)?,
-            u32_of("features", input.features)?,
-            u32_of("frames", output.frames)?,
-            u32_of("features", output.features)?,
-        ];
+        let dims = subsampling_dims(input, output)?;
         let mut launch = stream.launch_builder(&self.subsample_conv_in);
         launch
             .arg(mel)
@@ -864,24 +850,11 @@ impl EncoderKernels {
         output: FeatureMap,
     ) -> Result<(), Error> {
         check_len("depthwise input", input.len(), x.len())?;
-        check_subsampling(
-            input,
-            output,
-            out_lens.len(),
-            weight.len(),
-            bias.len(),
-            out.len(),
-        )?;
+        check_subsampling(input, output, weight.len(), bias.len(), out.len())?;
+        check_len("subsampling lengths", output.batch, out_lens.len())?;
         let config = elements(output.len())?;
         let lens = [len(x), len(out_lens), len(weight), len(bias), len_mut(out)];
-        let dims = [
-            u32_of("batch", output.batch)?,
-            u32_of("channels", output.channels)?,
-            u32_of("frames", input.frames)?,
-            u32_of("features", input.features)?,
-            u32_of("frames", output.frames)?,
-            u32_of("features", output.features)?,
-        ];
+        let dims = subsampling_dims(input, output)?;
         let mut launch = stream.launch_builder(&self.subsample_depthwise);
         launch
             .arg(x)
@@ -1120,11 +1093,11 @@ impl AttentionKernels {
             });
         }
         let n = shape.len()?;
-        let d_model = count("attention width", &[shape.heads, shape.head_dim])?;
-        check_len("fused qkv", count("fused qkv", &[3, n])?, qkv.len())?;
+        let d_model = element_count("attention width", &[shape.heads, shape.head_dim])?;
+        check_len("fused qkv", element_count("fused qkv", &[3, n])?, qkv.len())?;
         check_len(
             "position table",
-            count("position table", &[2 * shape.frames - 1, d_model])?,
+            element_count("position table", &[2 * shape.frames - 1, d_model])?,
             pos.len(),
         )?;
         check_len("pos_bias_u", d_model, bias_u.len())?;
@@ -1327,7 +1300,7 @@ impl DecodeKernels {
         let row = shape.classes + durations.len();
         check_len(
             "joint logits",
-            count("joint logits", &[batch, row])?,
+            element_count("joint logits", &[batch, row])?,
             logits.len(),
         )?;
         check_len("frame lengths", batch, lens_frames.len())?;
@@ -1343,7 +1316,7 @@ impl DecodeKernels {
         ] {
             check_len(context, batch, buffer.len())?;
         }
-        let slots = count("decode output", &[batch, shape.capacity])?;
+        let slots = element_count("decode output", &[batch, shape.capacity])?;
         for (context, buffer) in [
             ("tokens", &output.tokens),
             ("token frames", &output.frames),
@@ -1461,9 +1434,9 @@ impl DecodeKernels {
     ) -> Result<(), Error> {
         check_weight_row(hidden)?;
         let batch = emit.len();
-        let n = count("lstm state", &[batch, hidden])?;
-        let gates = count("lstm gates", &[4, hidden])?;
-        let weight = count("lstm weight", &[gates, hidden])?;
+        let n = element_count("lstm state", &[batch, hidden])?;
+        let gates = element_count("lstm gates", &[4, hidden])?;
+        let weight = element_count("lstm weight", &[gates, hidden])?;
         check_len("lstm input weight", weight, weights.weight_ih.len())?;
         check_len("lstm state weight", weight, weights.weight_hh.len())?;
         check_len("lstm bias", gates, weights.bias.len())?;
@@ -1553,7 +1526,7 @@ impl DecodeKernels {
         let batch = emit.len();
         let joint_hidden = buffers.bias.len();
         let outputs = buffers.joint_bias.len();
-        let rows = count("joint input", &[batch, joint_hidden])?;
+        let rows = element_count("joint input", &[batch, joint_hidden])?;
         if joint_hidden == 0 || outputs == 0 {
             return Err(Error::BufferLength {
                 context: "joint widths",
@@ -1563,17 +1536,17 @@ impl DecodeKernels {
         }
         check_len(
             "predictor projection weight",
-            count("predictor projection weight", &[joint_hidden, hidden])?,
+            element_count("predictor projection weight", &[joint_hidden, hidden])?,
             buffers.weight.len(),
         )?;
         check_len(
             "top state",
-            count("top state", &[batch, hidden])?,
+            element_count("top state", &[batch, hidden])?,
             buffers.top.len(),
         )?;
         check_len(
             "encoder projection",
-            count("encoder projection", &[rows, frames])?,
+            element_count("encoder projection", &[rows, frames])?,
             buffers.enc_proj.len(),
         )?;
         check_len("frame cursors", batch, buffers.frame.len())?;
@@ -1583,7 +1556,7 @@ impl DecodeKernels {
         check_len("joint input", rows, buffers.joint_in.len())?;
         check_len(
             "joint logits",
-            count("joint logits", &[batch, outputs])?,
+            element_count("joint logits", &[batch, outputs])?,
             buffers.logits.len(),
         )?;
 

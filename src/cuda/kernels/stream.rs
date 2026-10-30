@@ -9,11 +9,11 @@
 use cudakit::cudarc::driver::{
     CudaFunction, CudaStream, CudaView, CudaViewMut, LaunchConfig, PushKernelArg,
 };
-use cudakit::{Error, LoadedKernels, check_len};
+use cudakit::{Error, LoadedKernels, check_len, element_count};
 
 use super::{
-    CudaRuntime, FeatureMap, GemmOperand, KernelModule, ROW_VALUES, count, elements, len, len_mut,
-    u32_of,
+    CudaRuntime, FeatureMap, GemmOperand, KernelModule, ROW_VALUES, check_subsampling, elements,
+    len, len_mut, subsampling_dims, u32_of,
 };
 
 /// Threads per stream attention block while the grid is small, the kernels'
@@ -73,7 +73,7 @@ impl StreamGeometry {
 
     /// Elements in the key-value arena, `[slots, layers, 2, context, d_model]`
     pub(crate) fn kv_len(self) -> Result<usize, Error> {
-        count(
+        element_count(
             "key-value cache",
             &[self.slots, self.layers, 2, self.context, self.d_model()],
         )
@@ -81,7 +81,7 @@ impl StreamGeometry {
 
     /// Elements in the conv arena, `[slots, layers, kernel - 1, d_model]`
     pub(crate) fn conv_len(self, kernel_size: usize) -> Result<usize, Error> {
-        count(
+        element_count(
             "conv cache",
             &[
                 self.slots,
@@ -171,7 +171,7 @@ impl StreamKernels {
     ) -> Result<(), Error> {
         check_len(
             "subsampling input",
-            count(
+            element_count(
                 "subsampling input",
                 &[input.batch, input.frames, input.features],
             )?,
@@ -179,7 +179,7 @@ impl StreamKernels {
         )?;
         check_windows(output.batch, in_windows)?;
         check_windows(output.batch, out_windows)?;
-        check_conv(input, output, weight.len(), bias.len(), out.len())?;
+        check_subsampling(input, output, weight.len(), bias.len(), out.len())?;
         let config = elements(output.len())?;
         let lens = [
             len(mel),
@@ -189,7 +189,7 @@ impl StreamKernels {
             len(bias),
             len_mut(out),
         ];
-        let dims = map_dims(input, output)?;
+        let dims = subsampling_dims(input, output)?;
         let mut launch = stream.launch_builder(&self.conv_in);
         launch
             .arg(mel)
@@ -231,7 +231,7 @@ impl StreamKernels {
     ) -> Result<(), Error> {
         check_len("depthwise input", input.len(), x.len())?;
         check_windows(output.batch, out_windows)?;
-        check_conv(input, output, weight.len(), bias.len(), out.len())?;
+        check_subsampling(input, output, weight.len(), bias.len(), out.len())?;
         let config = elements(output.len())?;
         let lens = [
             len(x),
@@ -240,7 +240,7 @@ impl StreamKernels {
             len(bias),
             len_mut(out),
         ];
-        let dims = map_dims(input, output)?;
+        let dims = subsampling_dims(input, output)?;
         let mut launch = stream.launch_builder(&self.depthwise);
         launch
             .arg(x)
@@ -312,7 +312,7 @@ impl StreamKernels {
         check_len("flatten input", map.len(), x.len())?;
         check_len(
             "flatten output",
-            count(
+            element_count(
                 "flatten output",
                 &[map.batch, out_frames, map.channels, map.features],
             )?,
@@ -374,24 +374,24 @@ impl StreamKernels {
             });
         }
         rows.check(g.batch)?;
-        check_len("qkv", count("qkv", &[g.rows(), 3, d])?, qkv.len())?;
+        check_len("qkv", element_count("qkv", &[g.rows(), 3, d])?, qkv.len())?;
         check_len("key-value cache", g.kv_len()?, kv.len())?;
         // positions `context + frames - 1` down to `-(frames - 1)`
         check_len(
             "projected positions",
-            count("projected positions", &[g.context + 2 * g.frames - 1, d])?,
+            element_count("projected positions", &[g.context + 2 * g.frames - 1, d])?,
             pos.len(),
         )?;
         check_len("pos_bias_u", d, bias_u.len())?;
         check_len("pos_bias_v", d, bias_v.len())?;
         check_len(
             "attention output",
-            count("attention output", &[g.rows(), d])?,
+            element_count("attention output", &[g.rows(), d])?,
             out.len(),
         )?;
         let blocks = u32_of(
             "attention grid",
-            count("attention grid", &[g.rows(), g.heads])?,
+            element_count("attention grid", &[g.rows(), g.heads])?,
         )?;
         let threads = if blocks < NARROW_ATTENTION_BLOCKS {
             ATTENTION_THREADS
@@ -478,9 +478,9 @@ impl StreamKernels {
             });
         }
         rows.check(g.batch)?;
-        check_len("qkv", count("qkv", &[g.rows(), 3, d])?, qkv.len())?;
+        check_len("qkv", element_count("qkv", &[g.rows(), 3, d])?, qkv.len())?;
         check_len("key-value cache", g.kv_len()?, kv.len())?;
-        let config = elements(count("key-value append", &[g.rows(), 2, d])?)?;
+        let config = elements(element_count("key-value append", &[g.rows(), 2, d])?)?;
         let lens = [len(qkv), len_mut(kv), len(rows.slots), len(rows.rings)];
         let dims = [
             u32_of("batch", g.batch)?,
@@ -536,20 +536,20 @@ impl StreamKernels {
         rows.check(g.batch)?;
         check_len(
             "conv pw1 output",
-            count("conv pw1 output", &[g.rows(), 2, d])?,
+            element_count("conv pw1 output", &[g.rows(), 2, d])?,
             pw1.len(),
         )?;
         check_len("conv cache", g.conv_len(kernel_size)?, cache.len())?;
         check_len(
             "depthwise weight",
-            count("depthwise weight", &[d, kernel_size])?,
+            element_count("depthwise weight", &[d, kernel_size])?,
             weight.len(),
         )?;
         check_len("conv norm gamma", d, gamma.len())?;
         check_len("conv norm beta", d, beta.len())?;
         check_len(
             "conv module output",
-            count("conv module output", &[g.rows(), d])?,
+            element_count("conv module output", &[g.rows(), d])?,
             out.len(),
         )?;
         let config = LaunchConfig {
@@ -625,11 +625,11 @@ impl StreamKernels {
         rows.check(g.batch)?;
         check_len(
             "conv pw1 output",
-            count("conv pw1 output", &[g.rows(), 2, d])?,
+            element_count("conv pw1 output", &[g.rows(), 2, d])?,
             pw1.len(),
         )?;
         check_len("conv cache", g.conv_len(kernel_size)?, cache.len())?;
-        let config = elements(count("conv cache update", &[g.batch, d])?)?;
+        let config = elements(element_count("conv cache update", &[g.batch, d])?)?;
         let lens = [len(pw1), len_mut(cache), len(rows.slots), len(rows.cached)];
         let dims = [
             u32_of("batch", g.batch)?,
@@ -669,11 +669,11 @@ impl StreamKernels {
         frames: usize,
     ) -> Result<(), Error> {
         let batch = prompts.len();
-        let rows = count("prompt rows", &[batch, frames])?;
+        let rows = element_count("prompt rows", &[batch, frames])?;
         let width = x.len().checked_div(rows).unwrap_or(0);
         check_len(
             "prompt input",
-            count("prompt input", &[rows, width])?,
+            element_count("prompt input", &[rows, width])?,
             x.len(),
         )?;
         if width == 0 || table.len() % width != 0 {
@@ -776,7 +776,7 @@ fn state_shape(
     rows: usize,
     slots_state: usize,
 ) -> Result<(usize, usize), Error> {
-    let per_row = count("state rows", &[groups, batch])?;
+    let per_row = element_count("state rows", &[groups, batch])?;
     if per_row == 0 || !rows.is_multiple_of(per_row) {
         return Err(Error::BufferLength {
             context: "state rows",
@@ -785,7 +785,7 @@ fn state_shape(
         });
     }
     let width = rows / per_row;
-    let slot = count("state slot", &[groups, width])?;
+    let slot = element_count("state slot", &[groups, width])?;
     if !slots_state.is_multiple_of(slot) {
         return Err(Error::BufferLength {
             context: "state slots",
@@ -800,38 +800,9 @@ fn state_shape(
 fn check_windows(batch: usize, windows: &CudaView<'_, u32>) -> Result<(), Error> {
     check_len(
         "frame windows",
-        count("frame windows", &[batch, 2])?,
+        element_count("frame windows", &[batch, 2])?,
         windows.len(),
     )
-}
-
-/// Checks a 3x3 subsampling convolution's buffers against its output map
-fn check_conv(
-    input: FeatureMap,
-    output: FeatureMap,
-    weight: usize,
-    bias: usize,
-    out: usize,
-) -> Result<(), Error> {
-    check_len("subsampling batch", output.batch, input.batch)?;
-    check_len(
-        "subsampling weight",
-        count("subsampling weight", &[output.channels, 9])?,
-        weight,
-    )?;
-    check_len("subsampling bias", output.channels, bias)?;
-    check_len("subsampling output", output.len(), out)
-}
-
-fn map_dims(input: FeatureMap, output: FeatureMap) -> Result<[u32; 6], Error> {
-    Ok([
-        u32_of("batch", output.batch)?,
-        u32_of("channels", output.channels)?,
-        u32_of("frames", input.frames)?,
-        u32_of("features", input.features)?,
-        u32_of("frames", output.frames)?,
-        u32_of("features", output.features)?,
-    ])
 }
 
 fn check_layer(geometry: StreamGeometry, layer: usize) -> Result<(), Error> {
