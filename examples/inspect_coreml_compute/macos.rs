@@ -22,7 +22,7 @@ const JOINT_DECISION_DIR: &str = "parakeet-v2/joint-decision.mlmodelc";
 #[cfg(feature = "vad")]
 const VAD_DIR: &str = "vad/silero-vad.mlmodelc";
 
-fn main() -> ExitCode {
+pub fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -33,59 +33,51 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<()> {
-    #[cfg(not(target_os = "macos"))]
-    {
-        bail!("CoreML compute inspection is only supported on macOS")
+    let args = Args::parse(env::args().skip(1))?;
+    let bundle = resolve_bundle(&args)?;
+
+    println!("models_root: {}", bundle.root().display());
+    println!("compute_units: {}", compute_units_name(args.compute_units));
+    print_device_list("coreml_available_devices", unsafe {
+        MLModel::availableComputeDevices()
+    });
+    print_device_list("all_compute_devices", unsafe { MLAllComputeDevices() });
+
+    inspect_model(
+        "encoder",
+        &bundle.root().join(ENCODER_DIR),
+        args.compute_units,
+        args.show_ops,
+    )?;
+    inspect_model(
+        "decoder",
+        &bundle.root().join(DECODER_DIR),
+        args.compute_units,
+        args.show_ops,
+    )?;
+    inspect_model(
+        "joint_decision",
+        &bundle.root().join(JOINT_DECISION_DIR),
+        args.compute_units,
+        args.show_ops,
+    )?;
+
+    #[cfg(feature = "vad")]
+    if args.long_form {
+        inspect_model(
+            "vad",
+            &bundle.root().join(VAD_DIR),
+            args.compute_units,
+            args.show_ops,
+        )?;
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        let args = Args::parse(env::args().skip(1))?;
-        let bundle = resolve_bundle(&args)?;
-
-        println!("models_root: {}", bundle.root().display());
-        println!("compute_units: {}", compute_units_name(args.compute_units));
-        print_device_list("coreml_available_devices", unsafe {
-            MLModel::availableComputeDevices()
-        });
-        print_device_list("all_compute_devices", unsafe { MLAllComputeDevices() });
-
-        inspect_model(
-            "encoder",
-            &bundle.root().join(ENCODER_DIR),
-            args.compute_units,
-            args.show_ops,
-        )?;
-        inspect_model(
-            "decoder",
-            &bundle.root().join(DECODER_DIR),
-            args.compute_units,
-            args.show_ops,
-        )?;
-        inspect_model(
-            "joint_decision",
-            &bundle.root().join(JOINT_DECISION_DIR),
-            args.compute_units,
-            args.show_ops,
-        )?;
-
-        #[cfg(feature = "vad")]
-        if args.long_form {
-            inspect_model(
-                "vad",
-                &bundle.root().join(VAD_DIR),
-                args.compute_units,
-                args.show_ops,
-            )?;
-        }
-
-        #[cfg(not(feature = "vad"))]
-        if args.long_form {
-            bail!("rebuild with --features vad to inspect the VAD model")
-        }
-
-        Ok(())
+    #[cfg(not(feature = "vad"))]
+    if args.long_form {
+        bail!("rebuild with --features vad to inspect the VAD model")
     }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone)]

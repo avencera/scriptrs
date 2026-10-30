@@ -674,11 +674,17 @@ mod tests {
     use crate::deployment::{ParakeetDeployment, ParakeetVersion};
     use crate::error::TranscriptionError;
     use std::fs;
-    use std::path::PathBuf;
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
 
-    fn fixture_models() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/models")
+    /// An empty v2 Core ML layout: what `validate_base` checks is which paths exist
+    fn v2_layout() -> TempDir {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let layout = ParakeetDeployment::v2().layout();
+        for dir in [layout.encoder(), layout.decoder(), layout.joint_decision()] {
+            fs::create_dir_all(temp_dir.path().join(dir)).expect("v2 bundle dir should be created");
+        }
+        fs::write(temp_dir.path().join(layout.vocab()), []).expect("v2 vocab should be created");
+        temp_dir
     }
 
     fn coreml_layout(bundle: &ModelBundle) -> &CoreMlLayout {
@@ -691,7 +697,8 @@ mod tests {
 
     #[test]
     fn v2_bundle_resolves_existing_fixture_paths() {
-        let bundle = ModelBundle::from_dir(fixture_models());
+        let layout = v2_layout();
+        let bundle = ModelBundle::from_dir(layout.path());
         bundle
             .validate_base()
             .expect("v2 fixture layout should validate");
@@ -706,8 +713,8 @@ mod tests {
 
     #[test]
     fn v3_deployment_rejects_a_v2_layout() {
-        let bundle =
-            ModelBundle::from_dir_with_deployment(fixture_models(), ParakeetDeployment::v3());
+        let layout = v2_layout();
+        let bundle = ModelBundle::from_dir_with_deployment(layout.path(), ParakeetDeployment::v3());
         let error = bundle
             .validate_base()
             .expect_err("v3 must reject the v2 fixture layout");
