@@ -44,7 +44,6 @@ const DESC_B_SCALE_MODE: u32 = 32;
 const POINTER_MODE_DEVICE: i32 = 1;
 const OP_N: i32 = 0;
 const OP_T: i32 = 1;
-const SCALE_SCALAR_32F: i32 = 0;
 const SCALE_VEC16_UE4M3: i32 = 1;
 // `cudaDataType`, from `library_types.h`
 const R_32F: u32 = 0;
@@ -68,10 +67,14 @@ impl LtFormat {
         }
     }
 
-    fn scale_mode(self) -> i32 {
+    /// The scale mode to set, or `None` for the default scalar FP32 scales
+    ///
+    /// the scale-mode attributes arrived with block scaling, so leaving them unset
+    /// for FP8 keeps per-tensor FP8 working on older cuBLASLt
+    fn scale_mode(self) -> Option<i32> {
         match self {
-            Self::Fp8 => SCALE_SCALAR_32F,
-            Self::Nvfp4 => SCALE_VEC16_UE4M3,
+            Self::Fp8 => None,
+            Self::Nvfp4 => Some(SCALE_VEC16_UE4M3),
         }
     }
 }
@@ -395,8 +398,10 @@ impl LtGemm {
         unsafe {
             set(desc, DESC_TRANSA, &OP_T)?;
             set(desc, DESC_TRANSB, &OP_N)?;
-            set(desc, DESC_A_SCALE_MODE, &format.scale_mode())?;
-            set(desc, DESC_B_SCALE_MODE, &format.scale_mode())?;
+            if let Some(mode) = format.scale_mode() {
+                set(desc, DESC_A_SCALE_MODE, &mode)?;
+                set(desc, DESC_B_SCALE_MODE, &mode)?;
+            }
             set(desc, DESC_A_SCALE_POINTER, &w_scale)?;
             set(desc, DESC_B_SCALE_POINTER, &a_scale)?;
             if device_alpha {

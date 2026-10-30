@@ -65,7 +65,7 @@ pub enum Precision {
     Tf32,
     /// Full FP32 multiplies, matching NeMo's FP32 decode token for token
     Fp32,
-    /// FP8 E4M3 weights with one scale per weight, and FP8 activations with one
+    /// FP8 E4M3 weights with one scale per weight tensor, and FP8 activations with one
     /// dynamic scale per product, through cuBLASLt with FP32 accumulation and output.
     /// Needs an Ada (sm_89) or newer GPU; loading fails on GPUs whose cuBLASLt runs
     /// no FP8 products. Needs the `low-precision` feature
@@ -76,6 +76,9 @@ pub enum Precision {
     /// FLEURS (de, es, fr, it, nl, pt) and 6.28 % against 6.25 % on MLS (es, fr, it,
     /// pt). It runs about 7 % slower than FP16 one utterance at a time and 2 % faster
     /// in batches of 16, and its weight file is 697 MB against FP16's 1300 MB
+    ///
+    /// cuBLASLt's algorithm for each product shape is chosen by timing when the model
+    /// loads, so a few transcripts can differ between processes
     #[cfg(feature = "low-precision")]
     Fp8,
     /// INT8 weights with one scale per 128 inputs, dequantized to FP16 before each
@@ -100,6 +103,9 @@ pub enum Precision {
     /// about 0.08 points on LibriSpeech test-clean (2.01 % against 1.93 %), 0.25 on
     /// FLEURS (4.82 % against 4.57 %) and 0.4 on MLS (6.64 % against 6.25 %). Its
     /// weight file is 432 MB
+    ///
+    /// cuBLASLt's algorithm for each product shape is chosen by timing when the model
+    /// loads, so a few transcripts can differ between processes
     #[cfg(feature = "low-precision")]
     Nvfp4,
 }

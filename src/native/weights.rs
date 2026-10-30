@@ -77,7 +77,8 @@ impl WeightFile {
                 #[cfg(not(feature = "low-precision"))]
                 if view.dtype() != Dtype::F32 {
                     return Err(invalid(format!(
-                        "tensor `{name}` is {:?}, not f32",
+                        "tensor `{name}` is {:?}, not f32 (FP16 and quantized weight files \
+                         need the `low-precision` feature)",
                         view.dtype()
                     )));
                 }

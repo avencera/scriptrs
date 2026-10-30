@@ -19,7 +19,9 @@ use safetensors::tensor::TensorView;
 
 use crate::cuda::encoder::EncoderMath;
 use crate::cuda::math;
-use crate::cuda::quant::{INT8_GROUP, NV_BLOCK, QuantizedWeight, ScaleLayout, Scheme, f16_bits};
+use crate::cuda::quant::{
+    INPUT_MULTIPLE, INT8_GROUP, NV_BLOCK, QuantizedWeight, ScaleLayout, Scheme, f16_bits,
+};
 use crate::error::TranscriptionError;
 use crate::models::Precision;
 use crate::native::spec::{EncoderSpec, ParakeetSpec};
@@ -222,6 +224,14 @@ pub fn write_native_weights(
         TranscriptionError::InvalidWeights("metadata `config` is missing".to_owned())
     })?;
     let spec = ParakeetSpec::from_config_json(config)?.encoder;
+    // whole INT8 groups and NVFP4 scale tiles, as loading at that precision requires
+    if scheme.is_some()
+        && (spec.d_model % INPUT_MULTIPLE != 0 || spec.ff_hidden % INPUT_MULTIPLE != 0)
+    {
+        return Err(TranscriptionError::InvalidConfiguration(format!(
+            "{precision:?} needs layer widths that are multiples of {INPUT_MULTIPLE}"
+        )));
+    }
 
     let mut tensors: Vec<(String, Tensor)> = Vec::new();
     for (name, dtype, shape) in file.tensors() {
@@ -306,7 +316,18 @@ pub fn write_native_weights(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| TranscriptionError::InvalidWeights(error.to_string()))?;
     safetensors::serialize_to_file(views, Some(metadata), output)
-        .map_err(|error| TranscriptionError::InvalidWeights(error.to_string()))
+        .map_err(|error| TranscriptionError::InvalidWeights(error.to_string()))?;
+
+    // safetensors writes through a temporary file, which is created 0600; weight
+    // files are meant to be shared and published
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(output, std::fs::Permissions::from_mode(0o644))?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -326,7 +347,7 @@ mod tests {
     /// prints each file's size
     #[test]
     #[ignore = "reads exported weights from /shared/models/scriptrs-native and writes ~3 GB"]
-    fn nemo_parity_written_weights_match_load_time_quantization() {
+    fn written_weights_match_load_time_quantization() {
         let input = native_root().join("parakeet-v3/model.safetensors");
         let source = WeightFile::open(&input).expect("FP32 weights");
         let spec = source

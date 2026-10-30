@@ -310,7 +310,8 @@ impl QuantState {
         let n = rows * width;
         let kernels = &self.kernels;
         kernels.amax(stream, a, &mut quant.partials.slice_mut(..))?;
-        let alpha = match &w.scales {
+        // keep the device alpha's guard alive until the matmul is queued
+        let (alpha, _alpha_sync) = match &w.scales {
             DeviceScales::Float(_) => {
                 kernels.fp8(
                     stream,
@@ -319,7 +320,7 @@ impl QuantState {
                     &mut quant.values.slice_mut(..n),
                     &mut quant.scale.slice_mut(..),
                 )?;
-                Alpha::Host(spec.alpha)
+                (Alpha::Host(spec.alpha), None)
             }
             DeviceScales::Nvfp4 { global, .. } => {
                 let layout = ScaleLayout::new(rows, width, NV_BLOCK);
@@ -333,8 +334,8 @@ impl QuantState {
                     width,
                     spec.alpha * global,
                 )?;
-                let (alpha, _alpha_sync) = quant.alpha.device_ptr(stream);
-                Alpha::Device(alpha)
+                let (alpha, sync) = quant.alpha.device_ptr(stream);
+                (Alpha::Device(alpha), Some(sync))
             }
         };
 
