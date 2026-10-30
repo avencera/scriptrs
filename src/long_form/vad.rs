@@ -5,7 +5,6 @@ use crate::constants::{VAD_CONTEXT_SAMPLES, VAD_WINDOW_SAMPLES};
 #[cfg(target_os = "macos")]
 use crate::coreml::SileroVadCoreMlModel;
 use crate::error::TranscriptionError;
-use crate::long_form::planner::VadConfig;
 use crate::models::{ModelBundle, RuntimeBundle};
 #[cfg(feature = "cuda")]
 use crate::native::silero::{SileroModel, SileroState};
@@ -29,7 +28,6 @@ impl SileroVad {
     pub(crate) fn process(
         &self,
         audio: &[f32],
-        _config: &VadConfig,
         control: &TranscriptionControl,
     ) -> Result<Vec<f32>, TranscriptionError> {
         self.model.process(audio, control)

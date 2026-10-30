@@ -449,7 +449,7 @@ fn load_mono_16khz_audio() -> Vec<f32> {
 }
 ```
 
-Enable `vad` when you want VAD-backed speech region planning for sparse speech, long silences, or recordings with a lot of non-speech audio. Windows with a speech probability of at least `config.vad.default_threshold` (0.5 by default) count as speech:
+Enable `vad` when you want VAD-backed speech region planning for sparse speech, long silences, or recordings with a lot of non-speech audio. Windows with a speech probability of at least `config.segmentation.threshold` (0.5 by default) count as speech:
 
 ```rust
 use scriptrs::{LongFormConfig, LongFormMode, LongFormTranscriptionPipeline};

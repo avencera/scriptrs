@@ -28,7 +28,7 @@ const NATIVE_OVERLAP_SECONDS: f64 = 8.0;
 #[cfg(feature = "cuda")]
 const NATIVE_BATCH_SIZE: usize = 16;
 #[cfg(feature = "vad")]
-pub use planner::{VadConfig, VadSegmentationConfig};
+pub use planner::VadSegmentationConfig;
 
 use self::execute::{RunRequest, execute_plan, transcribe_task};
 use self::merge::merge_overlapping_windows;
@@ -78,9 +78,6 @@ pub struct LongFormConfig {
     pub batch_size: usize,
     /// Single-chunk transcription settings
     pub transcription: TranscriptionConfig,
-    /// VAD processing settings
-    #[cfg(feature = "vad")]
-    pub vad: VadConfig,
     /// VAD segmentation settings
     #[cfg(feature = "vad")]
     pub segmentation: VadSegmentationConfig,
@@ -102,8 +99,6 @@ impl LongFormConfig {
             worker_count: 4,
             batch_size: 1,
             transcription: TranscriptionConfig::default(),
-            #[cfg(feature = "vad")]
-            vad: VadConfig::default(),
             #[cfg(feature = "vad")]
             segmentation: VadSegmentationConfig::default(),
             overlap: OverlapChunkConfig::from_deployment(deployment),
@@ -141,10 +136,7 @@ impl LongFormConfig {
         self.overlap.validate_for(deployment)?;
 
         #[cfg(feature = "vad")]
-        {
-            self.vad.validate()?;
-            self.segmentation.validate_for(self.vad.default_threshold)?;
-        }
+        self.segmentation.validate()?;
 
         Ok(())
     }
@@ -332,15 +324,10 @@ impl LongFormTranscriptionPipeline {
             .ok_or_else(|| self.inner.bundle().missing_vad_error())
             .map_err(PreprocessedTranscriptionError::from)?;
         let probabilities = vad
-            .process(audio, &config.vad, control)
+            .process(audio, control)
             .map_err(PreprocessedTranscriptionError::from)?;
         control.check()?;
-        let regions = detect_speech_regions(
-            &probabilities,
-            audio.len(),
-            config.segmentation.threshold(config.vad.default_threshold),
-            &config.segmentation,
-        );
+        let regions = detect_speech_regions(&probabilities, audio.len(), &config.segmentation);
         let execution_plan = build_vad_execution_plan(&regions, &probabilities, config);
         control.check_plan(execution_plan.tasks.len())?;
         self.run_plan(request, execution_plan)
@@ -650,7 +637,7 @@ mod tests {
     fn long_form_config_rejects_invalid_vad_threshold() {
         let deployment = ParakeetDeployment::v3();
         let mut config = LongFormConfig::from_deployment(&deployment);
-        config.vad.default_threshold = f32::NAN;
+        config.segmentation.threshold = f32::NAN;
 
         assert!(config.validate_for(&deployment).is_err());
     }
@@ -1062,11 +1049,7 @@ mod tests {
             .expect("native VAD should load")
             .expect("the native bundle should have a VAD model");
         let ours = vad
-            .process(
-                audio,
-                &LongFormConfig::default().vad,
-                &TranscriptionControl::internal_unbounded(),
-            )
+            .process(audio, &TranscriptionControl::internal_unbounded())
             .expect("VAD scan");
         (
             ours,
@@ -1082,12 +1065,7 @@ mod tests {
         audio_len: usize,
         config: &LongFormConfig,
     ) -> (Vec<SampleRange>, Vec<(usize, usize)>) {
-        let regions = detect_speech_regions(
-            probabilities,
-            audio_len,
-            config.segmentation.threshold(config.vad.default_threshold),
-            &config.segmentation,
-        );
+        let regions = detect_speech_regions(probabilities, audio_len, &config.segmentation);
         let mut tasks = Vec::new();
         for region in &regions {
             build_region_plan(*region, probabilities, config, &mut tasks);
@@ -1155,11 +1133,7 @@ mod tests {
             .as_ref()
             .expect("the native bundle has a VAD model");
         let probabilities = vad
-            .process(
-                audio,
-                &config.vad,
-                &TranscriptionControl::internal_unbounded(),
-            )
+            .process(audio, &TranscriptionControl::internal_unbounded())
             .expect("VAD scan");
         let (_, windows) = speech_plan(&probabilities, audio.len(), config);
         windows

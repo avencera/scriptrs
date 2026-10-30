@@ -241,7 +241,7 @@ fn bench_long(bundle: ModelBundle, paths: &[PathBuf], args: &Args) -> Result<Ben
     if args.vad {
         config.mode = scriptrs::LongFormMode::Vad;
         if let Some(threshold) = args.vad_threshold {
-            config.vad.default_threshold = threshold;
+            config.segmentation.threshold = threshold;
         }
         if let Some(padding) = args.vad_padding {
             config.segmentation.speech_padding = padding;
