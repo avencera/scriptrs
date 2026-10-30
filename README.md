@@ -10,8 +10,8 @@ Fast [NVIDIA Parakeet TDT](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) s
 
 On an RTX 5090, the CUDA backend transcribes LibriSpeech test-clean at 1534x real
 time one utterance at a time, 3.1x as fast as NVIDIA NeMo and 6.1x as fast as
-parakeet-rs, at the same word error rate. Batched, it is 1.5x as fast as NeMo at
-batch 8 and about even at batch 32 (4928x against 5242x). On 31.6 h of
+parakeet-rs, at the same word error rate. Batched, it is 1.6x as fast as NeMo at
+batch 8 and about even at batch 32 (5338x against 5242x). On 31.6 h of
 multilingual speech the default FP16 mode scores the same WER as the FP32 mode,
 which matches NeMo. On six harder English sets it has a lower WER than Whisper
 large-v3 at about 20x its speed. See [CUDA](#cuda) for the numbers.
@@ -171,8 +171,8 @@ time:
 | parakeet-rs 0.4.3 (ONNX Runtime) | 253x | 0.52x | 1.93 % |
 
 Through the [queue](#many-short-inputs), which prepares the next inputs on the CPU
-while the GPU runs, the same set runs at 1761x one at a time with identical
-transcripts, and at 5120x in batches of up to 16 (the default). Batching changes 2
+while the GPU runs, the same set runs at 1765x one at a time with identical
+transcripts, and at 5111x in batches of up to 16 (the default). Batching changes 2
 of the 2620 transcripts by one word or punctuation mark, and WER is 1.92 %.
 
 NeMo gains more from batching, because large batches are dominated by the
@@ -182,9 +182,9 @@ batch sizes:
 
 | Batch | scriptrs (queue) | NVIDIA NeMo bf16 | vs NeMo |
 |---|---|---|---|
-| 1 | 1758x | 490x | 3.6x |
-| 8 | 4389x | 2958x | 1.5x |
-| 32 | 4928x | 5242x | 0.94x |
+| 1 | 1765x | 490x | 3.6x |
+| 8 | 4637x | 2958x | 1.6x |
+| 32 | 5338x | 5242x | 1.02x |
 
 WER is 1.92–1.93 % for both at every batch size.
 
@@ -261,8 +261,8 @@ On an RTX 5090 with Parakeet v3 (speed in x real time, then WER):
 | | FP16 (default) | TF32 | FP32 |
 |---|---|---|---|
 | LibriSpeech test-clean, one utterance at a time | 1534x, 1.93 % | 1179x, 1.93 % | 848x, 1.93 % |
-| LibriSpeech test-clean, queue in batches of 16 | 5124x, 1.92 % | 3447x, 1.93 % | — |
-| Earnings-21, long-form | 4182x, 8.24 % | 2774x, 8.24 % | — |
+| LibriSpeech test-clean, queue in batches of 16 | 5111x, 1.92 % | 3438x, 1.93 % | — |
+| Earnings-21, long-form | 4173x, 8.24 % | 2772x, 8.24 % | — |
 | FLEURS de, es, fr, it, nl, pt (15.8 h) | 1839x, 4.57 % | 1450x, 4.57 % | 966x, 4.57 % |
 | MLS es, fr, it, pt (15.8 h) | 1921x, 6.25 % | 1524x, 6.26 % | 996x, 6.26 % |
 
