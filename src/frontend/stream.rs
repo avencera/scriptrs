@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use realfft::{RealFftPlanner, RealToComplex, num_complex::Complex};
 
-use super::{MelFilterbank, create_mel_filterbank, hann_window};
+use super::{MelFilterbank, create_mel_filterbank, forward_fft, hann_window};
 use crate::error::TranscriptionError;
 use crate::native::spec::FrontendConfig;
 
@@ -171,12 +171,12 @@ impl StreamingFeatures {
                 self.input[offset + k] = self.samples[index as usize - self.base] * weight;
             }
         }
-        setup
-            .r2c
-            .process_with_scratch(&mut self.input, &mut self.output, &mut self.scratch)
-            .map_err(|error| {
-                TranscriptionError::InvalidModelOutput(format!("fft failed: {error}"))
-            })?;
+        forward_fft(
+            &setup.r2c,
+            &mut self.input,
+            &mut self.output,
+            &mut self.scratch,
+        )?;
         for (power, bin) in self.power.iter_mut().zip(&self.output) {
             *power = bin.norm_sqr();
         }
@@ -184,11 +184,7 @@ impl StreamingFeatures {
         let first = out.len();
         out.resize(first + setup.features(), 0.0);
         let mels = &mut out[first..];
-        setup.filterbank.apply(&self.power, mels);
-        let log_zero_guard = 2.0f32.powi(-24);
-        for value in mels {
-            *value = (*value + log_zero_guard).ln();
-        }
+        setup.filterbank.apply_log(&self.power, mels);
         self.frames += 1;
         Ok(())
     }
