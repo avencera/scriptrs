@@ -1,6 +1,5 @@
 use crate::backend::EncoderChunk;
 use crate::config::TranscriptionConfig;
-use crate::constants::SAMPLES_PER_ENCODER_FRAME;
 use crate::decode::{ParakeetTdtDecoder, RawTranscription};
 use crate::deployment::{FrontendSpec, ParakeetDeployment};
 use crate::error::TranscriptionError;
@@ -176,10 +175,7 @@ impl TranscriptionPipeline {
             .zip(windows)
             .map(|(decoded, window)| {
                 let mut raw = decoded.raw;
-                raw.drop_context_frames(
-                    window.context_samples / SAMPLES_PER_ENCODER_FRAME,
-                    window.global_sample_offset / SAMPLES_PER_ENCODER_FRAME,
-                );
+                raw.place_on_timeline(window.context_samples, window.global_sample_offset);
                 raw
             })
             .collect())

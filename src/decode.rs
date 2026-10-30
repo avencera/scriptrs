@@ -29,9 +29,24 @@ impl RawTranscription {
         self.tokens.is_empty()
     }
 
-    /// Drops the tokens in the first `context_frames` frames, then moves the rest
-    /// so frame `context_frames` lands on `frame_offset`
-    pub(crate) fn drop_context_frames(&mut self, context_frames: usize, frame_offset: usize) {
+    /// Drops the tokens heard in a window's first `context_samples`, then moves the
+    /// rest onto the recording timeline, where the window's own audio starts at
+    /// `global_sample_offset`
+    ///
+    /// Both must be whole encoder frames: a frame index can't carry a sub-frame
+    /// remainder, so it would land every token up to a frame early
+    pub(crate) fn place_on_timeline(
+        &mut self,
+        context_samples: usize,
+        global_sample_offset: usize,
+    ) {
+        debug_assert!(
+            context_samples.is_multiple_of(SAMPLES_PER_ENCODER_FRAME)
+                && global_sample_offset.is_multiple_of(SAMPLES_PER_ENCODER_FRAME),
+            "window context {context_samples} and offset {global_sample_offset} must be whole encoder frames"
+        );
+        let context_frames = context_samples / SAMPLES_PER_ENCODER_FRAME;
+        let frame_offset = global_sample_offset / SAMPLES_PER_ENCODER_FRAME;
         self.tokens.retain_mut(|token| {
             if token.frame < context_frames {
                 return false;
