@@ -263,13 +263,7 @@ impl EncoderCoreMlModel {
                 )));
             }
         };
-        let time_steps = match output_lengths.first().copied() {
-            Some(value) => {
-                let value = f32_to_usize(value, self.length_output.name)?;
-                if value > 0 { value } else { encoder.shape()[2] }
-            }
-            None => encoder.shape()[2],
-        };
+        let time_steps = encoder_time_steps(&output_lengths, self.length_output.name)?;
         Ok((encoder, time_steps))
     }
 }
@@ -698,6 +692,18 @@ fn vad_state_vector(values: Vec<f32>, name: &str) -> Result<Vec<f32>, Transcript
     Ok(values)
 }
 
+/// The valid time steps the encoder reports in its length output `name`
+///
+/// The encoder input is zero-padded to the loaded width, so the padded output
+/// width is never a fallback: it would decode padding as speech. A length of 0
+/// decodes nothing, and an empty length output is an error
+fn encoder_time_steps(lengths: &[f32], name: &str) -> Result<usize, TranscriptionError> {
+    let value = lengths.first().copied().ok_or_else(|| {
+        TranscriptionError::InvalidModelOutput(format!("CoreML output `{name}` was empty"))
+    })?;
+    f32_to_usize(value, name)
+}
+
 fn f32_to_usize(value: f32, name: &str) -> Result<usize, TranscriptionError> {
     if !value.is_finite() {
         return Err(TranscriptionError::InvalidModelOutput(format!(
@@ -725,7 +731,15 @@ fn f32_to_usize(value: f32, name: &str) -> Result<usize, TranscriptionError> {
 
 #[cfg(test)]
 mod tests {
-    use super::f32_to_usize;
+    use super::{encoder_time_steps, f32_to_usize};
+
+    /// The padded output width is never used for the valid steps
+    #[test]
+    fn encoder_length_is_taken_as_reported() {
+        assert_eq!(encoder_time_steps(&[0.0], "encoder_length").unwrap(), 0);
+        assert_eq!(encoder_time_steps(&[37.0], "encoder_length").unwrap(), 37);
+        assert!(encoder_time_steps(&[], "encoder_length").is_err());
+    }
 
     #[test]
     fn float_to_usize_rejects_non_finite_non_integral_and_out_of_range_values() {
