@@ -435,28 +435,20 @@ impl CudaDecoder {
         let slots: Vec<u32> = rows.iter().map(|row| row.slot as u32).collect();
         stream.memcpy_htod(&slots, &mut ws.slots)?;
         let layers = self.lstm.len();
-        let kernels = &self.stream_kernels;
-        kernels.gather(
-            stream,
-            &states.h.slice(..),
-            &ws.slots.slice(..),
-            &mut ws.h.slice_mut(..),
-            layers,
-        )?;
-        kernels.gather(
-            stream,
-            &states.c.slice(..),
-            &ws.slots.slice(..),
-            &mut ws.c.slice_mut(..),
-            layers,
-        )?;
-        kernels.gather(
-            stream,
-            &states.pred_proj.slice(..),
-            &ws.slots.slice(..),
-            &mut ws.pred_proj.slice_mut(..),
-            1,
-        )?;
+        // the buffers `save` scatters back, in the same order
+        for (slots_state, rows, groups) in [
+            (&states.h, &mut ws.h, layers),
+            (&states.c, &mut ws.c, layers),
+            (&states.pred_proj, &mut ws.pred_proj, 1),
+        ] {
+            self.stream_kernels.gather(
+                stream,
+                &slots_state.slice(..),
+                &ws.slots.slice(..),
+                &mut rows.slice_mut(..),
+                groups,
+            )?;
+        }
 
         // a resumed row's predictor already holds its last token, so it only
         // computes the first frame's joint input
@@ -474,28 +466,20 @@ impl CudaDecoder {
     ) -> Result<(), TranscriptionError> {
         let stream = runtime.stream();
         let layers = self.lstm.len();
-        let kernels = &self.stream_kernels;
-        kernels.scatter(
-            stream,
-            &ws.h.slice(..),
-            &ws.slots.slice(..),
-            &mut states.h.slice_mut(..),
-            layers,
-        )?;
-        kernels.scatter(
-            stream,
-            &ws.c.slice(..),
-            &ws.slots.slice(..),
-            &mut states.c.slice_mut(..),
-            layers,
-        )?;
-        kernels.scatter(
-            stream,
-            &ws.pred_proj.slice(..),
-            &ws.slots.slice(..),
-            &mut states.pred_proj.slice_mut(..),
-            1,
-        )?;
+        // the buffers `resume` gathers, in the same order
+        for (rows, slots_state, groups) in [
+            (&ws.h, &mut states.h, layers),
+            (&ws.c, &mut states.c, layers),
+            (&ws.pred_proj, &mut states.pred_proj, 1),
+        ] {
+            self.stream_kernels.scatter(
+                stream,
+                &rows.slice(..),
+                &ws.slots.slice(..),
+                &mut slots_state.slice_mut(..),
+                groups,
+            )?;
+        }
         Ok(())
     }
 
@@ -1243,14 +1227,10 @@ mod tests {
         stream
             .memcpy_htod(&vec![1u32; ws.batch], &mut ws.lens)
             .expect("lens");
-        for buffer in [
-            &mut ws.frame,
-            &mut ws.emitted,
-            &mut ws.counts,
-            &mut ws.faults,
-        ] {
-            stream.memset_zeros(buffer).expect("reset");
-        }
+        // `decide` only writes the label and emit flags this also sets
+        decoder
+            .reset_cursors(runtime, ws, &vec![0; ws.batch])
+            .expect("reset");
         decoder.set_language(runtime, ws, mask).expect("filter");
         decoder.decide(runtime, ws).expect("decide");
 
