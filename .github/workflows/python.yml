@@ -1,0 +1,250 @@
+name: Python
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - master
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # one abi3 wheel per platform with the backend that platform runs; the Linux
+  # wheel builds without a GPU or CUDA toolkit because CUDA is loaded at run time
+  wheels:
+    name: Wheel (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64, CUDA
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            manylinux: "2_28"
+          - name: macOS arm64, Core ML
+            os: macos-15
+            target: aarch64-apple-darwin
+            manylinux: "off"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --locked --out dist -m crates/scriptrs-python/Cargo.toml
+          # tag builds are published, so they never reuse objects from the shared cache
+          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+      - name: Check wheel size
+        shell: bash
+        run: |
+          set -euo pipefail
+          # PyPI rejects files over 100 MB unless the project's limit is raised
+          limit=$((90 * 1000 * 1000))
+          for wheel in dist/*.whl; do
+            size="$(wc -c < "$wheel")"
+            echo "$(basename "$wheel"): $size bytes"
+            test "$size" -le "$limit"
+          done
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-wheel-${{ matrix.target }}
+          path: dist/*.whl
+
+  sdist:
+    name: Sdist
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          command: sdist
+          args: --out dist -m crates/scriptrs-python/Cargo.toml
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+
+      # pip builds the sdist on platforms without a wheel, so build it the same way,
+      # outside the checkout; the runner has no GPU, so check the import only
+      - name: Install sdist into a fresh environment
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          uv venv --python 3.12 sdist-venv
+          uv pip install --python sdist-venv "$GITHUB_WORKSPACE"/dist/*.tar.gz
+          sdist-venv/bin/python -c "import scriptrs; print(scriptrs.__version__, scriptrs.BACKEND)"
+          sdist-venv/bin/scriptrs --version
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-sdist
+          path: dist/*.tar.gz
+
+  tests:
+    name: Tests (${{ matrix.name }})
+    needs: wheels
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # a GitHub runner has no NVIDIA driver, so this checks that the CUDA wheel
+          # imports and fails cleanly before downloading a model
+          - name: Linux x86_64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          # transcribes with Core ML; Parakeet v2 alone keeps the download near 0.5 GB
+          - name: macOS arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+    env:
+      SCRIPTRS_TEST_MODELS: parakeet/v2
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+
+      - name: Download wheel
+        uses: actions/download-artifact@v8
+        with:
+          name: python-wheel-${{ matrix.target }}
+          path: dist
+
+      - name: Install wheel into a fresh environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv venv --python 3.12 .venv-wheel
+          uv pip install --python .venv-wheel dist/*.whl pytest numpy
+
+      - name: Run tests
+        working-directory: crates/scriptrs-python
+        run: ../../.venv-wheel/bin/python -m pytest -rA
+
+  # a v* tag publishes to TestPyPI, installs that release, and only then publishes to
+  # PyPI; each index trusts this workflow and environment, so no token is stored
+  testpypi-publish:
+    name: Publish to TestPyPI
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [wheels, sdist, tests]
+    runs-on: ubuntu-24.04
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/scriptrs/
+    permissions:
+      id-token: write
+    steps:
+      - name: Download wheels and sdist
+        uses: actions/download-artifact@v8
+        with:
+          pattern: python-*
+          path: dist
+          merge-multiple: true
+
+      - name: Check files match the tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          ls -la dist
+          test "$(find dist -type f | wc -l)" -eq 3
+          for file in dist/*; do
+            case "$(basename "$file")" in
+              "scriptrs-${version}"-*.whl | "scriptrs-${version}.tar.gz") ;;
+              *) echo "$file does not match tag $GITHUB_REF_NAME"; exit 1 ;;
+            esac
+          done
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  testpypi-install:
+    name: Install from TestPyPI (${{ matrix.name }})
+    needs: testpypi-publish
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-24.04
+          - name: macOS arm64
+            os: macos-15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+
+      - name: Install the release and transcribe
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          uv venv --python 3.12 .venv-release
+          # a new release can take a few minutes to appear in the index. Anyone can
+          # upload to TestPyPI, so nothing else is installed from it: these checks
+          # never load cuBLAS, the one dependency
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if uv pip install --python .venv-release --no-cache --no-deps --only-binary scriptrs \
+              --index-url https://test.pypi.org/simple/ "scriptrs==${version}"; then
+              break
+            fi
+            test "$attempt" -lt 10
+            sleep 30
+          done
+          .venv-release/bin/python -c "import scriptrs; print(scriptrs.__version__, scriptrs.BACKEND)"
+          # only the macOS runner has a backend that can transcribe
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            text="$(.venv-release/bin/scriptrs transcribe --model parakeet/v2 crates/scriptrs-python/tests/data/librispeech-1089-134686-0007.wav)"
+            printf '%s\n' "$text"
+            grep -qi 'indifference' <<< "$text"
+          fi
+
+  pypi-publish:
+    name: Publish to PyPI
+    needs: testpypi-install
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/project/scriptrs/
+    permissions:
+      id-token: write
+    steps:
+      - name: Download wheels and sdist
+        uses: actions/download-artifact@v8
+        with:
+          pattern: python-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2

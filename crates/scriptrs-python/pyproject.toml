@@ -1,0 +1,54 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "scriptrs"
+dynamic = ["version"]
+description = "Fast NVIDIA Parakeet TDT v2 and v3 speech-to-text on Core ML (macOS) and CUDA (Linux)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Praveen Perera" }]
+keywords = ["parakeet", "speech-to-text", "asr", "transcription", "cuda", "coreml"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Rust",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+# the CUDA backend runs every encoder matrix multiply through cuBLAS
+dependencies = [
+    "nvidia-cublas-cu12>=12.4; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+[project.scripts]
+scriptrs = "scriptrs.cli:main"
+
+[project.urls]
+Repository = "https://github.com/avencera/scriptrs"
+Documentation = "https://github.com/avencera/scriptrs/blob/master/crates/scriptrs-python/README.md"
+
+[dependency-groups]
+test = ["pytest>=8", "numpy>=1.26"]
+
+[tool.maturin]
+module-name = "scriptrs._native"
+python-source = "python"
+features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["model: loads a Parakeet model, so it needs a backend and downloads the model"]

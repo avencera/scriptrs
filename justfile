@@ -1,8 +1,10 @@
 fmt:
     cargo fmt
+    cargo fmt --manifest-path crates/scriptrs-python/Cargo.toml
 
 clippy:
     cargo clippy --all --all-targets --all-features -- -D warnings
+    cargo clippy --manifest-path crates/scriptrs-python/Cargo.toml --all-targets -- -D warnings
 
 test *args:
     cargo test {{args}}
@@ -49,3 +51,21 @@ cuda-kernels area="encoder":
         LIBCLANG_PATH="${LIBCLANG_PATH:-/usr/lib/llvm-21/lib}" \
         cargo +nightly-2026-08-28 oxide build --arch sm_75 --features {{area}}
     cp "$out/scriptrs_cuda_kernels.ptx" ../../src/cuda/ptx/{{area}}.sm75.ptx
+
+# build the Python wheel for this platform into crates/scriptrs-python/target/wheels,
+# without the manylinux check that CI runs in its container
+python-build:
+    uvx --from 'maturin>=1.9,<2' maturin build --release --locked --auditwheel skip -m crates/scriptrs-python/Cargo.toml
+
+# install the wheel into a fresh environment and run its tests; on Linux the model
+# tests need the GPU, so submit this through the homebased gpu0 queue there
+python-test *args: python-build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd crates/scriptrs-python
+    venv=target/python-test-venv
+    rm -rf "$venv"
+    uv venv -q --python 3.12 "$venv"
+    version=$(cargo pkgid | sed 's/.*[#@]//')
+    uv pip install -q --python "$venv" "target/wheels/scriptrs-${version}"-*.whl pytest numpy
+    "$venv"/bin/python -m pytest -rA {{args}}
