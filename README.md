@@ -92,6 +92,18 @@ scriptrs = { version = "0.5", features = ["vad"] }
   SentencePiece constructors. `VocabKind`,
   `ModelLayout::vocab_kind` and `ParakeetDeployment::vocab_kind` are gone; the
   deployment's version picks the tokenizer format.
+- Long-form transcription runs audio as one window only up to
+  `config.overlap.max_model_samples` (`LongFormConfig::single_window_samples`),
+  not up to the model's input limit. On native CUDA bundles, clips from 30 to
+  40 s are now split into windows, and in VAD mode scanned for speech. The
+  Python `max_chunk_seconds` is 30 on CUDA.
+- `LongFormConfig::validate_for` rejects `config.overlap.context_samples` that
+  is not a whole number of encoder frames (1280 samples), or that leaves no room
+  for one frame of audio in `config.overlap.max_model_samples`. Round the
+  context to a multiple of 1280 below that limit.
+- `select_language_from_logits` returns `TranscriptionError::InvalidModelOutput`
+  when `languages` and `logits` differ in length, instead of reading only the
+  shorter prefix. Pass one logit per language.
 
 ## Python
 
