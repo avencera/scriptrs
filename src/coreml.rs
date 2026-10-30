@@ -1,50 +1,29 @@
-#[cfg(target_os = "macos")]
 mod array;
-#[cfg(target_os = "macos")]
 mod runtime;
 
-#[cfg(target_os = "macos")]
 use std::cell::RefCell;
-#[cfg(target_os = "macos")]
 use std::collections::HashMap;
-#[cfg(target_os = "macos")]
 use std::env;
-#[cfg(target_os = "macos")]
 use std::ffi::c_void;
-#[cfg(target_os = "macos")]
 use std::path::Path;
-#[cfg(target_os = "macos")]
 use std::ptr::NonNull;
-#[cfg(target_os = "macos")]
 use std::sync::{Arc, Mutex, PoisonError};
 
-#[cfg(target_os = "macos")]
 use block2::RcBlock;
-#[cfg(target_os = "macos")]
 use ndarray::{Array1, Array2, Array3};
-#[cfg(target_os = "macos")]
 use objc2::rc::{Retained, autoreleasepool};
-#[cfg(target_os = "macos")]
 use objc2::runtime::{AnyObject, ProtocolObject};
-#[cfg(target_os = "macos")]
 use objc2_core_ml::{MLComputeUnits, MLFeatureProvider, MLModel};
-#[cfg(target_os = "macos")]
 use objc2_foundation::{NSArray, NSMutableDictionary, NSNumber, NSString};
 
-#[cfg(target_os = "macos")]
 use crate::backend::StepRuntime;
-#[cfg(all(target_os = "macos", feature = "vad"))]
+#[cfg(feature = "vad")]
 use crate::constants::{VAD_CONTEXT_SAMPLES, VAD_STATE_SIZE, VAD_WINDOW_SAMPLES};
-#[cfg(target_os = "macos")]
 use crate::coreml::array::{contiguous_strides, extract_output, ns_number_array};
-#[cfg(target_os = "macos")]
 use crate::deployment::{DecoderDimensions, ModelIo};
-#[cfg(target_os = "macos")]
 use crate::error::TranscriptionError;
-#[cfg(target_os = "macos")]
 use crate::model_io::{DecoderStepOutputs, JointOutputs};
 
-#[cfg(target_os = "macos")]
 #[derive(Debug, Clone)]
 pub(crate) struct ParakeetSplitCoreMlModel {
     encoder: CoreMlModel,
@@ -54,7 +33,7 @@ pub(crate) struct ParakeetSplitCoreMlModel {
     dims: DecoderDimensions,
 }
 
-#[cfg(all(target_os = "macos", feature = "vad"))]
+#[cfg(feature = "vad")]
 #[derive(Debug, Clone)]
 pub(crate) struct SileroVadCoreMlModel {
     model: CoreMlModel,
@@ -66,7 +45,6 @@ pub(crate) struct SileroVadCoreMlModel {
     cell_output: CachedOutputKey,
 }
 
-#[cfg(target_os = "macos")]
 impl ParakeetSplitCoreMlModel {
     pub(crate) fn new(
         encoder_path: &Path,
@@ -207,7 +185,6 @@ impl ParakeetSplitCoreMlModel {
     }
 }
 
-#[cfg(target_os = "macos")]
 impl StepRuntime for ParakeetSplitCoreMlModel {
     fn run_encoder(
         &self,
@@ -255,7 +232,7 @@ impl StepRuntime for ParakeetSplitCoreMlModel {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "vad"))]
+#[cfg(feature = "vad")]
 impl SileroVadCoreMlModel {
     pub(crate) fn new(path: &Path) -> Result<Self, TranscriptionError> {
         Ok(Self {
@@ -307,7 +284,6 @@ impl SileroVadCoreMlModel {
     }
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Debug, Clone)]
 struct DecoderCoreMlModel {
     model: CoreMlModel,
@@ -320,7 +296,6 @@ struct DecoderCoreMlModel {
     cell_output: CachedOutputKey,
 }
 
-#[cfg(target_os = "macos")]
 impl DecoderCoreMlModel {
     fn new(path: &Path, io: ModelIo, dims: DecoderDimensions) -> Result<Self, TranscriptionError> {
         let decoder_io = io.decoder();
@@ -387,7 +362,6 @@ impl DecoderCoreMlModel {
     }
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Debug, Clone)]
 struct JointDecisionCoreMlModel {
     model: CoreMlModel,
@@ -400,7 +374,6 @@ struct JointDecisionCoreMlModel {
     top_k_logits_output: Option<CachedOutputKey>,
 }
 
-#[cfg(target_os = "macos")]
 impl JointDecisionCoreMlModel {
     fn new(path: &Path, io: ModelIo, dims: DecoderDimensions) -> Result<Self, TranscriptionError> {
         let joint_io = io.joint();
@@ -460,7 +433,6 @@ impl JointDecisionCoreMlModel {
     }
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Debug, Clone)]
 pub(crate) struct SplitDecoderCoreMlOutput {
     pub decoder_step: Array3<f32>,
@@ -468,7 +440,7 @@ pub(crate) struct SplitDecoderCoreMlOutput {
     pub cell_state: Array3<f32>,
 }
 
-#[cfg(all(target_os = "macos", feature = "vad"))]
+#[cfg(feature = "vad")]
 #[derive(Debug, Clone)]
 pub(crate) struct SileroVadOutput {
     pub probability: f32,
@@ -476,7 +448,6 @@ pub(crate) struct SileroVadOutput {
     pub cell_state: Vec<f32>,
 }
 
-#[cfg(target_os = "macos")]
 pub(crate) struct CoreMlModel {
     model: Retained<MLModel>,
     /// Held across every prediction, and shared by clones, which share `model`
@@ -492,17 +463,14 @@ pub(crate) struct CoreMlModel {
 // noop deallocator block captures nothing, and each clone has its own input
 // dictionary, only touched inside a prediction, through the `RefCell`. speakrs
 // moves its Core ML models to worker threads the same way
-#[cfg(target_os = "macos")]
 unsafe impl Send for CoreMlModel {}
 
-#[cfg(target_os = "macos")]
 impl std::fmt::Debug for CoreMlModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CoreMlModel").finish_non_exhaustive()
     }
 }
 
-#[cfg(target_os = "macos")]
 impl Clone for CoreMlModel {
     fn clone(&self) -> Self {
         Self {
@@ -514,7 +482,6 @@ impl Clone for CoreMlModel {
     }
 }
 
-#[cfg(target_os = "macos")]
 impl CoreMlModel {
     pub(crate) fn new(path: &Path) -> Result<Self, TranscriptionError> {
         Ok(Self {
@@ -581,7 +548,6 @@ impl CoreMlModel {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn configured_compute_units() -> Result<MLComputeUnits, TranscriptionError> {
     let Some(value) = env::var_os("SCRIPTRS_COREML_COMPUTE_UNITS") else {
         return Ok(MLComputeUnits::CPUAndNeuralEngine);
@@ -603,14 +569,12 @@ fn configured_compute_units() -> Result<MLComputeUnits, TranscriptionError> {
     }
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Debug, Clone)]
 pub(crate) struct CoreMlTensor {
     pub data: Vec<f32>,
     pub shape: Vec<usize>,
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum CoreMlInput<'a> {
     F32 {
@@ -625,7 +589,6 @@ pub(crate) enum CoreMlInput<'a> {
     },
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Clone)]
 pub(crate) struct CachedInputShape {
     name: Retained<NSString>,
@@ -635,10 +598,8 @@ pub(crate) struct CachedInputShape {
 }
 
 // SAFETY: the NSString and NSArrays are immutable after construction and only read
-#[cfg(target_os = "macos")]
 unsafe impl Send for CachedInputShape {}
 
-#[cfg(target_os = "macos")]
 impl std::fmt::Debug for CachedInputShape {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedInputShape")
@@ -648,7 +609,6 @@ impl std::fmt::Debug for CachedInputShape {
     }
 }
 
-#[cfg(target_os = "macos")]
 impl CachedInputShape {
     fn new(name: &str, shape: &[usize]) -> Self {
         Self {
@@ -660,7 +620,6 @@ impl CachedInputShape {
     }
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum CachedCoreMlInput<'a> {
     F32 {
@@ -673,7 +632,6 @@ pub(crate) enum CachedCoreMlInput<'a> {
     },
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Clone)]
 struct CachedOutputKey {
     name: &'static str,
@@ -681,10 +639,8 @@ struct CachedOutputKey {
 }
 
 // SAFETY: the NSString is immutable after construction and only read
-#[cfg(target_os = "macos")]
 unsafe impl Send for CachedOutputKey {}
 
-#[cfg(target_os = "macos")]
 impl std::fmt::Debug for CachedOutputKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedOutputKey")
@@ -693,7 +649,6 @@ impl std::fmt::Debug for CachedOutputKey {
     }
 }
 
-#[cfg(target_os = "macos")]
 impl CachedOutputKey {
     fn new(name: &'static str) -> Self {
         Self {
@@ -703,7 +658,6 @@ impl CachedOutputKey {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn array3_from_output(
     output: &ProtocolObject<dyn MLFeatureProvider>,
     key: &CachedOutputKey,
@@ -714,7 +668,6 @@ fn array3_from_output(
     array3_from_parts(data, &shape, context)
 }
 
-#[cfg(target_os = "macos")]
 fn array3_from_parts(
     data: Vec<f32>,
     shape: &[usize],
@@ -730,7 +683,6 @@ fn array3_from_parts(
     })
 }
 
-#[cfg(target_os = "macos")]
 fn scalar_f32(
     output: &ProtocolObject<dyn MLFeatureProvider>,
     key: &CachedOutputKey,
@@ -742,7 +694,6 @@ fn scalar_f32(
     })
 }
 
-#[cfg(target_os = "macos")]
 fn scalar_usize(
     output: &ProtocolObject<dyn MLFeatureProvider>,
     key: &CachedOutputKey,
@@ -751,7 +702,6 @@ fn scalar_usize(
     f32_to_usize(value, key.name)
 }
 
-#[cfg(target_os = "macos")]
 fn vector_f32(
     output: &ProtocolObject<dyn MLFeatureProvider>,
     key: &CachedOutputKey,
@@ -761,7 +711,6 @@ fn vector_f32(
     Ok(data)
 }
 
-#[cfg(target_os = "macos")]
 fn vector_usize(
     output: &ProtocolObject<dyn MLFeatureProvider>,
     key: &CachedOutputKey,
@@ -772,7 +721,7 @@ fn vector_usize(
         .collect()
 }
 
-#[cfg(all(target_os = "macos", feature = "vad"))]
+#[cfg(feature = "vad")]
 fn vad_probability(value: f32) -> Result<f32, TranscriptionError> {
     if !value.is_finite() {
         return Err(TranscriptionError::InvalidModelOutput(format!(
@@ -788,7 +737,7 @@ fn vad_probability(value: f32) -> Result<f32, TranscriptionError> {
     Ok(value)
 }
 
-#[cfg(all(target_os = "macos", feature = "vad"))]
+#[cfg(feature = "vad")]
 fn vad_state_vector(values: Vec<f32>, name: &str) -> Result<Vec<f32>, TranscriptionError> {
     if values.len() != VAD_STATE_SIZE {
         return Err(TranscriptionError::InvalidModelOutput(format!(
@@ -807,7 +756,6 @@ fn vad_state_vector(values: Vec<f32>, name: &str) -> Result<Vec<f32>, Transcript
     Ok(values)
 }
 
-#[cfg(target_os = "macos")]
 fn f32_to_usize(value: f32, name: &str) -> Result<usize, TranscriptionError> {
     if !value.is_finite() {
         return Err(TranscriptionError::InvalidModelOutput(format!(
@@ -833,7 +781,7 @@ fn f32_to_usize(value: f32, name: &str) -> Result<usize, TranscriptionError> {
     Ok(value as usize)
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
     use super::f32_to_usize;
 
