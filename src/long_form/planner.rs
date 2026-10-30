@@ -219,6 +219,7 @@ impl OverlapChunkConfig {
     /// mid-frame would land every token up to a frame early. The first window
     /// starts at `range.start` rounded down to a frame instead, so the model hears
     /// under 80 ms before the range; `push_overlap_task` drops that frame's tokens
+    /// only when the previous range kept them
     pub(crate) fn plan(&self, range: SampleRange) -> Vec<SampleRange> {
         let mut chunks = Vec::new();
         let mut start = range.start / SAMPLES_PER_ENCODER_FRAME * SAMPLES_PER_ENCODER_FRAME;
@@ -452,8 +453,16 @@ pub(super) fn build_vad_execution_plan(
 ) -> LongFormExecutionPlan {
     let mut tasks = Vec::new();
     let mut region_tasks = Vec::with_capacity(regions.len());
+    let mut previous_end = 0;
     for region in regions.iter().copied() {
-        region_tasks.push(build_region_plan(region, probabilities, config, &mut tasks));
+        region_tasks.push(build_region_plan(
+            region,
+            previous_end,
+            probabilities,
+            config,
+            &mut tasks,
+        ));
+        previous_end = region.end;
     }
     LongFormExecutionPlan {
         tasks,
@@ -474,7 +483,7 @@ pub(super) fn build_fast_execution_plan(
         .overlap
         .plan(full_audio)
         .into_iter()
-        .map(|chunk| push_overlap_task(&mut tasks, chunk, full_audio, config))
+        .map(|chunk| push_overlap_task(&mut tasks, chunk, 0, config))
         .collect();
     let regions = vec![RegionTask {
         task_indices,
@@ -510,9 +519,12 @@ pub(super) enum RegionTaskKind {
     Overlap,
 }
 
+/// Plans the windows of one speech region, the first after `previous_end`, the
+/// previous region's end or 0
 #[cfg(feature = "vad")]
 pub(super) fn build_region_plan(
     region: SampleRange,
+    previous_end: usize,
     probabilities: &[f32],
     config: &LongFormConfig,
     tasks: &mut Vec<ChunkTask>,
@@ -546,7 +558,7 @@ pub(super) fn build_region_plan(
             .overlap
             .plan(region)
             .into_iter()
-            .map(|chunk| push_overlap_task(tasks, chunk, region, config))
+            .map(|chunk| push_overlap_task(tasks, chunk, previous_end, config))
             .collect(),
         kind: RegionTaskKind::Overlap,
     }
@@ -564,23 +576,26 @@ fn push_segment_task(tasks: &mut Vec<ChunkTask>, segment: SampleRange) -> usize 
     task_idx
 }
 
-/// Adds the task for overlap window `chunk` of `range`
+/// Adds the task for overlap window `chunk` of a range that follows
+/// `previous_end`, the previous range's end or 0
 ///
-/// A region keeps only the tokens that start inside it, so the window's own audio
-/// starts no earlier than the first frame boundary inside the range. The frame
-/// the first window reaches back into is dropped as context: a token starting
-/// there belongs to the previous region, which already kept it, or to the silence
-/// before this one
+/// A token belongs to the range it starts in, or to the next range when it starts
+/// in the gap between them. The previous range keeps every token that starts
+/// before its end, whether its windows were overlap windows or VAD segments, so
+/// a window keeps only frames starting at or after the first frame boundary past
+/// that end. A first window rounded down to a frame that reaches into the
+/// previous range drops that frame as context, and one that reaches only into
+/// the gap keeps it
 fn push_overlap_task(
     tasks: &mut Vec<ChunkTask>,
     chunk: SampleRange,
-    range: SampleRange,
+    previous_end: usize,
     config: &LongFormConfig,
 ) -> usize {
     let task_idx = tasks.len();
     let own_start = chunk
         .start
-        .max(range.start.next_multiple_of(SAMPLES_PER_ENCODER_FRAME));
+        .max(previous_end.next_multiple_of(SAMPLES_PER_ENCODER_FRAME));
     let context_start = chunk.start.saturating_sub(config.overlap.context_samples);
     tasks.push(ChunkTask {
         audio_start: context_start,
@@ -889,7 +904,7 @@ mod tests {
                 end: 896 + audio_len,
             };
             let probabilities = vec![0.9; region.end.div_ceil(VAD_WINDOW_SAMPLES)];
-            build_region_plan(region, &probabilities, config, &mut tasks);
+            build_region_plan(region, 0, &probabilities, config, &mut tasks);
             tasks
         };
         tasks
@@ -947,7 +962,7 @@ mod tests {
             end: 32_000,
         };
 
-        let plan = build_region_plan(region, &[], &config, &mut tasks);
+        let plan = build_region_plan(region, 0, &[], &config, &mut tasks);
 
         assert!(matches!(plan.kind, RegionTaskKind::Segments));
         assert_eq!(plan.task_indices, vec![0]);
@@ -969,7 +984,7 @@ mod tests {
         };
         let probabilities = vec![1.0; region.end.div_ceil(512)];
 
-        let plan = build_region_plan(region, &probabilities, &config, &mut tasks);
+        let plan = build_region_plan(region, 0, &probabilities, &config, &mut tasks);
 
         assert!(matches!(plan.kind, RegionTaskKind::Overlap));
         assert_eq!(plan.task_indices.len(), tasks.len());
@@ -1072,6 +1087,7 @@ mod tests {
                 start: 16_000,
                 end: 32_000,
             },
+            0,
             &[],
             &config,
             &mut tasks,

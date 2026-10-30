@@ -582,8 +582,6 @@ mod tests {
     use super::LongFormTranscriptionPipeline;
     #[cfg(all(feature = "cuda", feature = "vad"))]
     use super::SileroVad;
-    #[cfg(all(feature = "cuda", feature = "vad"))]
-    use super::planner::build_region_plan;
     #[cfg(feature = "vad")]
     use super::planner::{RegionTaskKind, SampleRange, build_vad_execution_plan};
     use super::{
@@ -757,11 +755,12 @@ mod tests {
         );
     }
 
-    /// Adjacent VAD regions under a frame apart each keep only the tokens that
-    /// start inside them, so the frame both hear is transcribed once
+    /// A token belongs to the region it starts in, or to the next region when it
+    /// starts in the gap before one: VAD regions under a frame apart transcribe
+    /// the frame both hear once, and the frame a region starts inside is kept
     #[cfg(feature = "vad")]
     #[test]
-    fn adjacent_vad_regions_emit_a_shared_frame_once() {
+    fn vad_regions_keep_each_frame_once() {
         let mut config = LongFormConfig::default();
         config.overlap.max_model_samples = 48_000;
         config.segmentation.speech_padding = 0.01;
@@ -771,6 +770,8 @@ mod tests {
         let mut probabilities = vec![0.0; 8];
         probabilities.extend(std::iter::repeat_n(0.9, 300));
         probabilities.extend(std::iter::repeat_n(0.0, 2));
+        probabilities.extend(std::iter::repeat_n(0.9, 300));
+        probabilities.extend(std::iter::repeat_n(0.0, 40));
         probabilities.extend(std::iter::repeat_n(0.9, 300));
         let audio_len = probabilities.len() * VAD_WINDOW_SAMPLES;
         let regions = detect_speech_regions(&probabilities, audio_len, &config.segmentation);
@@ -783,7 +784,11 @@ mod tests {
                 },
                 SampleRange {
                     start: 158_560,
-                    end: 312_320,
+                    end: 312_480,
+                },
+                SampleRange {
+                    start: 332_640,
+                    end: 486_400,
                 },
             ]
         );
@@ -813,9 +818,11 @@ mod tests {
             ids.extend(merged.ids());
         }
 
-        // frame 3 starts in the silence before the first region and frame 123
-        // inside the first region, so the second region drops it
-        assert_eq!(ids, (4..=243).collect::<Vec<u32>>());
+        // frame 3 starts before the first region and frame 259 in the gap before
+        // the third, so each is the next region's; frame 123 starts inside the
+        // first region, so the second, which hears it too, drops it
+        let expected: Vec<u32> = (3..=244).chain(259..=379).collect();
+        assert_eq!(ids, expected);
     }
 
     /// Silence past the native single-input limit, so it takes the long-form path
@@ -1249,11 +1256,8 @@ mod tests {
         config: &LongFormConfig,
     ) -> (Vec<SampleRange>, Vec<(usize, usize)>) {
         let regions = detect_speech_regions(probabilities, audio_len, &config.segmentation);
-        let mut tasks = Vec::new();
-        for region in &regions {
-            build_region_plan(*region, probabilities, config, &mut tasks);
-        }
-        let windows = tasks
+        let windows = build_vad_execution_plan(&regions, probabilities, config)
+            .tasks
             .iter()
             .map(|task| (task.audio_start, task.audio_end))
             .collect();
