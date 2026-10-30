@@ -286,6 +286,11 @@ mod tests {
         .expect_err("cancelled scan");
 
         assert_eq!(calls, 1);
-        assert!(matches!(error, crate::error::TranscriptionError::Cancelled));
+        assert!(matches!(
+            error,
+            crate::error::TranscriptionError::Control(
+                crate::preprocessing::TranscriptionControlError::Cancelled
+            )
+        ));
     }
 }

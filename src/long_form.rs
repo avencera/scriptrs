@@ -580,7 +580,7 @@ mod tests {
     use crate::preprocessing::PreprocessedTranscriptionError;
     use crate::preprocessing::{AudioWindowMut, TranscriptionControl};
     #[cfg(feature = "cuda")]
-    use crate::preprocessing::{TranscriptionDeadline, WindowLimit};
+    use crate::preprocessing::{TranscriptionControlError, TranscriptionDeadline, WindowLimit};
     #[cfg(all(feature = "cuda", feature = "vad"))]
     use crate::test_support::NemoReference;
 
@@ -866,9 +866,9 @@ mod tests {
             assert!(
                 matches!(
                     error,
-                    PreprocessedTranscriptionError::Transcription(
-                        TranscriptionError::DeadlineExpired
-                    )
+                    PreprocessedTranscriptionError::Transcription(TranscriptionError::Control(
+                        TranscriptionControlError::DeadlineExpired
+                    ))
                 ),
                 "{path:?} returned {error}"
             );
@@ -929,7 +929,9 @@ mod tests {
             assert!(
                 matches!(
                     error,
-                    PreprocessedTranscriptionError::Transcription(TranscriptionError::Cancelled)
+                    PreprocessedTranscriptionError::Transcription(TranscriptionError::Control(
+                        TranscriptionControlError::Cancelled
+                    ))
                 ),
                 "{path:?} returned {error}"
             );

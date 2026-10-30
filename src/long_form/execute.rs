@@ -13,7 +13,7 @@ use crate::error::TranscriptionError;
 use crate::pipeline::{ChunkPreparer, PreparedWindow, TranscriptionPipeline};
 use crate::preprocessing::{
     AudioWindowMut, PreprocessedTranscriptionError, SourceSampleRange, TranscriptionControl,
-    WindowIndex, WindowPreprocessor,
+    TranscriptionControlError, WindowIndex, WindowPreprocessor,
 };
 
 /// One long-form run's input, shared by every execution path
@@ -436,9 +436,9 @@ where
 {
     matches!(
         error,
-        PreprocessedTranscriptionError::Transcription(
-            TranscriptionError::Cancelled | TranscriptionError::DeadlineExpired
-        )
+        PreprocessedTranscriptionError::Transcription(TranscriptionError::Control(
+            TranscriptionControlError::Cancelled | TranscriptionControlError::DeadlineExpired
+        ))
     )
 }
 
