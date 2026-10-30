@@ -201,9 +201,7 @@ impl StreamingModel {
             mel_start: -(MEL_CONTEXT as isize),
             chunks: 0,
             encoded: 0,
-            received: 0,
-            finished: false,
-            failed: false,
+            state: StreamState::Open,
             raw: RawTranscription::empty(),
         })
     }
@@ -248,7 +246,7 @@ impl StreamingModel {
                     Err(failure) => {
                         if failure.advanced {
                             for (index, _) in batch {
-                                streams[*index].failed = true;
+                                streams[*index].state = StreamState::Failed;
                             }
                         }
                         return Err(failure.error);
@@ -279,21 +277,30 @@ pub struct Stream {
     chunks: usize,
     /// Encoder frames encoded
     encoded: usize,
-    /// Audio samples received
-    received: usize,
-    finished: bool,
-    failed: bool,
+    state: StreamState,
     /// Tokens so far, with frames counted from the stream's start
     raw: RawTranscription,
+}
+
+/// Where a [`Stream`] is in its life
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamState {
+    /// Taking audio
+    Open,
+    /// Its audio has ended
+    Finished,
+    /// A failed batch left its device state unusable; finishing it later keeps it
+    /// failed
+    Failed,
 }
 
 impl std::fmt::Debug for Stream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Stream")
             .field("slot", &self.slot)
-            .field("received", &self.received)
+            .field("received", &self.features.received())
             .field("chunks", &self.chunks)
-            .field("finished", &self.finished)
+            .field("state", &self.state)
             .finish_non_exhaustive()
     }
 }
@@ -301,7 +308,7 @@ impl std::fmt::Debug for Stream {
 impl Stream {
     /// Appends mono 16 kHz audio; a [failed](Self::is_failed) stream takes no more
     pub fn push(&mut self, audio: &[f32]) -> Result<(), TranscriptionError> {
-        if self.failed {
+        if self.state == StreamState::Failed {
             // nothing drains a failed stream's mel, so it would only grow
             return Err(TranscriptionError::InvalidConfiguration(
                 "audio pushed to a failed stream".to_owned(),
@@ -309,31 +316,31 @@ impl Stream {
         }
         if let Some(index) = audio.iter().position(|sample| !sample.is_finite()) {
             return Err(TranscriptionError::InvalidAudioSample {
-                index: self.received + index,
+                index: self.features.received() + index,
             });
         }
-        self.features.push(audio, &mut self.mel)?;
-        self.received += audio.len();
-        Ok(())
+        self.features.push(audio, &mut self.mel)
     }
 
     /// Marks the end of the audio, so the next [`StreamingModel::process`] encodes
     /// the rest
     pub fn finish(&mut self) -> Result<(), TranscriptionError> {
         self.features.finish(&mut self.mel)?;
-        self.finished = true;
+        if self.state == StreamState::Open {
+            self.state = StreamState::Finished;
+        }
         Ok(())
     }
 
     /// Whether the stream is finished and every chunk of it is transcribed
     pub fn is_done(&self) -> bool {
-        !self.failed && self.finished && self.next_chunk().is_none()
+        self.state == StreamState::Finished && self.next_chunk().is_none()
     }
 
     /// Whether a failed [`StreamingModel::process`] left the stream unable to
     /// continue
     pub fn is_failed(&self) -> bool {
-        self.failed
+        self.state == StreamState::Failed
     }
 
     /// The transcript of the chunks processed so far
@@ -341,7 +348,7 @@ impl Stream {
     /// Each call decodes every token from the stream's start, so its cost grows
     /// with the stream's length
     pub fn transcript(&self) -> TranscriptionResult {
-        let seconds = self.received as f64 / self.model.sample_rate as f64;
+        let seconds = self.features.received() as f64 / self.model.sample_rate as f64;
         self.model.decoder.decode(&self.raw, seconds)
     }
 
@@ -351,16 +358,17 @@ impl Stream {
     /// last first chunk of any length, and a last later chunk of at least one
     /// encoder frame's mel frames
     fn next_chunk(&self) -> Option<ChunkWindow> {
-        if self.failed {
+        if self.state == StreamState::Failed {
             return None;
         }
+        let finished = self.state == StreamState::Finished;
         let available = self.features.frames();
         let first = self.model.first_mel;
         if self.chunks == 0 {
             let frames = match available {
                 _ if available >= first => first,
                 0 => return None,
-                _ if self.finished => available,
+                _ if finished => available,
                 _ => return None,
             };
             return Some(ChunkWindow { start: 0, frames });
@@ -371,7 +379,7 @@ impl Stream {
         let new = available.saturating_sub(start);
         let take = if new >= ENCODER_SUBSAMPLING * frames {
             ENCODER_SUBSAMPLING * frames
-        } else if self.finished && new >= ENCODER_SUBSAMPLING {
+        } else if finished && new >= ENCODER_SUBSAMPLING {
             new
         } else {
             return None;
@@ -435,7 +443,7 @@ const _: () = {
 
 #[cfg(test)]
 mod tests {
-    use super::{Stream, StreamingConfig, StreamingModel};
+    use super::{Stream, StreamState, StreamingConfig, StreamingModel};
     use crate::cuda::test_support::native_root;
     #[cfg(feature = "low-precision")]
     use crate::error::TranscriptionError;
@@ -554,7 +562,7 @@ mod tests {
                 while streams.iter().any(|stream| !stream.is_done()) {
                     for (job, ((copy, utt), stream)) in jobs.iter().zip(&mut streams).enumerate() {
                         let audio = &utterances[*utt].0;
-                        if round < job || stream.finished {
+                        if round < job || stream.state == StreamState::Finished {
                             continue;
                         }
                         // 37 ms to about half a second, varying by copy and round

@@ -107,6 +107,11 @@ impl StreamingFeatures {
         self.frames
     }
 
+    /// Raw samples received so far
+    pub(crate) fn received(&self) -> usize {
+        self.received
+    }
+
     /// Appends `audio` and writes every frame it completes to `out`, time-major
     pub(crate) fn push(
         &mut self,
