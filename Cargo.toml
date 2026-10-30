@@ -86,6 +86,10 @@ tempfile = "3.23.0"
 name = "cuda_bench"
 required-features = ["cuda", "long-form"]
 
+[[example]]
+name = "stream_bench"
+required-features = ["cuda"]
+
 [[test]]
 name = "queued"
 required-features = ["cuda"]

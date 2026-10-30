@@ -28,6 +28,10 @@
 //! Add `vad` when you need VAD-backed speech region planning for
 //! sparse speech, long silences, or recordings with a lot of non-speech audio.
 //!
+//! With the `cuda` feature, `StreamingModel` transcribes live audio from many
+//! streams at once with the cache-aware Nemotron Speech Streaming EN and
+//! Nemotron 3.5 ASR Streaming models, one chunk per stream per batch.
+//!
 //! # Model loading
 //!
 //! With the default `online` feature, [`TranscriptionPipeline::from_pretrained`]
@@ -154,6 +158,8 @@ mod pipeline;
 #[cfg(feature = "long-form")]
 mod preprocessing;
 mod queue;
+#[cfg(feature = "cuda")]
+mod streaming;
 #[cfg(test)]
 mod test_support;
 mod types;
@@ -198,5 +204,7 @@ pub use queue::{
     QueueConfig, QueueError, QueueReceiver, QueueReceiverIter, QueueSender,
     QueuedTranscriptionJobId, QueuedTranscriptionRequest, QueuedTranscriptionResult,
 };
+#[cfg(feature = "cuda")]
+pub use streaming::{Stream, StreamingConfig, StreamingModel};
 pub use types::{TimedToken, TranscriptChunk, TranscriptionResult};
 pub use vocab::Vocabulary;

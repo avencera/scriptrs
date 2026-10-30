@@ -17,8 +17,15 @@ Writes the native model layout from the `.nemo` checkpoints and the Silero packa
 ```text
 parakeet-v2/model.safetensors   parakeet-v2/vocab.txt
 parakeet-v3/model.safetensors   parakeet-v3/parakeet_vocab.json
+nemotron-speech-streaming-en-0.6b/model.safetensors   .../vocab.txt
+nemotron-3.5-asr-streaming-0.6b/model.safetensors     .../vocab.txt
 vad/silero-vad-v5.safetensors
 ```
+
+`--only` (repeatable: `v2`, `v3`, `nemotron-en`, `nemotron-3.5`, `vad`) exports a
+subset. The streaming checkpoints' configs also record the cache-aware settings
+(`att_context_size`, causal subsampling and convolution, LayerNorm in the
+convolution module), and their `vocab.txt` ends with the `<blk>` token.
 
 Tensors keep their NeMo or Silero names and stay fp32. The safetensors metadata
 holds `format`, `format_version` (now `2`), the source checkpoint and its SHA-256,
@@ -47,6 +54,34 @@ The v3 sets at `/shared/datasets/parakeet-ref/` came from the profile's original
 script, which this one ports with an unchanged key layout; v2 sets are in `v2/`
 and Silero's in `silero-v5/`. `just parity` in the repository root checks the
 Rust side against them.
+
+## `stream_ref.py`
+
+Runs NeMo's cache-aware streaming loop (the one in
+`speech_to_text_cache_aware_streaming_infer.py`) over LibriSpeech test-clean, one
+utterance at a time, for each `--lookahead` (repeatable), and writes under
+`<out>/<model>/` `r<R>.texts.json`, `r<R>.hyps.json` (tokens and encoder-frame
+timestamps), `r<R>.timing.json` (per-chunk step time) and, with `--dump N`,
+`r<R>.dump.safetensors`: the first N utterances' audio, mel, each chunk's mel input
+and every layer's output, and the tokens. The Rust streaming tests read the dumps
+from `/shared/datasets/nemotron-stream-ref` (or `$SCRIPTRS_STREAM_REF`). NeMo runs
+in FP32 with TF32 off on the GPU, so submit it to the `gpu0` queue:
+
+```sh
+uv run python stream_ref.py --model nemotron-en --lookahead 13 --lookahead 1 \
+    --dump 4 --out /shared/datasets/nemotron-stream-ref
+```
+
+`examples/stream_bench.rs` writes the scriptrs side for `wer.py`. `--fp32` gives
+NeMo's text exactly; the FP16 default changes a few utterances:
+
+```sh
+cargo run --release --features cuda --example stream_bench -- \
+    --model /shared/models/scriptrs-native/nemotron-speech-streaming-en-0.6b \
+    --lookahead 1 --fp32 --out bench/stream-r1.json
+uv run python wer.py bench/stream-r1.texts.json \
+    --against /shared/datasets/nemotron-stream-ref/nemotron-en/r1.texts.json
+```
 
 ## `wer.py`
 

@@ -31,7 +31,7 @@ const MEL_BUCKET: usize = 64;
 
 /// Decode steps per replay of the decode graph, between host checks of the frame
 /// cursors
-const STEPS_PER_CHECK: usize = 16;
+pub(crate) const STEPS_PER_CHECK: usize = 16;
 
 /// Cached shapes may hold up to this fraction (1 / divisor) of the device memory
 /// free once the weights are loaded; the rest stays free for other work on the same
@@ -117,7 +117,7 @@ impl ShapeCache {
 /// without failing, so they stay outside it
 static EXCLUSIVE_DEVICE_WORK: Mutex<()> = Mutex::new(());
 
-fn exclusive_device_work() -> MutexGuard<'static, ()> {
+pub(crate) fn exclusive_device_work() -> MutexGuard<'static, ()> {
     // the lock guards no data, so a panic while holding it leaves nothing to repair
     EXCLUSIVE_DEVICE_WORK
         .lock()
@@ -128,17 +128,23 @@ fn exclusive_device_work() -> MutexGuard<'static, ()> {
 ///
 /// The lock has to cover the fields' drops, which run after `Drop::drop` returns,
 /// so the engine is dropped by hand inside it
-struct ExclusiveTeardown(ManuallyDrop<Engine>);
+pub(crate) struct ExclusiveTeardown<T>(ManuallyDrop<T>);
 
-impl Deref for ExclusiveTeardown {
-    type Target = Engine;
+impl<T> ExclusiveTeardown<T> {
+    pub(crate) fn new(engine: T) -> Self {
+        Self(ManuallyDrop::new(engine))
+    }
+}
 
-    fn deref(&self) -> &Engine {
+impl<T> Deref for ExclusiveTeardown<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
         &self.0
     }
 }
 
-impl Drop for ExclusiveTeardown {
+impl<T> Drop for ExclusiveTeardown<T> {
     fn drop(&mut self) {
         let _exclusive = exclusive_device_work();
         // SAFETY: the engine is dropped only here, and nothing reads it afterward
@@ -162,7 +168,7 @@ struct Engine {
 /// [`EXCLUSIVE_DEVICE_WORK`] keeps every capture apart from other engines' loads and
 /// teardown
 #[derive(Clone)]
-pub(crate) struct CudaModel(Arc<ExclusiveTeardown>);
+pub(crate) struct CudaModel(Arc<ExclusiveTeardown<Engine>>);
 
 // a backend handle that is not thread-safe would quietly make pipelines `!Send`
 const _: () = {
@@ -195,17 +201,15 @@ impl CudaModel {
         let runtime = CudaRuntime::open(0, Options::default())?;
         runtime.prepare(Library::Cublas)?;
         let encoder = CudaEncoder::load(&runtime, &file, spec.encoder, math(precision))?;
-        let decoder = CudaDecoder::load(&runtime, &file, &spec)?;
+        let decoder = CudaDecoder::load(&runtime, &file, &spec.transducer)?;
         let (free, _) = runtime.stream().context().mem_get_info()?;
-        Ok(Self(Arc::new(ExclusiveTeardown(ManuallyDrop::new(
-            Engine {
-                shapes: Mutex::new(ShapeCache::new(free / CACHE_SHARE_DIVISOR)),
-                encoder,
-                decoder,
-                features: spec.encoder.features,
-                runtime,
-            },
-        )))))
+        Ok(Self(Arc::new(ExclusiveTeardown::new(Engine {
+            shapes: Mutex::new(ShapeCache::new(free / CACHE_SHARE_DIVISOR)),
+            encoder,
+            decoder,
+            features: spec.encoder.features,
+            runtime,
+        }))))
     }
 
     pub(crate) fn transcribe_chunks(

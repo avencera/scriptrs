@@ -11,6 +11,8 @@ use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
 
 use crate::common::{MAX_WARPS, add, block_reduce, sigmoid, to_f16};
 
+pub mod stream;
+
 fn max(a: f32, b: f32) -> f32 {
     a.max(b)
 }
