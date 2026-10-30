@@ -38,11 +38,14 @@ gpu-parity *args:
 weight-files:
     cargo test --release --features cuda,low-precision --lib written_weights_match_load_time_quantization -- --ignored --nocapture
 
-# rebuild src/cuda/ptx/<area>.sm75.ptx from crates/scriptrs-cuda-kernels with the
-# cuda-oxide nightly; a hand-built stand-in until cudakit-build owns the toolchain
+# rebuild src/cuda/ptx/<area>.<tier>.ptx from crates/scriptrs-cuda-kernels with the
+# cuda-oxide nightly; a hand-built stand-in until cudakit-build owns the toolchain.
+# `attention` needs mma.sync and cp.async, so it builds for sm_80 and the rest for sm_75
 cuda-kernels area="encoder":
     #!/usr/bin/env bash
     set -euo pipefail
+    arch=sm_75
+    if [ "{{area}}" = attention ]; then arch=sm_80; fi
     out=$(mktemp -d)
     trap 'rm -rf "$out"' EXIT
     cd crates/scriptrs-cuda-kernels
@@ -52,5 +55,5 @@ cuda-kernels area="encoder":
     env -u RUSTUP_TOOLCHAIN -u CARGO -u RUSTC CARGO_TARGET_DIR="$PWD/target" \
         CUDA_OXIDE_PTX_DIR="$out" CUDA_OXIDE_LLC="${CUDA_OXIDE_LLC:-/usr/bin/llc-21}" \
         LIBCLANG_PATH="${LIBCLANG_PATH:-/usr/lib/llvm-21/lib}" \
-        cargo +nightly-2026-08-28 oxide build --arch sm_75 --features {{area}}
-    cp "$out/scriptrs_cuda_kernels.ptx" ../../src/cuda/ptx/{{area}}.sm75.ptx
+        cargo +nightly-2026-08-28 oxide build --arch "$arch" --features {{area}}
+    cp "$out/scriptrs_cuda_kernels.ptx" "../../src/cuda/ptx/{{area}}.${arch/_/}.ptx"
