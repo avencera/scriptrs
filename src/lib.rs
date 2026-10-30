@@ -178,7 +178,7 @@ pub use config::TranscriptionConfig;
 pub use cuda::stored::write_native_weights;
 pub use deployment::{
     DecoderDimensions, DecoderIo, EncoderIo, FrontendSpec, JointIo, ModelIo, ModelLayout,
-    ParakeetDeployment, ParakeetVersion, VocabKind,
+    ParakeetDeployment, ParakeetVersion,
 };
 pub use error::TranscriptionError;
 #[cfg(feature = "online")]

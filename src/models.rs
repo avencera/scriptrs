@@ -467,7 +467,7 @@ impl ModelBundle {
     }
 
     pub(crate) fn vocabulary(&self) -> Result<Vocabulary, TranscriptionError> {
-        Vocabulary::load_for_deployment(self.runtime.vocab_path(), &self.deployment)
+        Vocabulary::load(self.runtime.vocab_path(), &self.deployment)
     }
 
     /// Error to return when a VAD run is requested but the bundle has no VAD model

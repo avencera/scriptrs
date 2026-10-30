@@ -108,7 +108,7 @@ impl StreamingModel {
             config.max_batch,
             config.precision,
         )?;
-        let vocab = Vocabulary::from_file(dir.join("vocab.txt"))?;
+        let vocab = Vocabulary::from_sentencepiece_file(dir.join("vocab.txt"))?;
         let classes = spec.transducer.predictor.vocab_size;
         if vocab.len() != classes + 1 || vocab.blank_id() != classes {
             return Err(TranscriptionError::InvalidVocabulary(format!(

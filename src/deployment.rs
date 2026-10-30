@@ -5,7 +5,7 @@ use crate::constants::{
 };
 use crate::error::TranscriptionError;
 use crate::language::{LanguageSelection, ParakeetLanguage, V3_LANGUAGES};
-use crate::vocab::Vocabulary;
+use crate::vocab::{Vocabulary, is_blank_token};
 
 const V2_ENCODER: &str = "parakeet-v2/encoder.mlmodelc";
 const V2_DECODER: &str = "parakeet-v2/decoder.mlmodelc";
@@ -38,15 +38,6 @@ pub enum ParakeetVersion {
     V3,
 }
 
-/// Tokenizer file format owned by a deployment
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum VocabKind {
-    /// SentencePiece `vocab.txt` used by v2
-    SentencePieceTxt,
-    /// JSON tokenizer used by v3 (`parakeet_vocab.json`)
-    JsonTokenizer,
-}
-
 /// Relative model layout for one Parakeet version
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelLayout {
@@ -54,7 +45,6 @@ pub struct ModelLayout {
     decoder: &'static str,
     joint_decision: &'static str,
     vocab: &'static str,
-    vocab_kind: VocabKind,
 }
 
 impl ModelLayout {
@@ -76,11 +66,6 @@ impl ModelLayout {
     /// Vocabulary file path relative to the models root
     pub const fn vocab(self) -> &'static str {
         self.vocab
-    }
-
-    /// Vocabulary parser required by this layout
-    pub const fn vocab_kind(self) -> VocabKind {
-        self.vocab_kind
     }
 }
 
@@ -325,7 +310,6 @@ impl ParakeetDeployment {
                 decoder: V2_DECODER,
                 joint_decision: V2_JOINT,
                 vocab: V2_VOCAB,
-                vocab_kind: VocabKind::SentencePieceTxt,
             },
             frontend: FrontendSpec::parakeet_defaults(),
             decoder: DecoderDimensions::tdt_0_6b(),
@@ -347,7 +331,6 @@ impl ParakeetDeployment {
                 decoder: V3_DECODER,
                 joint_decision: V3_JOINT,
                 vocab: V3_VOCAB,
-                vocab_kind: VocabKind::JsonTokenizer,
             },
             frontend: FrontendSpec::parakeet_defaults(),
             decoder: DecoderDimensions::tdt_0_6b(),
@@ -416,7 +399,7 @@ impl ParakeetDeployment {
 
         match self.version {
             ParakeetVersion::V2 => {
-                if !matches!(vocabulary.token(self.blank_id), Some("<blk>" | "<blank>")) {
+                if !vocabulary.token(self.blank_id).is_some_and(is_blank_token) {
                     return Err(TranscriptionError::InvalidVocabulary(format!(
                         "v2 vocabulary must contain `<blk>` or `<blank>` at blank id {}",
                         self.blank_id
@@ -469,11 +452,6 @@ impl ParakeetDeployment {
     /// Core ML tensor names for this deployment
     pub const fn model_io(&self) -> ModelIo {
         self.model_io
-    }
-
-    /// Vocabulary parser required by this deployment
-    pub const fn vocab_kind(&self) -> VocabKind {
-        self.layout.vocab_kind
     }
 
     /// Whether `language` is in this deployment's allowlist
@@ -532,7 +510,7 @@ impl ParakeetDeployment {
 
 #[cfg(test)]
 mod tests {
-    use super::{ParakeetDeployment, ParakeetVersion, VocabKind};
+    use super::{ParakeetDeployment, ParakeetVersion};
     use crate::error::TranscriptionError;
     use crate::language::{LanguageSelection, ParakeetLanguage};
 
@@ -554,7 +532,6 @@ mod tests {
             "parakeet-v2/joint-decision.mlmodelc"
         );
         assert_eq!(deployment.layout().vocab(), "parakeet-v2/vocab.txt");
-        assert_eq!(deployment.vocab_kind(), VocabKind::SentencePieceTxt);
         assert_eq!(deployment.languages(), &[ParakeetLanguage::English]);
         assert_eq!(deployment.hard_sample_max(), 240_000);
         assert_eq!(deployment.decoder_dimensions().encoder_hidden(), 1_024);
@@ -576,7 +553,6 @@ mod tests {
             deployment.layout().vocab(),
             "parakeet-v3/parakeet_vocab.json"
         );
-        assert_eq!(deployment.vocab_kind(), VocabKind::JsonTokenizer);
         assert_eq!(deployment.hard_sample_max(), 240_000);
         assert!(deployment.supports_language(ParakeetLanguage::Polish));
         assert!(deployment.supports_language(ParakeetLanguage::English));
