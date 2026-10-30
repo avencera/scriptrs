@@ -96,14 +96,14 @@ impl StreamGeometry {
 /// Per-row stream state, `[batch]` each
 pub(crate) struct StreamRows<'a> {
     /// Each row's slot in the cache arenas
-    pub slots: &'a CudaView<'a, u32>,
+    pub slots: CudaView<'a, u32>,
     /// Physical index where each ring's next frames go: its oldest frame once the
     /// ring is full, its first unused frame before
-    pub rings: &'a CudaView<'a, u32>,
+    pub rings: CudaView<'a, u32>,
     /// Valid frames in each ring, the newest; 0 on a stream's first chunk
-    pub cached: &'a CudaView<'a, u32>,
+    pub cached: CudaView<'a, u32>,
     /// Real frames in each row's chunk
-    pub valid: &'a CudaView<'a, u32>,
+    pub valid: CudaView<'a, u32>,
 }
 
 impl StreamRows<'_> {
@@ -410,10 +410,10 @@ impl StreamKernels {
             len(pos),
             len(bias_u),
             len(bias_v),
-            len(rows.slots),
-            len(rows.rings),
-            len(rows.cached),
-            len(rows.valid),
+            len(&rows.slots),
+            len(&rows.rings),
+            len(&rows.cached),
+            len(&rows.valid),
             out.len() as u64,
         ];
         let dims = [
@@ -436,13 +436,13 @@ impl StreamKernels {
             .arg(&lens[2]);
         launch.arg(bias_u).arg(&lens[3]).arg(bias_v).arg(&lens[4]);
         launch
-            .arg(rows.slots)
+            .arg(&rows.slots)
             .arg(&lens[5])
-            .arg(rows.rings)
+            .arg(&rows.rings)
             .arg(&lens[6])
-            .arg(rows.cached)
+            .arg(&rows.cached)
             .arg(&lens[7])
-            .arg(rows.valid)
+            .arg(&rows.valid)
             .arg(&lens[8]);
         out.push(&mut launch, &lens[9]);
         for dim in &dims {
@@ -481,7 +481,7 @@ impl StreamKernels {
         check_len("qkv", element_count("qkv", &[g.rows(), 3, d])?, qkv.len())?;
         check_len("key-value cache", g.kv_len()?, kv.len())?;
         let config = elements(element_count("key-value append", &[g.rows(), 2, d])?)?;
-        let lens = [len(qkv), len_mut(kv), len(rows.slots), len(rows.rings)];
+        let lens = [len(qkv), len_mut(kv), len(&rows.slots), len(&rows.rings)];
         let dims = [
             u32_of("batch", g.batch)?,
             u32_of("frames", g.frames)?,
@@ -496,9 +496,9 @@ impl StreamKernels {
             .arg(&lens[0])
             .arg(kv)
             .arg(&lens[1])
-            .arg(rows.slots)
+            .arg(&rows.slots)
             .arg(&lens[2])
-            .arg(rows.rings)
+            .arg(&rows.rings)
             .arg(&lens[3]);
         for dim in &dims {
             launch.arg(dim);
@@ -560,8 +560,8 @@ impl StreamKernels {
         let lens = [
             len(pw1),
             len(cache),
-            len(rows.slots),
-            len(rows.cached),
+            len(&rows.slots),
+            len(&rows.cached),
             len(weight),
             len(gamma),
             len(beta),
@@ -580,9 +580,9 @@ impl StreamKernels {
             .arg(&lens[0])
             .arg(cache)
             .arg(&lens[1])
-            .arg(rows.slots)
+            .arg(&rows.slots)
             .arg(&lens[2])
-            .arg(rows.cached)
+            .arg(&rows.cached)
             .arg(&lens[3]);
         launch
             .arg(weight)
@@ -630,7 +630,12 @@ impl StreamKernels {
         )?;
         check_len("conv cache", g.conv_len(kernel_size)?, cache.len())?;
         let config = elements(element_count("conv cache update", &[g.batch, d])?)?;
-        let lens = [len(pw1), len_mut(cache), len(rows.slots), len(rows.cached)];
+        let lens = [
+            len(pw1),
+            len_mut(cache),
+            len(&rows.slots),
+            len(&rows.cached),
+        ];
         let dims = [
             u32_of("batch", g.batch)?,
             u32_of("frames", g.frames)?,
@@ -645,9 +650,9 @@ impl StreamKernels {
             .arg(&lens[0])
             .arg(cache)
             .arg(&lens[1])
-            .arg(rows.slots)
+            .arg(&rows.slots)
             .arg(&lens[2])
-            .arg(rows.cached)
+            .arg(&rows.cached)
             .arg(&lens[3]);
         for dim in &dims {
             launch.arg(dim);

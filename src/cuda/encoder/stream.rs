@@ -14,7 +14,9 @@
 //! A stream's caches advance by one chunk of encoder frames each step, so its ring
 //! position and cached frame count follow from the frames it has encoded
 
-use cudakit::cudarc::driver::{CudaSlice, CudaView};
+use std::ops::Range;
+
+use cudakit::cudarc::driver::CudaSlice;
 
 use super::{
     Activations, Attention, ConvModule, CudaEncoder, NORM_EPS, causal_subsampled, gemm_input,
@@ -89,8 +91,7 @@ pub(crate) struct StreamWorkspace {
     /// `[batch, chunk_mel(frames), features]`, time-major
     mel: CudaSlice<f32>,
     mel_host: HostStaging<f32>,
-    /// Per-row state, `[12, batch]`: the four stages' `[batch, 2]` windows, then
-    /// slots, ring starts, cached frames and valid frames
+    /// Per-row state, laid out as [`RowLayout`]
     rows: CudaSlice<u32>,
     rows_host: HostStaging<u32>,
     /// Encoder frames each row yields
@@ -119,12 +120,68 @@ impl StreamWorkspace {
     pub(crate) fn output(&self) -> &CudaSlice<f32> {
         &self.act.x
     }
+
+    /// The layout of `rows`
+    fn layout(&self) -> RowLayout {
+        RowLayout {
+            batch: self.geometry.batch,
+        }
+    }
 }
 
-/// Views of `rows`, a workspace's per-row state, for the kernels: the slots, ring
-/// starts, cached frames and valid frames
-fn row_state(rows: &CudaSlice<u32>, batch: usize) -> [CudaView<'_, u32>; 4] {
-    [0, 1, 2, 3].map(|index| rows.slice((8 + index) * batch..(9 + index) * batch))
+/// Where each part of a batch's per-row state sits in a workspace's packed `rows`:
+/// each subsampling stage's `[batch, 2]` frame windows, mel first, then `[batch]`
+/// each of slots, ring starts, cached frames and valid frames
+#[derive(Debug, Clone, Copy)]
+struct RowLayout {
+    batch: usize,
+}
+
+impl RowLayout {
+    /// Stages with frame windows, the mel and the three subsampled maps
+    const STAGES: usize = 4;
+
+    /// Values in the whole buffer
+    fn len(self) -> usize {
+        (2 * Self::STAGES + 4) * self.batch
+    }
+
+    /// Stage `stage`'s `[batch, 2]` windows
+    fn windows(self, stage: usize) -> Range<usize> {
+        2 * stage * self.batch..2 * (stage + 1) * self.batch
+    }
+
+    /// The `[batch]` values `index` places past the windows
+    fn per_row(self, index: usize) -> Range<usize> {
+        let start = (2 * Self::STAGES + index) * self.batch;
+        start..start + self.batch
+    }
+
+    fn slots(self) -> Range<usize> {
+        self.per_row(0)
+    }
+
+    fn rings(self) -> Range<usize> {
+        self.per_row(1)
+    }
+
+    fn cached(self) -> Range<usize> {
+        self.per_row(2)
+    }
+
+    fn valid(self) -> Range<usize> {
+        self.per_row(3)
+    }
+
+    /// The per-row values of `rows`, a buffer in this layout, for the kernels
+    fn rows(self, rows: &CudaSlice<u32>) -> StreamRows<'_> {
+        StreamRows {
+            slots: rows.slice(self.slots()),
+            rings: rows.slice(self.rings()),
+            cached: rows.slice(self.cached()),
+            valid: rows.slice(self.valid()),
+        }
+    }
 }
 
 impl CudaEncoder {
@@ -185,15 +242,19 @@ impl CudaEncoder {
         self.check_streaming()?;
         // whole chunks fill the cache, so every chunk's window is the same shape and
         // chunked_limited attention sees all of it
-        if frames == 0
-            || !context.is_multiple_of(frames)
-            || caches.kv.len()
-                != self
-                    .geometry(caches.slots, frames, context, caches.slots)
-                    .kv_len()?
-        {
+        if frames == 0 || !context.is_multiple_of(frames) {
             return Err(TranscriptionError::InvalidConfiguration(format!(
                 "a {frames}-frame chunk does not tile the {context}-frame cache"
+            )));
+        }
+        let kv_len = self
+            .geometry(caches.slots, frames, context, caches.slots)
+            .kv_len()?;
+        if caches.kv.len() != kv_len {
+            return Err(TranscriptionError::InvalidConfiguration(format!(
+                "the stream caches hold {} key-value values, not the {kv_len} of a \
+                 {context}-frame cache",
+                caches.kv.len()
             )));
         }
 
@@ -201,6 +262,7 @@ impl CudaEncoder {
         let spec = self.spec;
         let d = spec.d_model;
         let geometry = self.geometry(batch, frames, context, caches.slots);
+        let layout = RowLayout { batch };
         let mel_frames = chunk_mel(frames);
         let maps = self.feature_maps(batch, mel_frames);
         let rows = batch * frames;
@@ -230,8 +292,8 @@ impl CudaEncoder {
             geometry,
             mel: zeros(stream, maps[0].len())?,
             mel_host: HostStaging::new(stream, maps[0].len(), Direction::Upload)?,
-            rows: zeros(stream, 12 * batch)?,
-            rows_host: HostStaging::new(stream, 12 * batch, Direction::Upload)?,
+            rows: zeros(stream, layout.len())?,
+            rows_host: HostStaging::new(stream, layout.len(), Direction::Upload)?,
             host_valid: vec![0; batch],
             maps: [zeros(stream, maps[1].len())?, zeros(stream, maps[2].len())?],
             flat: zeros(stream, rows * spec.subsampling_channels * maps[3].features)?,
@@ -304,6 +366,7 @@ impl CudaEncoder {
         }
 
         let stream = runtime.stream();
+        let layout = ws.layout();
         let input = ws.mel_host.write()?;
         input.fill(0.0);
         let state = ws.rows_host.write()?;
@@ -312,13 +375,18 @@ impl CudaEncoder {
             let start = (b * mel_frames + windows[0].0) * features;
             input[start..start + mel.len()].copy_from_slice(mel);
             for (stage, (begin, end)) in windows.into_iter().enumerate() {
-                state[2 * (stage * batch + b)] = begin as u32;
-                state[2 * (stage * batch + b) + 1] = end as u32;
+                state[layout.windows(stage)][2 * b..2 * b + 2]
+                    .copy_from_slice(&[begin as u32, end as u32]);
             }
             let ring = row.encoded % context;
             let cached = row.encoded.min(context);
-            for (index, value) in [row.slot, ring, cached, valid].into_iter().enumerate() {
-                state[(8 + index) * batch + b] = value as u32;
+            for (values, value) in [
+                (layout.slots(), row.slot),
+                (layout.rings(), ring),
+                (layout.cached(), cached),
+                (layout.valid(), valid),
+            ] {
+                state[values][b] = value as u32;
             }
             ws.host_valid[b] = valid;
         }
@@ -352,6 +420,7 @@ impl CudaEncoder {
         let kernels = &self.stream_kernels;
         let sub = &self.subsampling;
         let geometry = ws.geometry;
+        let layout = ws.layout();
         let [mel_map, first, second, third] =
             self.feature_maps(geometry.batch, chunk_mel(geometry.frames));
         let StreamWorkspace {
@@ -362,8 +431,7 @@ impl CudaEncoder {
             act,
             ..
         } = ws;
-        let batch = geometry.batch;
-        let windows = |stage: usize| rows.slice(2 * stage * batch..2 * (stage + 1) * batch);
+        let windows = |stage: usize| rows.slice(layout.windows(stage));
 
         kernels.conv_in(
             stream,
@@ -469,13 +537,7 @@ impl CudaEncoder {
             &mut ws.act.qkv,
         )?;
 
-        let state = row_state(&ws.rows, geometry.batch);
-        let rows = StreamRows {
-            slots: &state[0],
-            rings: &state[1],
-            cached: &state[2],
-            valid: &state[3],
-        };
+        let rows = ws.layout().rows(&ws.rows);
         let pos = ws
             .pos
             .slice(index * positions * d..(index + 1) * positions * d);
@@ -538,13 +600,7 @@ impl CudaEncoder {
             &mut ws.act.hidden.slice_mut(..pw1_len),
         )?;
 
-        let state = row_state(&ws.rows, geometry.batch);
-        let rows = StreamRows {
-            slots: &state[0],
-            rings: &state[1],
-            cached: &state[2],
-            valid: &state[3],
-        };
+        let rows = ws.layout().rows(&ws.rows);
         let act = &mut ws.act;
         self.stream_kernels.conv(
             stream,
