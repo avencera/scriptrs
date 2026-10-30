@@ -2,16 +2,18 @@
 //! [`FusedShapes`] picks, else the cuBLAS head split, score products and rel-shift
 //! softmax
 
-use cudakit::cudarc::driver::{CudaSlice, CudaView};
+use std::sync::Arc;
+
+use cudakit::cudarc::driver::{CudaSlice, CudaStream, CudaView};
 use cudakit::{Sgemm, SgemmBatched};
 
 use super::{
-    Activations, Attention, CudaEncoder, EncoderWorkspace, Linear, gemm_input, merged_in,
-    mixed_precision, normed_in,
+    Activations, Attention, CudaEncoder, EncoderMath, EncoderWorkspace, Linear, gemm_input,
+    merged_in, mixed_precision, normed_in,
 };
 use crate::cuda::fp16::linear_fp16_to_fp16;
 use crate::cuda::kernels::{AttentionKernels, CudaRuntime, Heads};
-use crate::cuda::linear;
+use crate::cuda::{linear, zeros};
 use crate::error::TranscriptionError;
 
 /// Input shapes the FP16 encoder runs the fused attention on: on an RTX 5090 it is 3
@@ -76,22 +78,59 @@ pub(super) enum AttentionBuffers {
     FusedTf32 { pos: CudaSlice<f32> },
 }
 
+impl AttentionBuffers {
+    /// Allocate the buffers of the fused kernel when `fused`, else of the unfused path,
+    /// for `batch` inputs of `frames` encoder frames
+    pub(super) fn new(
+        stream: &Arc<CudaStream>,
+        math: EncoderMath,
+        fused: bool,
+        batch: usize,
+        heads: usize,
+        frames: usize,
+        d: usize,
+    ) -> Result<Self, TranscriptionError> {
+        let rows = batch * frames;
+        let positions = 2 * frames - 1;
+        Ok(match math {
+            EncoderMath::Fp16 if fused => Self::FusedFp16 {
+                qkv: zeros(stream, rows * 3 * d)?,
+                pos: zeros(stream, positions * d)?,
+            },
+            EncoderMath::Single(_) if fused => Self::FusedTf32 {
+                pos: zeros(stream, positions * d)?,
+            },
+            _ => Self::Unfused(Box::new(UnfusedAttention {
+                q_u: zeros(stream, rows * d)?,
+                q_v: zeros(stream, rows * d)?,
+                k: zeros(stream, rows * d)?,
+                v: zeros(stream, rows * d)?,
+                pos: zeros(stream, positions * d)?,
+                pos_heads: zeros(stream, positions * d)?,
+                scores: zeros(stream, batch * heads * frames * frames)?,
+                bd: zeros(stream, rows * heads * positions)?,
+                context: zeros(stream, rows * d)?,
+            })),
+        })
+    }
+}
+
 pub(super) struct UnfusedAttention {
     /// `[batch, heads, frames, head_dim]`, `q_v` `[heads, batch, frames, head_dim]`
-    pub(super) q_u: CudaSlice<f32>,
-    pub(super) q_v: CudaSlice<f32>,
-    pub(super) k: CudaSlice<f32>,
-    pub(super) v: CudaSlice<f32>,
+    q_u: CudaSlice<f32>,
+    q_v: CudaSlice<f32>,
+    k: CudaSlice<f32>,
+    v: CudaSlice<f32>,
     /// `[2 * frames - 1, d_model]` projected position table, and `[heads, 2 * frames -
     /// 1, head_dim]`
-    pub(super) pos: CudaSlice<f32>,
-    pub(super) pos_heads: CudaSlice<f32>,
+    pos: CudaSlice<f32>,
+    pos_heads: CudaSlice<f32>,
     /// `[batch, heads, frames, frames]` content scores, then weights
-    pub(super) scores: CudaSlice<f32>,
+    scores: CudaSlice<f32>,
     /// `[heads, batch, frames, 2 * frames - 1]` position scores
-    pub(super) bd: CudaSlice<f32>,
+    bd: CudaSlice<f32>,
     /// `[batch, heads, frames, head_dim]`
-    pub(super) context: CudaSlice<f32>,
+    context: CudaSlice<f32>,
 }
 
 /// What an attention sublayer reads from its workspace beside the buffers of its

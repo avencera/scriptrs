@@ -43,7 +43,7 @@ mod attention;
 mod quantized;
 mod stream;
 
-use attention::{AttentionBuffers, FUSED_FP16, FUSED_TF32, FusedAttention, UnfusedAttention};
+use attention::{AttentionBuffers, FUSED_FP16, FUSED_TF32, FusedAttention};
 pub(crate) use stream::{
     ChunkRow, MEL_CONTEXT, StreamCaches, StreamWorkspace, chunk_mel, first_chunk_mel,
 };
@@ -575,7 +575,6 @@ impl CudaEncoder {
         let maps = self.feature_maps(batch, mel_frames);
         let frames = maps[3].frames;
         let rows = batch * frames;
-        let positions = 2 * frames - 1;
         let pos_emb = stream.clone_htod(&relative_positions(frames, d))?;
         let pos_emb_f16 = self.fp16_copy(runtime, &pos_emb)?;
         #[cfg_attr(
@@ -585,33 +584,14 @@ impl CudaEncoder {
         let mut act = Activations::new(runtime, spec, self.math, rows)?;
         #[cfg(feature = "low-precision")]
         if let Some(quant) = &self.quant {
-            act.quant.inputs = quant.inputs(runtime, spec, rows, positions)?;
+            act.quant.inputs = quant.inputs(runtime, spec, rows, 2 * frames - 1)?;
         }
 
         let fused = self
             .fused
             .as_ref()
             .is_some_and(|fused| fused.shapes.takes(batch, frames));
-        let attention = match self.math {
-            EncoderMath::Fp16 if fused => AttentionBuffers::FusedFp16 {
-                qkv: zeros(stream, rows * 3 * d)?,
-                pos: zeros(stream, positions * d)?,
-            },
-            EncoderMath::Single(_) if fused => AttentionBuffers::FusedTf32 {
-                pos: zeros(stream, positions * d)?,
-            },
-            _ => AttentionBuffers::Unfused(Box::new(UnfusedAttention {
-                q_u: zeros(stream, rows * d)?,
-                q_v: zeros(stream, rows * d)?,
-                k: zeros(stream, rows * d)?,
-                v: zeros(stream, rows * d)?,
-                pos: zeros(stream, positions * d)?,
-                pos_heads: zeros(stream, positions * d)?,
-                scores: zeros(stream, batch * heads * frames * frames)?,
-                bd: zeros(stream, rows * heads * positions)?,
-                context: zeros(stream, rows * d)?,
-            })),
-        };
+        let attention = AttentionBuffers::new(stream, self.math, fused, batch, heads, frames, d)?;
 
         Ok(EncoderWorkspace {
             batch,

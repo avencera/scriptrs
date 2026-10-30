@@ -238,7 +238,7 @@ impl AttentionKernels {
         // SAFETY: matches `attention_rel_pos_f16` and `attention_rel_pos_tf32`, whose
         // parameter lists differ only in the operand type `T`; the buffers hold exactly
         // the rows `shape` implies, which bound every unchecked access, the grid covers
-        // the frames in blocks of `16 * warps` rows, and the shared memory is the block's.
+        // the frames in blocks of `16 * warps` rows, and the shared memory is the block's
         // `qkv`, `pos` and `out` start 16-byte aligned, as checked above
         unsafe { launch.launch(config) }?;
         Ok(())

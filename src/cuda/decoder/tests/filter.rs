@@ -189,7 +189,7 @@ fn decide_once(
 /// with none, against the host rule `decide_from_logits`: the same token and
 /// duration, and the same confidence within the sum-order tolerances. Each
 /// fixture also runs under the next language's mask straight after its own, at
-/// the same K, so a mask left over from the previous call picks the wrong ids.
+/// the same K, so a mask left over from the previous call picks the wrong ids
 /// Rows with a non-finite class logit fault under the filter, as the host rule
 /// rejects them
 #[test]
