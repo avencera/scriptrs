@@ -501,5 +501,8 @@ fn parse_args() -> Result<Args> {
     if args.clients.first() != Some(&1) {
         bail!("--clients must start with 1, the pass the others are held against");
     }
+    if args.clients.contains(&0) {
+        bail!("--clients takes counts of at least 1");
+    }
     Ok(args)
 }
