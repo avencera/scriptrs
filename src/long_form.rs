@@ -51,7 +51,7 @@ use self::vad::SileroVad;
 /// With `vad`, you can switch to VAD-based speech region detection
 /// for recordings that contain long silences or a lot of non-speech content
 ///
-/// It expects the same mono 16kHz `&[f32]` input as the base pipeline.
+/// It expects the same mono 16kHz `&[f32]` input as the base pipeline
 #[derive(Debug, Clone)]
 pub struct LongFormTranscriptionPipeline {
     inner: TranscriptionPipeline,
@@ -78,11 +78,11 @@ pub struct LongFormConfig {
     pub batch_size: usize,
     /// Single-chunk transcription settings
     pub transcription: TranscriptionConfig,
-    #[cfg(feature = "vad")]
     /// VAD processing settings
-    pub vad: VadConfig,
     #[cfg(feature = "vad")]
+    pub vad: VadConfig,
     /// VAD segmentation settings
+    #[cfg(feature = "vad")]
     pub segmentation: VadSegmentationConfig,
     /// Overlap fallback settings
     pub overlap: OverlapChunkConfig,
@@ -118,7 +118,7 @@ impl LongFormConfig {
     pub fn for_bundle(bundle: &ModelBundle) -> Self {
         #[cfg_attr(
             not(feature = "cuda"),
-            allow(unused_mut, reason = "only native bundles adjust the defaults")
+            expect(unused_mut, reason = "only native bundles adjust the defaults")
         )]
         let mut config = Self::from_deployment(bundle.deployment());
         #[cfg(feature = "cuda")]
@@ -156,8 +156,8 @@ pub enum LongFormMode {
     /// Skip VAD and chunk the full recording with overlap windows
     #[default]
     Fast,
-    #[cfg(feature = "vad")]
     /// Detect speech with VAD before chunk planning
+    #[cfg(feature = "vad")]
     Vad,
 }
 
@@ -197,12 +197,12 @@ impl LongFormTranscriptionPipeline {
         })
     }
 
-    #[cfg(feature = "online")]
     /// Download models and build a long-form pipeline
     ///
     /// With the default configuration this resolves models from the pinned
     /// `avencera/scriptrs-models` snapshot on Hugging Face. Set
-    /// `SCRIPTRS_MODELS_DIR` to force a local bundle.
+    /// `SCRIPTRS_MODELS_DIR` to force a local bundle
+    #[cfg(feature = "online")]
     pub fn from_pretrained() -> Result<Self, TranscriptionError> {
         #[cfg(feature = "vad")]
         let bundle = ModelBundle::from_pretrained_long_form().map_err(|error| {
@@ -239,7 +239,7 @@ impl LongFormTranscriptionPipeline {
         .map_err(identity_error)
     }
 
-    /// Transcribe audio while preprocessing each planned ASR window once.
+    /// Transcribe audio while preprocessing each planned ASR window once
     pub fn run_with_preprocessor<P: WindowPreprocessor + ?Sized>(
         &self,
         audio: &[f32],
@@ -273,7 +273,7 @@ impl LongFormTranscriptionPipeline {
     /// Run the inner single-chunk pipeline directly
     ///
     /// This is useful when you want to reuse the long-form model bundle but feed
-    /// already-split chunks through the base transcription path yourself.
+    /// already-split chunks through the base transcription path yourself
     pub fn run_chunk(&self, audio: &[f32]) -> Result<TranscriptionResult, TranscriptionError> {
         let control = TranscriptionControl::internal_unbounded();
         let config = &self.default_config;

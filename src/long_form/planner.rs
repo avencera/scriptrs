@@ -11,8 +11,8 @@ pub(crate) struct SampleRange {
     pub end: usize,
 }
 
-#[cfg(feature = "vad")]
 /// Runtime threshold configuration for the VAD model
+#[cfg(feature = "vad")]
 #[derive(Debug, Clone)]
 pub struct VadConfig {
     /// Positive speech threshold applied to per-window probabilities
@@ -37,11 +37,11 @@ impl VadConfig {
     }
 }
 
-#[cfg(feature = "vad")]
 /// Segmentation parameters for converting VAD probabilities into speech regions
 ///
 /// The model hard sample maximum is not stored here. Pass
-/// [`ParakeetDeployment::hard_sample_max`] into the planner.
+/// [`ParakeetDeployment::hard_sample_max`] into the planner
+#[cfg(feature = "vad")]
 #[derive(Debug, Clone)]
 pub struct VadSegmentationConfig {
     /// Minimum speech span kept in the output

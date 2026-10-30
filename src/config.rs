@@ -6,7 +6,7 @@ use crate::language::LanguageSelection;
 ///
 /// Defaults come from [`ParakeetDeployment::v2`]. Build this with
 /// [`Self::from_deployment`] so the hard sample maximum and frontend numbers
-/// stay owned by the deployment.
+/// stay owned by the deployment
 #[derive(Debug, Clone)]
 pub struct TranscriptionConfig {
     /// Sample rate expected by the pipeline
@@ -57,7 +57,7 @@ impl TranscriptionConfig {
     /// Frontend dimensions and the single-chunk limit are deployment-owned.
     /// Callers may still use a configuration value as an input boundary, but
     /// a value that was edited or built for another deployment is rejected
-    /// before it reaches the extractor or model.
+    /// before it reaches the extractor or model
     pub fn validate_for(&self, deployment: &ParakeetDeployment) -> Result<(), TranscriptionError> {
         let frontend = deployment.frontend();
         ensure_equal("sample_rate", self.sample_rate, frontend.sample_rate())?;

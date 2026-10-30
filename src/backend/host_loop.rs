@@ -13,7 +13,7 @@ use crate::model_io::{DecoderStepOutputs, JointOutputs};
 ///
 /// The loop owns encoder input padding, decoder-state caching, blank handling,
 /// duration advancement and the per-frame token cap; a runtime only moves
-/// tensors.
+/// tensors
 pub(crate) trait StepRuntime {
     /// Encode `[1, features, target_frames]` mel input with `feature_frames`
     /// valid frames into `[1, hidden, time]` and its valid time steps
@@ -45,7 +45,7 @@ pub(crate) trait StepRuntime {
 /// Host greedy TDT loop shared by step runtimes
 ///
 /// Chunks run one at a time at batch 1, with one joint call per decode step
-/// and one decoder call per emitted token.
+/// and one decoder call per emitted token
 #[derive(Debug)]
 pub(crate) struct HostLoop {
     dims: DecoderDimensions,

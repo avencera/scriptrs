@@ -29,10 +29,10 @@ const NATIVE_HARD_SAMPLE_MAX: usize = 640_000;
 /// bundles are resolved from a directory with [`Self::from_dir`], and native
 /// weight bundles for the CUDA backend with `Self::from_native_dir` (the `cuda`
 /// feature). The runtime is never inferred from file extensions or the host
-/// platform.
+/// platform
 ///
 /// Most callers will use `TranscriptionPipeline::from_pretrained` or
-/// `TranscriptionPipeline::from_dir` instead of constructing this directly.
+/// `TranscriptionPipeline::from_dir` instead of constructing this directly
 #[derive(Debug, Clone)]
 pub struct ModelBundle {
     root: PathBuf,
@@ -341,7 +341,7 @@ impl ModelBundle {
     /// Resolve the v2 Core ML model layout from a local directory
     ///
     /// This only resolves paths. File existence is checked later by
-    /// [`Self::validate_base`].
+    /// [`Self::validate_base`]
     pub fn from_dir(models_dir: impl Into<PathBuf>) -> Self {
         Self::from_dir_with_deployment(models_dir, ParakeetDeployment::v2())
     }
@@ -366,11 +366,11 @@ impl ModelBundle {
     /// and the vocabulary, as `dev-tools/nemo/export_native.py` writes them. With
     /// `vad`, the Silero VAD weights are `vad/silero-vad-v5.safetensors` in the same
     /// directory. This only resolves paths; [`Self::validate_base`] checks they
-    /// exist, and loading checks the weights against the deployment.
+    /// exist, and loading checks the weights against the deployment
     ///
     /// The CUDA encoder takes inputs of any length, so a native bundle raises the
     /// deployment's single-input limit to 40 s, enough for whole LibriSpeech
-    /// utterances. Longer audio goes through the long-form pipeline.
+    /// utterances. Longer audio goes through the long-form pipeline
     #[cfg(feature = "cuda")]
     pub fn from_native_dir(models_dir: impl Into<PathBuf>, deployment: ParakeetDeployment) -> Self {
         let root = models_dir.into();
@@ -388,7 +388,7 @@ impl ModelBundle {
     ///
     /// The root is the weights' directory. Without `vad_path`, the VAD path keeps
     /// the [`Self::from_native_dir`] layout under that root, so a long-form run
-    /// reports it missing.
+    /// reports it missing
     #[cfg(all(feature = "online", feature = "cuda"))]
     fn from_native_files(
         weights_path: PathBuf,

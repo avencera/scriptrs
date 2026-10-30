@@ -9,7 +9,7 @@ use crate::language::ParakeetLanguage;
 ///
 /// SentencePiece files include an explicit `<blk>` token. NVIDIA Parakeet TDT
 /// v3 JSON tables omit blank; the deployment supplies the RNNT blank id one
-/// past the last tokenizer entry.
+/// past the last tokenizer entry
 #[derive(Debug, Clone)]
 pub struct Vocabulary {
     pub(crate) id_to_token: Vec<String>,
@@ -131,14 +131,14 @@ impl Vocabulary {
     /// Resolved RNNT blank token ID
     ///
     /// Deployment-aware loading verifies this value against the joint model
-    /// contract before it can be used for decoding.
+    /// contract before it can be used for decoding
     pub fn blank_id(&self) -> usize {
         self.blank_id
     }
 
     /// Number of tokenizer entries
     ///
-    /// This does not count an RNNT blank that lives one past the table.
+    /// This does not count an RNNT blank that lives one past the table
     pub fn len(&self) -> usize {
         self.id_to_token.len()
     }

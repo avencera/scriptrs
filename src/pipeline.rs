@@ -13,12 +13,12 @@ use ndarray::Array2;
 /// Single-chunk Parakeet transcription pipeline
 ///
 /// This is the base `scriptrs` entry point for audio that already fits inside a
-/// single Parakeet window. It expects mono 16kHz audio samples as `&[f32]`.
+/// single Parakeet window. It expects mono 16kHz audio samples as `&[f32]`
 ///
 /// If the input is longer than [`TranscriptionConfig::max_audio_samples`], this
 /// pipeline returns [`TranscriptionError::AudioTooLong`] instead of splitting it.
 /// Use `LongFormTranscriptionPipeline` with the `long-form` feature if you want
-/// `scriptrs` to own chunk planning internally.
+/// `scriptrs` to own chunk planning internally
 #[derive(Debug, Clone)]
 pub struct TranscriptionPipeline {
     bundle: ModelBundle,
@@ -32,7 +32,7 @@ impl TranscriptionPipeline {
     /// Build a v2 transcription pipeline from a local model directory
     ///
     /// The directory must contain the Parakeet runtime bundle expected by
-    /// [`ModelBundle::from_dir`].
+    /// [`ModelBundle::from_dir`]
     pub fn from_dir(models_dir: impl Into<std::path::PathBuf>) -> Result<Self, TranscriptionError> {
         Self::from_dir_with_deployment(models_dir, ParakeetDeployment::v2())
     }
@@ -61,12 +61,12 @@ impl TranscriptionPipeline {
         })
     }
 
-    #[cfg(feature = "online")]
     /// Download models and build a transcription pipeline
     ///
     /// With the default configuration this resolves models from the pinned
     /// `avencera/scriptrs-models` snapshot on Hugging Face. Set
-    /// `SCRIPTRS_MODELS_DIR` to force a local bundle.
+    /// `SCRIPTRS_MODELS_DIR` to force a local bundle
+    #[cfg(feature = "online")]
     pub fn from_pretrained() -> Result<Self, TranscriptionError> {
         let bundle = ModelBundle::from_pretrained().map_err(|error| {
             TranscriptionError::CoreMl(format!("model download failed: {error}"))
@@ -78,7 +78,7 @@ impl TranscriptionPipeline {
     ///
     /// `audio` must be mono 16kHz samples. Empty input returns
     /// [`TranscriptionError::EmptyAudio`]. Oversized input returns
-    /// [`TranscriptionError::AudioTooLong`].
+    /// [`TranscriptionError::AudioTooLong`]
     pub fn run(&self, audio: &[f32]) -> Result<TranscriptionResult, TranscriptionError> {
         self.run_with_config(audio, &self.config)
     }
@@ -87,7 +87,7 @@ impl TranscriptionPipeline {
     ///
     /// The configuration must use the same deployment-owned frontend settings
     /// as this pipeline. Use its language field to select a deployment-supported
-    /// language for this run.
+    /// language for this run
     pub fn run_with_config(
         &self,
         audio: &[f32],

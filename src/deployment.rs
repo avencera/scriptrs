@@ -87,7 +87,7 @@ impl ModelLayout {
 /// Encoder, decoder, and joint tensor names for one deployment
 ///
 /// Live Core ML names for the unpublished v3 bundle are isolated here so tests
-/// can inject [`crate::model_io::JointOutputs`] without loading a `.mlmodelc`.
+/// can inject [`crate::model_io::JointOutputs`] without loading a `.mlmodelc`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelIo {
     encoder: EncoderIo,
@@ -300,7 +300,7 @@ impl FrontendSpec {
 /// Typed owner of a Parakeet v2 or v3 runtime
 ///
 /// Construct this with [`Self::v2`] or [`Self::v3`]. Mixed layouts, language
-/// sets, and decoder sizes cannot be represented.
+/// sets, and decoder sizes cannot be represented
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParakeetDeployment {
     version: ParakeetVersion,
@@ -461,7 +461,7 @@ impl ParakeetDeployment {
 
     /// Joint top-K width that explicit-language filtering searches
     ///
-    /// `None` when the deployment has no language filter (v2 is English-only).
+    /// `None` when the deployment has no language filter (v2 is English-only)
     pub const fn language_filter_top_k(&self) -> Option<usize> {
         self.language_filter_top_k
     }

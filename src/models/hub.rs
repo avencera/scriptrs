@@ -16,7 +16,7 @@ impl ModelBundle {
     /// Download the v2 Parakeet model bundle from Hugging Face
     ///
     /// By default this resolves models from the pinned `avencera/scriptrs-models`
-    /// snapshot. Set `SCRIPTRS_MODELS_DIR` to force a local bundle.
+    /// snapshot. Set `SCRIPTRS_MODELS_DIR` to force a local bundle
     pub fn from_pretrained() -> Result<Self, HubError> {
         Self::from_pretrained_with_deployment(ParakeetDeployment::v2())
     }
@@ -34,7 +34,7 @@ impl ModelBundle {
     /// Download the Parakeet and VAD model bundle from Hugging Face
     ///
     /// By default this resolves models from the pinned `avencera/scriptrs-models`
-    /// snapshot. Set `SCRIPTRS_MODELS_DIR` to force a local bundle.
+    /// snapshot. Set `SCRIPTRS_MODELS_DIR` to force a local bundle
     #[cfg(feature = "vad")]
     pub fn from_pretrained_long_form() -> Result<Self, HubError> {
         Self::from_pretrained_long_form_with_deployment(ParakeetDeployment::v2())
@@ -57,7 +57,7 @@ impl ModelBundle {
     /// snapshot of the deployment's model repository,
     /// `avencera/parakeet-tdt-0.6b-v2-cuda` or `avencera/parakeet-tdt-0.6b-v3-cuda`,
     /// then behaves like [`Self::from_native_dir`]. Set `SCRIPTRS_MODELS_DIR` to
-    /// force a local native bundle.
+    /// force a local native bundle
     #[cfg(feature = "cuda")]
     pub fn from_pretrained_native(deployment: ParakeetDeployment) -> Result<Self, HubError> {
         if let Some(models_dir) = models_dir_override() {
@@ -70,7 +70,7 @@ impl ModelBundle {
     ///
     /// The VAD weights come from a pinned snapshot of
     /// `avencera/silero-vad-v5-safetensors`. Set `SCRIPTRS_MODELS_DIR` to force a
-    /// local native bundle.
+    /// local native bundle
     #[cfg(all(feature = "cuda", feature = "vad"))]
     pub fn from_pretrained_native_long_form(
         deployment: ParakeetDeployment,
@@ -143,7 +143,7 @@ impl HuggingFaceModelSource {
 /// Downloads and caches model bundles from Hugging Face
 ///
 /// This is mainly useful if you want direct control over the Hugging Face cache
-/// directory or want to prefetch assets before building a pipeline.
+/// directory or want to prefetch assets before building a pipeline
 pub struct ModelManager {
     // only native weights live outside the Core ML repository, in per-model ones
     #[cfg(feature = "cuda")]
@@ -178,7 +178,7 @@ impl ModelManager {
     /// Ensure the v2 Parakeet model bundle is cached locally
     ///
     /// The returned [`ModelBundle`] points at the resolved snapshot directory
-    /// inside the Hugging Face cache.
+    /// inside the Hugging Face cache
     pub fn ensure_base(&self) -> Result<ModelBundle, HubError> {
         self.ensure_with_deployment(ParakeetDeployment::v2(), false)
     }
@@ -186,7 +186,7 @@ impl ModelManager {
     /// Ensure the Parakeet and VAD model bundle is cached locally
     ///
     /// The returned [`ModelBundle`] points at the resolved snapshot directory
-    /// inside the Hugging Face cache.
+    /// inside the Hugging Face cache
     #[cfg(feature = "vad")]
     pub fn ensure_long_form(&self) -> Result<ModelBundle, HubError> {
         self.ensure_with_deployment(ParakeetDeployment::v2(), true)
@@ -218,7 +218,7 @@ impl ModelManager {
     /// `avencera/parakeet-tdt-0.6b-v3-cuda`, and with `include_vad` the Silero VAD
     /// weights from `avencera/silero-vad-v5-safetensors`, each at a pinned revision.
     /// The returned [`ModelBundle`] is a native bundle rooted at the Parakeet
-    /// snapshot directory.
+    /// snapshot directory
     #[cfg(feature = "cuda")]
     pub fn ensure_native(
         &self,

@@ -61,7 +61,7 @@ impl ParakeetModel {
 ///
 /// Every variant takes a batch of encoder chunks and returns greedy TDT output
 /// under one [`DecodePolicy`]. Step runtimes reach that contract through the
-/// shared [`HostLoop`].
+/// shared [`HostLoop`]
 #[derive(Debug, Clone)]
 enum ParakeetModelInner {
     #[cfg(target_os = "macos")]
