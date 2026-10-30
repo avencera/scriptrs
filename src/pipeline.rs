@@ -176,10 +176,9 @@ impl TranscriptionPipeline {
             .zip(windows)
             .map(|(decoded, window)| {
                 let mut raw = decoded.raw;
-                apply_time_offsets(
-                    &mut raw,
-                    window.global_sample_offset / SAMPLES_PER_ENCODER_FRAME,
+                raw.drop_context_frames(
                     window.context_samples / SAMPLES_PER_ENCODER_FRAME,
+                    window.global_sample_offset / SAMPLES_PER_ENCODER_FRAME,
                 );
                 raw
             })
@@ -253,39 +252,4 @@ impl ChunkPreparer {
     pub(crate) fn prepare(&self, audio: &[f32]) -> Result<PreparedChunk, TranscriptionError> {
         PreparedChunk::from_audio(audio, &self.config, &self.extractor)
     }
-}
-
-fn apply_time_offsets(raw: &mut RawTranscription, frame_offset: usize, context_frames: usize) {
-    if context_frames == 0 {
-        for frame_idx in &mut raw.frame_indices {
-            *frame_idx += frame_offset;
-        }
-        return;
-    }
-
-    let mut keep_indices = Vec::new();
-    for (index, frame_idx) in raw.frame_indices.iter_mut().enumerate() {
-        if *frame_idx < context_frames {
-            continue;
-        }
-        *frame_idx = *frame_idx - context_frames + frame_offset;
-        keep_indices.push(index);
-    }
-
-    raw.token_ids = keep_indices
-        .iter()
-        .map(|index| raw.token_ids[*index])
-        .collect();
-    raw.frame_indices = keep_indices
-        .iter()
-        .map(|index| raw.frame_indices[*index])
-        .collect();
-    raw.durations = keep_indices
-        .iter()
-        .map(|index| raw.durations[*index])
-        .collect();
-    raw.confidences = keep_indices
-        .iter()
-        .map(|index| raw.confidences[*index])
-        .collect();
 }

@@ -1,28 +1,54 @@
-use crate::constants::{MEL_HOP_SAMPLES, SAMPLE_RATE, SECONDS_PER_ENCODER_FRAME};
+use crate::constants::{SAMPLE_RATE, SAMPLES_PER_ENCODER_FRAME, SECONDS_PER_ENCODER_FRAME};
 use crate::types::{TimedToken, TranscriptChunk, TranscriptionResult};
 use crate::vocab::Vocabulary;
 
+/// One token a decoder emitted
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct RawToken {
+    pub id: u32,
+    /// Encoder frame the token was emitted at
+    pub frame: usize,
+    /// Encoder frames the token spans
+    pub duration: usize,
+    pub confidence: f32,
+}
+
+/// A decoder's emitted tokens, in order
 #[derive(Debug, Clone)]
 pub(crate) struct RawTranscription {
-    pub token_ids: Vec<u32>,
-    pub frame_indices: Vec<usize>,
-    pub durations: Vec<usize>,
-    pub confidences: Vec<f32>,
+    pub tokens: Vec<RawToken>,
 }
 
 impl RawTranscription {
     pub(crate) fn empty() -> Self {
-        Self {
-            token_ids: Vec::new(),
-            frame_indices: Vec::new(),
-            durations: Vec::new(),
-            confidences: Vec::new(),
-        }
+        Self { tokens: Vec::new() }
     }
 
     #[cfg(feature = "long-form")]
     pub(crate) fn is_empty(&self) -> bool {
-        self.token_ids.is_empty()
+        self.tokens.is_empty()
+    }
+
+    /// Drops the tokens in the first `context_frames` frames, then moves the rest
+    /// so frame `context_frames` lands on `frame_offset`
+    pub(crate) fn drop_context_frames(&mut self, context_frames: usize, frame_offset: usize) {
+        self.tokens.retain_mut(|token| {
+            if token.frame < context_frames {
+                return false;
+            }
+            token.frame = token.frame - context_frames + frame_offset;
+            true
+        });
+    }
+
+    /// Appends `other`'s tokens with their frames moved `frame_offset` later
+    #[cfg(feature = "cuda")]
+    pub(crate) fn extend_shifted(&mut self, other: Self, frame_offset: usize) {
+        self.tokens
+            .extend(other.tokens.into_iter().map(|token| RawToken {
+                frame: frame_offset + token.frame,
+                ..token
+            }));
     }
 }
 
@@ -41,14 +67,15 @@ impl ParakeetTdtDecoder {
         raw: &RawTranscription,
         duration_seconds: f64,
     ) -> TranscriptionResult {
-        if raw.token_ids.is_empty() {
+        if raw.tokens.is_empty() {
             return TranscriptionResult::empty(duration_seconds);
         }
 
         let mut text = String::new();
-        let mut tokens = Vec::with_capacity(raw.token_ids.len());
+        let mut tokens = Vec::with_capacity(raw.tokens.len());
 
-        for (index, token_id) in raw.token_ids.iter().copied().enumerate() {
+        for raw_token in &raw.tokens {
+            let token_id = raw_token.id;
             let Some(token_text) = self.vocab.token(token_id as usize) else {
                 continue;
             };
@@ -56,10 +83,8 @@ impl ParakeetTdtDecoder {
                 continue;
             }
 
-            let frame = raw.frame_indices[index];
-            let start = frame_to_seconds(frame);
-            let duration_frames = raw.durations.get(index).copied().unwrap_or(1);
-            let end = token_end_seconds(start, duration_frames, duration_seconds);
+            let start = frame_to_seconds(raw_token.frame);
+            let end = token_end_seconds(start, raw_token.duration, duration_seconds);
 
             let mut display_text = token_text.replace('▁', " ");
             if needs_digit_spacing(&text, &display_text) {
@@ -72,7 +97,7 @@ impl ParakeetTdtDecoder {
                 text: display_text,
                 start,
                 end,
-                confidence: raw.confidences.get(index).copied().unwrap_or(0.0),
+                confidence: raw_token.confidence,
             });
         }
 
@@ -100,7 +125,7 @@ impl ParakeetTdtDecoder {
 }
 
 fn frame_to_seconds(frame: usize) -> f64 {
-    (frame * MEL_HOP_SAMPLES * 8) as f64 / SAMPLE_RATE as f64
+    (frame * SAMPLES_PER_ENCODER_FRAME) as f64 / SAMPLE_RATE as f64
 }
 
 fn token_end_seconds(start: f64, duration_frames: usize, duration_seconds: f64) -> f64 {
@@ -139,10 +164,59 @@ fn needs_digit_spacing(existing_text: &str, display_text: &str) -> bool {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use super::{RawToken, RawTranscription};
+
+    /// Builds a transcription from per-token columns
+    pub(crate) fn raw_from_columns(
+        ids: &[u32],
+        frames: &[usize],
+        durations: &[usize],
+        confidences: &[f32],
+    ) -> RawTranscription {
+        assert!(
+            [frames.len(), durations.len(), confidences.len()]
+                .iter()
+                .all(|len| *len == ids.len()),
+            "every column needs one entry per token"
+        );
+        let tokens = (0..ids.len())
+            .map(|index| RawToken {
+                id: ids[index],
+                frame: frames[index],
+                duration: durations[index],
+                confidence: confidences[index],
+            })
+            .collect();
+        RawTranscription { tokens }
+    }
+
+    impl RawTranscription {
+        pub(crate) fn ids(&self) -> Vec<u32> {
+            self.tokens.iter().map(|token| token.id).collect()
+        }
+
+        pub(crate) fn frames(&self) -> Vec<usize> {
+            self.tokens.iter().map(|token| token.frame).collect()
+        }
+
+        pub(crate) fn durations(&self) -> Vec<usize> {
+            self.tokens.iter().map(|token| token.duration).collect()
+        }
+
+        #[cfg(feature = "cuda")]
+        pub(crate) fn confidences(&self) -> Vec<f32> {
+            self.tokens.iter().map(|token| token.confidence).collect()
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use crate::types::TimedToken;
 
-    use super::{ParakeetTdtDecoder, RawTranscription, SECONDS_PER_ENCODER_FRAME};
+    use super::test_support::raw_from_columns;
+    use super::{ParakeetTdtDecoder, SECONDS_PER_ENCODER_FRAME};
     use crate::vocab::Vocabulary;
 
     fn decoder(tokens: &[&str]) -> ParakeetTdtDecoder {
@@ -152,12 +226,7 @@ mod tests {
     #[test]
     fn digit_spacing_matches_parakeet_rs() {
         let decoder = decoder(&["▁like", "1", "0", "0", "<blk>"]);
-        let raw = RawTranscription {
-            token_ids: vec![0, 1, 2, 3],
-            frame_indices: vec![0, 1, 2, 3],
-            durations: vec![1, 1, 1, 1],
-            confidences: vec![0.9; 4],
-        };
+        let raw = raw_from_columns(&[0, 1, 2, 3], &[0, 1, 2, 3], &[1, 1, 1, 1], &[0.9; 4]);
         let result = decoder.decode(&raw, 1.0);
         assert_eq!(result.text, "like 100");
         assert_eq!(result.tokens[1].text, " 1");
@@ -166,12 +235,7 @@ mod tests {
     #[test]
     fn chunk_spans_the_token_range() {
         let decoder = decoder(&["▁hello", "▁world", "<blk>"]);
-        let raw = RawTranscription {
-            token_ids: vec![0, 1],
-            frame_indices: vec![0, 4],
-            durations: vec![1, 1],
-            confidences: vec![0.9; 2],
-        };
+        let raw = raw_from_columns(&[0, 1], &[0, 4], &[1, 1], &[0.9; 2]);
         let result = decoder.decode(&raw, 1.0);
         let chunk = &result.chunks[0];
         assert_eq!(chunk.text, "hello world");
@@ -182,12 +246,7 @@ mod tests {
     #[test]
     fn duration_decode_fixture_uses_raw_durations() {
         let decoder = decoder(&["▁hello", "▁world", "<blk>"]);
-        let raw = RawTranscription {
-            token_ids: vec![0, 1],
-            frame_indices: vec![0, 2],
-            durations: vec![2, 3],
-            confidences: vec![0.8, 0.7],
-        };
+        let raw = raw_from_columns(&[0, 1], &[0, 2], &[2, 3], &[0.8, 0.7]);
         let result = decoder.decode(&raw, 2.0);
         assert_eq!(result.tokens[0].start, 0.0);
         assert_eq!(result.tokens[0].end, 2.0 * SECONDS_PER_ENCODER_FRAME);

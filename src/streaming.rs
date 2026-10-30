@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use crate::constants::ENCODER_SUBSAMPLING;
 use crate::cuda::encoder::{MEL_CONTEXT, chunk_mel, first_chunk_mel};
 use crate::cuda::streaming::{EngineChunk, StreamEngine};
 use crate::decode::{ParakeetTdtDecoder, RawTranscription};
@@ -23,9 +24,6 @@ use crate::frontend::stream::{MelSetup, StreamingFeatures};
 use crate::models::Precision;
 use crate::types::TranscriptionResult;
 use crate::vocab::Vocabulary;
-
-/// Mel frames per encoder frame, the subsampling factor
-const SUBSAMPLING: usize = 8;
 
 /// A chunk's mel frames: `frames` from frame `start` on, before 0 for a later
 /// chunk whose context reaches before the audio
@@ -144,7 +142,7 @@ impl StreamingModel {
 
     /// Audio samples per chunk, after a stream's first
     pub fn chunk_samples(&self) -> usize {
-        SUBSAMPLING * self.0.engine.frames() * self.0.mel.hop_length()
+        ENCODER_SUBSAMPLING * self.0.engine.frames() * self.0.mel.hop_length()
     }
 
     /// The language tags [`Self::open_stream_in`] takes, such as `en-US`; empty for
@@ -369,11 +367,11 @@ impl Stream {
         }
 
         let frames = self.model.engine.frames();
-        let start = first + SUBSAMPLING * frames * (self.chunks - 1);
+        let start = first + ENCODER_SUBSAMPLING * frames * (self.chunks - 1);
         let new = available.saturating_sub(start);
-        let take = if new >= SUBSAMPLING * frames {
-            SUBSAMPLING * frames
-        } else if self.finished && new >= SUBSAMPLING {
+        let take = if new >= ENCODER_SUBSAMPLING * frames {
+            ENCODER_SUBSAMPLING * frames
+        } else if self.finished && new >= ENCODER_SUBSAMPLING {
             new
         } else {
             return None;
@@ -402,12 +400,7 @@ impl Stream {
     fn advance(&mut self, window: ChunkWindow, raw: RawTranscription) {
         let offset = self.encoded;
         let chunk_frames = self.model.engine.frames();
-        self.raw.token_ids.extend(raw.token_ids);
-        self.raw
-            .frame_indices
-            .extend(raw.frame_indices.iter().map(|frame| offset + frame));
-        self.raw.durations.extend(raw.durations);
-        self.raw.confidences.extend(raw.confidences);
+        self.raw.extend_shifted(raw, offset);
         self.chunks += 1;
         self.encoded += chunk_frames;
 
@@ -582,8 +575,8 @@ mod tests {
                     let (_, tokens, frames) = &utterances[*utt];
                     let label =
                         format!("r{lookahead} {precision:?} pass {pass} utt{utt} copy {copy}");
-                    assert_eq!(&stream.raw.token_ids, tokens, "{label} tokens");
-                    assert_eq!(&stream.raw.frame_indices, frames, "{label} frames");
+                    assert_eq!(&stream.raw.ids(), tokens, "{label} tokens");
+                    assert_eq!(&stream.raw.frames(), frames, "{label} frames");
                     assert!(!stream.transcript().text.is_empty(), "{label} text");
                 }
             }
