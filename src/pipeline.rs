@@ -283,3 +283,36 @@ impl ChunkPreparer {
         PreparedChunk::from_audio(audio, self.chunk, &self.extractor)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ChunkSpec;
+    use crate::deployment::ParakeetDeployment;
+    use crate::error::TranscriptionError;
+
+    fn assert_limit(deployment: &ParakeetDeployment, max: usize) {
+        let chunk = ChunkSpec::for_deployment(deployment);
+        assert!(chunk.check(&vec![0.0; max]).is_ok());
+        assert!(matches!(
+            chunk.check(&vec![0.0; max + 1]),
+            Err(TranscriptionError::AudioTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn chunk_limit_follows_the_deployment() {
+        assert_limit(&ParakeetDeployment::v2(), 240_000);
+        assert_limit(&ParakeetDeployment::v3(), 240_000);
+    }
+
+    // native bundles raise the limit on the deployment itself, which the pipeline
+    // has to read instead of a separate config value
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn chunk_limit_follows_a_raised_native_limit() {
+        assert_limit(
+            &ParakeetDeployment::v3().with_hard_sample_max(640_000),
+            640_000,
+        );
+    }
+}
