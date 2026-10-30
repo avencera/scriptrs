@@ -9,8 +9,9 @@ Fast [NVIDIA Parakeet TDT](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) s
 - Token-level timestamps and confidences
 
 On an RTX 5090, the CUDA backend transcribes LibriSpeech test-clean at 1534x real
-time, 3.2x as fast as NVIDIA NeMo and 6.1x as fast as parakeet-rs, at the same
-word error rate. Through the batching queue it runs at 4770x. On 31.6 h of
+time one utterance at a time, 3.1x as fast as NVIDIA NeMo and 6.1x as fast as
+parakeet-rs, at the same word error rate. Batched, it is 1.5x as fast as NeMo at
+batch 8 and about even at batch 32 (4928x against 5242x). On 31.6 h of
 multilingual speech the default FP16 mode scores the same WER as the FP32 mode,
 which matches NeMo. On six harder English sets it has a lower WER than Whisper
 large-v3 at about 18x its speed. See [CUDA](#cuda) for the numbers.
@@ -163,14 +164,27 @@ time:
 
 | | Speed (x real time) | vs NeMo | WER |
 |---|---|---|---|
-| scriptrs | 1534x | 3.2x | 1.93 % |
-| NVIDIA NeMo | 477x | 1x | 1.93 % |
-| parakeet-rs 0.4.3 (ONNX Runtime) | 253x | 0.53x | 1.93 % |
+| scriptrs | 1534x | 3.1x | 1.93 % |
+| NVIDIA NeMo | 490x | 1x | 1.93 % |
+| parakeet-rs 0.4.3 (ONNX Runtime) | 253x | 0.52x | 1.93 % |
 
 Through the [queue](#many-short-inputs), which prepares the next inputs on the CPU
 while the GPU runs, the same set runs at 1761x one at a time with identical
 transcripts, and at 4770x in batches of up to 16 (the default). Batching changes 2
 of the 2620 transcripts by one word or punctuation mark, and WER stays 1.93 %.
+
+NeMo gains more from batching, because large batches are dominated by the
+encoder's matrix multiplies rather than launch overhead. Against NeMo in bf16,
+which like the FP16 default multiplies 16-bit values with FP32 sums, at the same
+batch sizes:
+
+| Batch | scriptrs (queue) | NVIDIA NeMo bf16 | vs NeMo |
+|---|---|---|---|
+| 1 | 1758x | 490x | 3.6x |
+| 8 | 4389x | 2958x | 1.5x |
+| 32 | 4928x | 5242x | 0.94x |
+
+WER is 1.92–1.93 % for both at every batch size.
 
 The multilingual check is nearly 6 times the size of LibriSpeech: FLEURS and MLS,
 31.6 h over ten language sets in six languages (de, es, fr, it, nl, pt), one
