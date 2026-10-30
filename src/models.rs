@@ -641,6 +641,8 @@ fn native_hub_vocab(deployment: &ParakeetDeployment) -> &'static str {
     vocab.rsplit_once('/').map_or(vocab, |(_, name)| name)
 }
 
+// metadata.json is left out: Core ML never reads it, and the published v3 encoder
+// has none, so requiring it made every v3 download fail with a 404
 #[cfg(feature = "online")]
 fn mlmodelc_files(prefix: &str) -> Vec<String> {
     vec![
@@ -648,7 +650,6 @@ fn mlmodelc_files(prefix: &str) -> Vec<String> {
         format!("{prefix}/coremldata.bin"),
         format!("{prefix}/weights/weight.bin"),
         format!("{prefix}/analytics/coremldata.bin"),
-        format!("{prefix}/metadata.json"),
     ]
 }
 
