@@ -6,10 +6,12 @@
 //! mel, encoder, decode and detokenization for every utterance. Writes a summary
 //! and `<out>.texts.json` (`{id: text}`) for `dev-tools/nemo/wer.py`
 //!
-//! With `--queue`, the utterances go through the pipeline's background queue
-//! instead, pushed in the same order from a second thread, which overlaps feature
-//! extraction with the model; `--batch` sets the queue's `max_batch` (default
-//! [`QueueConfig::DEFAULT_MAX_BATCH`]), and 1 runs each utterance alone
+//! With `--scheduler`, the utterances go through a [`TranscriptionScheduler`]
+//! instead, all submitted in the same order before the first result is awaited,
+//! which overlaps feature extraction with the model and batches utterances
+//! together. `--batch N` fixes the batch size, as a NeMo run at batch N does:
+//! every encoder batch takes up to N utterances of a length, and the decoder
+//! works on N rows; without it the scheduler sizes batches with its defaults
 //!
 //! With `--long <wav or directory>` (repeatable), the first recording runs once as
 //! warmup, then each runs through the long-form pipeline with the bundle's
@@ -36,15 +38,14 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use eyre::{Result, bail, eyre};
 use hound::WavReader;
 use scriptrs::{
     LanguageSelection, LongFormConfig, LongFormTranscriptionPipeline, ModelBundle,
-    ParakeetDeployment, ParakeetLanguage, Precision, QueueConfig, QueueError,
-    QueuedTranscriptionRequest, TranscriptionConfig, TranscriptionPipeline,
+    ParakeetDeployment, ParakeetLanguage, Precision, SchedulerConfig, TranscriptionConfig,
+    TranscriptionPipeline,
 };
 use serde_json::{Value, json};
 
@@ -65,7 +66,7 @@ struct Args {
     vad: bool,
     vad_threshold: Option<f32>,
     vad_padding: Option<f64>,
-    queue: bool,
+    scheduler: bool,
 }
 
 struct Utterance {
@@ -89,11 +90,22 @@ fn run() -> Result<()> {
     let bundle = ModelBundle::from_native_dir(&args.models, args.deployment.clone())
         .with_precision(args.precision);
     let (audio_s, walls, texts, batch) = if args.long.is_empty() {
-        let queue = args.queue.then(|| QueueConfig {
-            max_batch: args.batch.unwrap_or(QueueConfig::DEFAULT_MAX_BATCH),
-            ..QueueConfig::default()
+        let scheduler = args.scheduler.then(|| match args.batch {
+            Some(batch) => SchedulerConfig {
+                max_batch: batch,
+                min_batch: batch,
+                decoder_rows: batch,
+                ..SchedulerConfig::default()
+            },
+            None => SchedulerConfig::default(),
         });
-        bench_manifest(bundle, &args.manifest, args.repeats, args.language, queue)?
+        bench_manifest(
+            bundle,
+            &args.manifest,
+            args.repeats,
+            args.language,
+            scheduler,
+        )?
     } else {
         bench_long(bundle, &args.long, &args)?
     };
@@ -108,7 +120,7 @@ fn run() -> Result<()> {
         "vad": args.vad,
         "vad_threshold": args.vad_threshold,
         "vad_padding": args.vad_padding,
-        "queue": args.queue,
+        "scheduler": args.scheduler,
         "n_utts": texts.len(),
         "audio_s": audio_s,
         "walls_s": walls,
@@ -146,7 +158,7 @@ fn bench_manifest(
     manifest: &Path,
     repeats: usize,
     language: LanguageSelection,
-    queue: Option<QueueConfig>,
+    scheduler_config: Option<SchedulerConfig>,
 ) -> Result<Bench> {
     let pipeline = TranscriptionPipeline::from_bundle(bundle)?;
     let config = TranscriptionConfig {
@@ -167,34 +179,33 @@ fn bench_manifest(
         pipeline.run_with_config(&utterance.audio, &config)?;
     }
 
+    let scheduler = scheduler_config
+        .map(|scheduler| {
+            pipeline
+                .clone()
+                .into_scheduler_with_config(config.clone(), scheduler)
+        })
+        .transpose()?;
     let mut walls = Vec::with_capacity(repeats);
     let mut texts = BTreeMap::new();
     for _ in 0..repeats {
         texts.clear();
         let started = Instant::now();
-        match queue {
+        match &scheduler {
+            Some(scheduler) => {
+                let pending = utterances
+                    .iter()
+                    .map(|utterance| scheduler.submit(utterance.audio.clone()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                for (utterance, pending) in utterances.iter().zip(pending) {
+                    texts.insert(utterance.id.clone(), pending.wait()?.text);
+                }
+            }
             None => {
                 for utterance in &utterances {
                     let text = pipeline.run_with_config(&utterance.audio, &config)?.text;
                     texts.insert(utterance.id.clone(), text);
                 }
-            }
-            Some(queue) => {
-                let (sender, receiver) = pipeline
-                    .clone()
-                    .into_queued_with_config(config.clone(), queue)?;
-                let utterances = &utterances;
-                thread::scope(|scope| -> Result<()> {
-                    let producer = scope.spawn(move || push_all(&sender, utterances));
-                    for queued in receiver {
-                        let queued = queued?;
-                        texts.insert(queued.id, queued.result?.text);
-                    }
-                    producer
-                        .join()
-                        .map_err(|_| eyre!("the producer thread panicked"))??;
-                    Ok(())
-                })?;
             }
         }
         walls.push(started.elapsed().as_secs_f64());
@@ -203,27 +214,8 @@ fn bench_manifest(
         audio_s,
         walls,
         texts,
-        queue.map_or(1, |queue| queue.max_batch),
+        scheduler_config.map_or(1, |scheduler| scheduler.max_batch),
     ))
-}
-
-/// Pushes every utterance, in order, retrying while the queue is full
-fn push_all(sender: &scriptrs::QueueSender, utterances: &[Utterance]) -> Result<(), QueueError> {
-    for utterance in utterances {
-        let mut request =
-            QueuedTranscriptionRequest::new(utterance.id.clone(), utterance.audio.clone());
-        loop {
-            match sender.try_push(request) {
-                Ok(_) => break,
-                Err(QueueError::Full(rejected)) => {
-                    request = rejected;
-                    thread::sleep(Duration::from_micros(200));
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
-    Ok(())
 }
 
 fn bench_long(bundle: ModelBundle, paths: &[PathBuf], args: &Args) -> Result<Bench> {
@@ -337,7 +329,7 @@ fn parse_args() -> Result<Args> {
     let mut vad = false;
     let mut vad_threshold = None;
     let mut vad_padding = None;
-    let mut queue = false;
+    let mut scheduler = false;
     let mut args = env::args().skip(1);
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| eyre!("{flag} needs a value"));
@@ -375,7 +367,7 @@ fn parse_args() -> Result<Args> {
             "--vad" => return Err(eyre!("--vad needs the `vad` feature")),
             "--vad-threshold" => vad_threshold = Some(value()?.parse()?),
             "--vad-padding" => vad_padding = Some(value()?.parse()?),
-            "--queue" => queue = true,
+            "--scheduler" => scheduler = true,
             other => return Err(eyre!("unknown argument {other}")),
         }
     }
@@ -405,7 +397,7 @@ fn parse_args() -> Result<Args> {
         vad,
         vad_threshold,
         vad_padding,
-        queue,
+        scheduler,
     })
 }
 

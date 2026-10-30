@@ -28,10 +28,10 @@ check:
     just clippy
     just test
 
-# GPU tests (`gpu_` prefix): NeMo parity and the transcription queue; they need the
-# GPU, so submit them through the homebased gpu0 queue instead of running them directly
+# GPU tests (`gpu_` prefix): NeMo parity and the scheduler; they need the GPU, so
+# submit them through the homebased gpu0 queue instead of running them directly
 gpu-parity *args:
-    cargo test --release --features cuda,long-form,vad,low-precision --lib --test queued gpu_ -- --ignored --nocapture --test-threads 1 {{args}}
+    cargo test --release --features cuda,long-form,vad,low-precision --lib --test scheduled gpu_ -- --ignored --nocapture --test-threads 1 {{args}}
 
 # write every precision's weight file from the exported FP32 weights (~3 GB under
 # /shared/models/scriptrs-native) and check each decodes as load-time quantization

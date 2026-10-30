@@ -32,6 +32,10 @@
 //! streams at once with the cache-aware Nemotron Speech Streaming EN and
 //! Nemotron 3.5 ASR Streaming models, one chunk per stream per batch.
 //!
+//! To transcribe many inputs, or serve many concurrent callers from one model,
+//! move either pipeline behind a [`TranscriptionScheduler`] with `into_scheduler`.
+//! On CUDA it batches windows across requests.
+//!
 //! # Model loading
 //!
 //! With the default `online` feature, [`TranscriptionPipeline::from_pretrained`]
@@ -157,7 +161,7 @@ mod native;
 mod pipeline;
 #[cfg(feature = "long-form")]
 mod preprocessing;
-mod queue;
+mod scheduler;
 #[cfg(feature = "cuda")]
 mod streaming;
 #[cfg(test)]
@@ -202,10 +206,7 @@ pub use preprocessing::{
     TranscriptionControlError, TranscriptionDeadline, WindowIndex, WindowLimit, WindowLimitError,
     WindowPreprocessor,
 };
-pub use queue::{
-    QueueConfig, QueueError, QueueReceiver, QueueReceiverIter, QueueSender,
-    QueuedTranscriptionJobId, QueuedTranscriptionRequest, QueuedTranscriptionResult,
-};
+pub use scheduler::{PendingTranscription, SchedulerConfig, TranscriptionScheduler};
 #[cfg(feature = "cuda")]
 pub use streaming::{Stream, StreamingConfig, StreamingModel};
 pub use types::{TimedToken, TranscriptChunk, TranscriptionResult};

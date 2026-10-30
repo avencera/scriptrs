@@ -796,8 +796,112 @@ impl LongFormTranscriptionPipeline {
     }
 }
 
+/// A long-form request planned for the scheduler: its windows, and how their
+/// outputs merge into one result
 #[derive(Debug)]
-struct LongFormExecutionPlan {
+pub(crate) enum ScheduledPlan {
+    /// Audio that fits one model input, transcribed as the base pipeline does
+    Single,
+    /// Overlap or VAD windows, merged as [`LongFormTranscriptionPipeline::run`]
+    /// merges them
+    Windows(LongFormExecutionPlan),
+}
+
+impl ScheduledPlan {
+    /// The planned windows in order
+    pub(crate) fn windows(&self, audio_len: usize) -> Vec<crate::scheduler::WindowSpan> {
+        match self {
+            Self::Single => vec![crate::scheduler::WindowSpan {
+                start: 0,
+                end: audio_len,
+                global_sample_offset: 0,
+                context_samples: 0,
+            }],
+            Self::Windows(plan) => plan
+                .tasks
+                .iter()
+                .map(|task| crate::scheduler::WindowSpan {
+                    start: task.audio_start,
+                    end: task.audio_end,
+                    global_sample_offset: task.global_sample_offset,
+                    context_samples: task.context_samples,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl LongFormTranscriptionPipeline {
+    /// The single-chunk pipeline inside
+    pub(crate) fn inner(&self) -> &TranscriptionPipeline {
+        &self.inner
+    }
+
+    /// Plans `audio` as [`Self::run_with_config`] would, without running a window
+    pub(crate) fn plan_scheduled(
+        &self,
+        audio: &[f32],
+        config: &LongFormConfig,
+    ) -> Result<ScheduledPlan, TranscriptionError> {
+        if audio.is_empty() {
+            return Err(TranscriptionError::EmptyAudio);
+        }
+        validate_finite_samples(audio, 0)?;
+        if audio.len() <= config.transcription.max_audio_samples {
+            return Ok(ScheduledPlan::Single);
+        }
+
+        let plan = match config.mode {
+            LongFormMode::Fast => Self::build_fast_execution_plan(audio.len(), config),
+            #[cfg(feature = "vad")]
+            LongFormMode::Vad => {
+                let control = TranscriptionControl::internal_unbounded();
+                let vad = self
+                    .vad
+                    .as_ref()
+                    .ok_or_else(|| self.inner.bundle().missing_vad_error())?;
+                let probabilities = vad.process(audio, &config.vad, &control)?;
+                let regions = detect_speech_regions(
+                    &probabilities,
+                    audio.len(),
+                    config.segmentation.threshold(config.vad.default_threshold),
+                    &config.segmentation,
+                );
+                self.build_execution_plan(&regions, &probabilities, config)
+            }
+        };
+        Ok(ScheduledPlan::Windows(plan))
+    }
+
+    /// Merges the outputs of a plan's windows, in plan order, into its result
+    pub(crate) fn merge_scheduled(
+        &self,
+        audio_len: usize,
+        plan: ScheduledPlan,
+        raws: Vec<RawTranscription>,
+    ) -> Result<TranscriptionResult, TranscriptionError> {
+        match plan {
+            ScheduledPlan::Single => {
+                let raw = raws.into_iter().next().ok_or_else(|| {
+                    TranscriptionError::InvalidModelOutput(
+                        "a scheduled window went missing".to_owned(),
+                    )
+                })?;
+                Ok(self.inner.decode_raw(&raw, duration_seconds(audio_len)))
+            }
+            ScheduledPlan::Windows(LongFormExecutionPlan { tasks, regions }) => {
+                if tasks.is_empty() {
+                    return Ok(TranscriptionResult::empty(duration_seconds(audio_len)));
+                }
+                let raws = raws.into_iter().map(Some).collect();
+                self.build_parallel_result(audio_len, &tasks, regions, raws)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct LongFormExecutionPlan {
     tasks: Vec<ChunkTask>,
     regions: Vec<RegionTask>,
 }
