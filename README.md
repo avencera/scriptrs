@@ -433,3 +433,7 @@ The example expects mono 16kHz WAV input.
 - `scriptrs` currently targets the exact file layout and model I/O shipped in `avencera/scriptrs-models`; if you swap in a different CoreML Parakeet export, you may need runtime code changes
 - Use `long-form` for the fastest path on clean, dense speech
 - Add `vad` when you need better robustness on sparse-speech or non-speech-heavy recordings; on dense or far-field speech it costs accuracy
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE)
