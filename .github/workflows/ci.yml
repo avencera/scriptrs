@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+# a new push to a pull request supersedes its running checks
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # the same gates as `just check`, through its recipes so the two stay in step
+  lint:
+    name: Format and dependencies
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: rustfmt
+
+      - name: Install just
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: just
+
+      # `just fmt` rewrites files, so any diff it leaves means the code wasn't formatted
+      - name: Format
+        run: |
+          just fmt
+          git diff --exit-code
+
+      - name: No ONNX Runtime
+        run: just no-ort
+
+  check:
+    name: Clippy and tests (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # builds the CUDA backend; a GitHub runner has no GPU, and the tests that
+          # need one are ignored by default
+          - name: Linux x86_64
+            os: ubuntu-24.04
+          - name: macOS arm64
+            os: macos-15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Install just
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: just
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Clippy
+        run: just clippy
+
+      - name: Test
+        run: just test --all-features
