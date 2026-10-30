@@ -20,6 +20,7 @@
 //! default workers prepare windows ahead of the model. `--language <code>` decodes
 //! with that language's filter instead of automatic language selection,
 //! `--tf32` or `--fp32` runs the encoder GEMMs in that precision instead of FP16,
+//! as do `--fp8`, `--int8` and `--nvfp4` with the `low-precision` feature,
 //! and `--vad` (with the `vad` feature) plans long recordings from Silero speech
 //! regions instead of overlap windows over the whole recording, at
 //! `--vad-threshold <p>` if given
@@ -98,11 +99,7 @@ fn run() -> Result<()> {
     let mut sorted = walls.clone();
     sorted.sort_by(f64::total_cmp);
     let summary = json!({
-        "backend": match args.precision {
-            Precision::Fp32 => "scriptrs-cuda-fp32",
-            Precision::Tf32 => "scriptrs-cuda-tf32",
-            Precision::Fp16 => "scriptrs-cuda-fp16",
-        },
+        "backend": format!("scriptrs-cuda-{}", precision_name(args.precision)),
         "version": version,
         "bs": batch,
         "long": !args.long.is_empty(),
@@ -303,6 +300,21 @@ fn stem(path: &Path) -> Result<String> {
         .ok_or_else(|| eyre!("{} has no file stem", path.display()))
 }
 
+/// The name a precision's flag and backend label use
+fn precision_name(precision: Precision) -> &'static str {
+    match precision {
+        Precision::Fp32 => "fp32",
+        Precision::Tf32 => "tf32",
+        Precision::Fp16 => "fp16",
+        #[cfg(feature = "low-precision")]
+        Precision::Fp8 => "fp8",
+        #[cfg(feature = "low-precision")]
+        Precision::Int8 => "int8",
+        #[cfg(feature = "low-precision")]
+        Precision::Nvfp4 => "nvfp4",
+    }
+}
+
 fn parse_args() -> Result<Args> {
     let mut models = None;
     let mut deployment = ParakeetDeployment::v3();
@@ -345,6 +357,12 @@ fn parse_args() -> Result<Args> {
             }
             "--tf32" => precision = Precision::Tf32,
             "--fp32" => precision = Precision::Fp32,
+            #[cfg(feature = "low-precision")]
+            "--fp8" => precision = Precision::Fp8,
+            #[cfg(feature = "low-precision")]
+            "--int8" => precision = Precision::Int8,
+            #[cfg(feature = "low-precision")]
+            "--nvfp4" => precision = Precision::Nvfp4,
             "--vad" if cfg!(feature = "vad") => vad = true,
             "--vad" => return Err(eyre!("--vad needs the `vad` feature")),
             "--vad-threshold" => vad_threshold = Some(value()?.parse()?),

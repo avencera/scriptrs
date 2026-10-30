@@ -108,7 +108,7 @@ impl ParakeetModelInner {
             }
             #[cfg(feature = "cuda")]
             RuntimeBundle::Native(layout) => Ok(Self::Cuda(crate::cuda::model::CudaModel::load(
-                layout.weights_path(),
+                &layout.weights_path(),
                 bundle.deployment(),
                 layout.precision(),
             )?)),

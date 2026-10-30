@@ -50,7 +50,8 @@ pub struct StreamingConfig {
     pub max_batch: usize,
     /// Encoder GEMM precision. [`Precision::Fp32`] gives NeMo's streaming tokens
     /// exactly; FP16, the default, is 1.4 to 1.9 times as fast, with WER on
-    /// LibriSpeech within 0.003 points of it
+    /// LibriSpeech within 0.003 points of it. The `low-precision` modes are for
+    /// offline transcription only, and loading fails with them
     pub precision: Precision,
 }
 
@@ -443,6 +444,8 @@ const _: () = {
 mod tests {
     use super::{Stream, StreamingConfig, StreamingModel};
     use crate::cuda::test_support::native_root;
+    #[cfg(feature = "low-precision")]
+    use crate::error::TranscriptionError;
     use crate::models::Precision;
     use crate::test_support::NemoReference;
 
@@ -474,6 +477,25 @@ mod tests {
     /// stream's tokens and frames to NeMo's streaming decode, in FP32 and in the FP16
     /// default, whose tokens should not change on this clean audio. The second pass
     /// reuses the freed slots and replays the captured graphs
+    #[test]
+    #[cfg(feature = "low-precision")]
+    fn quantized_precisions_do_not_stream() {
+        for precision in [Precision::Fp8, Precision::Int8, Precision::Nvfp4] {
+            let config = StreamingConfig {
+                precision,
+                ..StreamingConfig::new(1)
+            };
+            // fails before reading any weights, so the directory need not exist
+            let Err(error) = StreamingModel::from_native_dir("missing-model", &config) else {
+                panic!("{precision:?} must not stream");
+            };
+            assert!(
+                matches!(error, TranscriptionError::InvalidConfiguration(_)),
+                "{precision:?}: {error}"
+            );
+        }
+    }
+
     #[test]
     #[ignore = "needs a CUDA GPU, the native streaming weights and the NeMo streaming references"]
     fn gpu_streams_transcribe_like_nemo() {

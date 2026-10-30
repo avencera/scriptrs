@@ -17,6 +17,7 @@ path = "src/lib.rs"
 [features]
 decode = []
 encoder = []
+quant = []
 
 [dependencies]
 # keep the rev in sync with speakrs and cudakit until cudakit-build owns the pin

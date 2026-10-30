@@ -1561,6 +1561,7 @@ dependencies = [
  "approx",
  "block2",
  "cudakit",
+ "cudarc",
  "eyre",
  "hf-hub",
  "hound",

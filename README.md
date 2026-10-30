@@ -241,9 +241,13 @@ speech threshold.
 
 By default the encoder layers' linear weights are stored in FP16, which has TF32's
 10-bit mantissa, and their matrix multiplies run on FP16 tensor cores with FP32
-accumulation. `Precision::Tf32` keeps the weights in FP32 and uses TF32 tensor
-cores on Ampere and newer GPUs, or FP32 on older ones. `Precision::Fp32` matches
-NeMo's FP32 decode token for token on any GPU:
+accumulation. Use this default: it is the fastest and scores the same WER as FP32.
+
+`Precision::Tf32` and `Precision::Fp32` are for compatibility, when you need to
+keep matching transcripts you already produced at that precision. `Precision::Tf32`
+keeps the weights in FP32 and uses TF32 tensor cores on Ampere and newer GPUs, or
+FP32 on older ones. `Precision::Fp32` matches NeMo's FP32 decode token for token on
+any GPU:
 
 ```rust,ignore
 use scriptrs::{ModelBundle, ParakeetDeployment, Precision};
@@ -256,7 +260,7 @@ On an RTX 5090 with Parakeet v3 (speed in x real time, then WER):
 
 | | FP16 (default) | TF32 | FP32 |
 |---|---|---|---|
-| LibriSpeech test-clean, one utterance at a time | 1534x, 1.93 % | 1179x, 1.93 % | — |
+| LibriSpeech test-clean, one utterance at a time | 1534x, 1.93 % | 1179x, 1.93 % | 848x, 1.93 % |
 | LibriSpeech test-clean, queue in batches of 16 | 4767x, 1.93 % | 3364x, 1.92 % | — |
 | Earnings-21, long-form | 3633x, 8.24 % | 2633x, 8.24 % | — |
 | FLEURS de, es, fr, it, nl, pt (15.8 h) | 1839x, 4.57 % | 1450x, 4.57 % | 966x, 4.57 % |
@@ -267,6 +271,14 @@ are scored with Whisper's basic normalizer. On each of their ten language sets,
 FP16 is within one word error of TF32. On LibriSpeech one utterance at a time,
 FP16 gives the same transcripts as TF32. Batching changes a few transcripts in
 either precision, so the queued FP16 and TF32 transcripts differ slightly.
+
+The `low-precision` feature adds FP8, INT8 and NVFP4 modes for offline
+transcription, and the weight files that store them. Most users should leave it
+off. None of the three is faster than FP16 one utterance at a time, and they save
+little GPU memory: 0.4 to 0.7 GB of FP16's peak of about 7 GB on an RTX 5090. FP8
+and INT8 only halve the download at FP16's WER, and NVFP4 is faster only in large
+batches on Blackwell GPUs, at a WER cost. The `Precision` docs give the GPU
+requirements and measurements.
 
 ## Usage
 

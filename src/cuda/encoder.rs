@@ -10,6 +10,10 @@
 //! the kernels before each of those GEMMs write an FP16 copy of their output, so the
 //! GEMMs read half the bytes and run at the FP16 tensor-core rate. The residual
 //! stream, the GEMM outputs and their accumulation stay FP32
+//!
+//! With the `low-precision` feature, `EncoderMath::Quantized` keeps the FP16
+//! activations and quantizes the same linear layers further (see the `quantized`
+//! module). The streaming encoder does not run it
 
 use cudakit::cudarc::driver::{CudaSlice, CudaView, DevicePtrMut};
 use cudakit::{DeviceTensor, Math, Sgemm, SgemmBatched};
@@ -18,11 +22,15 @@ use crate::cuda::fp16::linear_fp16;
 use crate::cuda::kernels::{
     CudaRuntime, EncoderKernels, FeatureMap, GemmOperand, Heads, StreamKernels,
 };
+#[cfg(feature = "low-precision")]
+use crate::cuda::quant::Scheme;
 use crate::cuda::{Direction, HostStaging, linear, upload, upload_host, zeros};
 use crate::error::TranscriptionError;
 use crate::native::spec::{ConvNorm, EncoderSpec};
 use crate::native::weights::WeightFile;
 
+#[cfg(feature = "low-precision")]
+mod quantized;
 mod stream;
 
 pub(crate) use stream::{
@@ -64,6 +72,10 @@ pub(crate) enum EncoderMath {
     /// keep FP32 operands in TF32: they are a few percent of the work, and their
     /// operands would need conversions of their own
     Fp16,
+    /// [`Self::Fp16`] with the linear layers' weights, and for every scheme but INT8
+    /// their activations, quantized in the scheme
+    #[cfg(feature = "low-precision")]
+    Quantized(Scheme),
 }
 
 impl EncoderMath {
@@ -72,11 +84,14 @@ impl EncoderMath {
         match self {
             Self::Single(math) => math,
             Self::Fp16 => Math::Tf32,
+            #[cfg(feature = "low-precision")]
+            Self::Quantized(_) => Math::Tf32,
         }
     }
 
+    /// Whether the kernels write FP16 copies of the linear layers' inputs
     fn fp16(self) -> bool {
-        self == Self::Fp16
+        !matches!(self, Self::Single(_))
     }
 }
 
@@ -85,6 +100,8 @@ enum Linear {
     Single(DeviceTensor),
     /// FP16 bits
     Fp16(CudaSlice<u16>),
+    #[cfg(feature = "low-precision")]
+    Quantized(quantized::QuantLinear),
 }
 
 /// The activation a linear layer reads, matching its [`Linear`] weight
@@ -151,6 +168,8 @@ pub(crate) struct CudaEncoder {
     layers: Vec<Layer>,
     kernels: EncoderKernels,
     stream_kernels: StreamKernels,
+    #[cfg(feature = "low-precision")]
+    quant: Option<quantized::QuantState>,
 }
 
 /// Device buffers for one `(batch, mel frames)` input shape
@@ -200,6 +219,25 @@ struct Activations {
     merged: CudaSlice<f32>,
     /// FP16 GEMM inputs under [`EncoderMath::Fp16`]
     fp16: Option<Fp16Inputs>,
+    quant: QuantScratch,
+}
+
+/// The buffers the quantized linear layers quantize their activations into, empty
+/// without the `low-precision` feature and in a streaming workspace
+#[derive(Default)]
+struct QuantScratch {
+    #[cfg(feature = "low-precision")]
+    inputs: Option<quantized::QuantInputs>,
+}
+
+impl QuantScratch {
+    fn bytes(&self) -> usize {
+        #[cfg(feature = "low-precision")]
+        if let Some(inputs) = &self.inputs {
+            return inputs.bytes();
+        }
+        0
+    }
 }
 
 /// FP16 copies of the activations the FP16 linear layers read
@@ -221,9 +259,10 @@ impl Activations {
     ) -> Result<Self, TranscriptionError> {
         let stream = runtime.stream();
         let d = spec.d_model;
-        let fp16 = match math {
-            EncoderMath::Single(_) => None,
-            EncoderMath::Fp16 => Some(Fp16Inputs {
+        // the quantized maths also read FP16 activations
+        let fp16 = match math.fp16() {
+            false => None,
+            true => Some(Fp16Inputs {
                 normed: zeros(stream, rows * d)?,
                 hidden: zeros(stream, rows * spec.ff_hidden)?,
                 merged: zeros(stream, rows * d)?,
@@ -237,6 +276,7 @@ impl Activations {
             qkv: zeros(stream, rows * 3 * d)?,
             merged: zeros(stream, rows * d)?,
             fp16,
+            quant: QuantScratch::default(),
         })
     }
 
@@ -251,7 +291,7 @@ impl Activations {
                 .map(|buffer| buffer.num_bytes())
                 .sum()
         });
-        single + fp16
+        single + fp16 + self.quant.bytes()
     }
 
     /// Where a kernel writes `merged` for the next linear layer
@@ -377,6 +417,8 @@ impl CudaEncoder {
             out: pair("out", &[d, flat])?,
         };
 
+        #[cfg(feature = "low-precision")]
+        let quant = quantized::QuantState::load(runtime, file, spec, math)?;
         let mut layers = Vec::with_capacity(spec.layers);
         for index in 0..spec.layers {
             layers.push(Self::load_layer(
@@ -391,6 +433,8 @@ impl CudaEncoder {
             layers,
             kernels,
             stream_kernels: StreamKernels::load(runtime)?,
+            #[cfg(feature = "low-precision")]
+            quant,
         })
     }
 
@@ -407,8 +451,16 @@ impl CudaEncoder {
         let tensor = |name: &str, shape: &[usize]| file.tensor(&format!("{prefix}.{name}"), shape);
         let load =
             |name: &str, shape: &[usize]| upload(runtime, file, &format!("{prefix}.{name}"), shape);
+        #[cfg(not(feature = "low-precision"))]
         let to_linear = |weight: DeviceTensor| Linear::new(runtime, kernels, weight, math);
+        #[cfg(not(feature = "low-precision"))]
         let load_linear = |name: &str, shape: &[usize]| to_linear(load(name, shape)?);
+        // the linear weights may be stored FP16 or quantized
+        #[cfg(feature = "low-precision")]
+        let load_linear = |name: &str, shape: &[usize]| {
+            let name = format!("{prefix}.{name}");
+            quantized::load_linear(runtime, kernels, file, &name, shape, math)
+        };
         let norm = |name: &str| -> Result<Norm, TranscriptionError> {
             Ok(Norm {
                 weight: load(&format!("{name}.weight"), &[d])?,
@@ -422,13 +474,19 @@ impl CudaEncoder {
             })
         };
 
+        #[cfg(not(feature = "low-precision"))]
         let mut qkv = Vec::with_capacity(3 * d * d);
+        #[cfg(not(feature = "low-precision"))]
         for name in ["linear_q", "linear_k", "linear_v"] {
             qkv.extend_from_slice(tensor(&format!("self_attn.{name}.weight"), &[d, d])?);
         }
         let head_dim = d / spec.heads;
         let attention = Attention {
+            #[cfg(not(feature = "low-precision"))]
             qkv: to_linear(DeviceTensor::upload(runtime.stream(), &qkv, &[3 * d, d])?)?,
+            // the reader stacks the three weights of a file that keeps them apart
+            #[cfg(feature = "low-precision")]
+            qkv: load_linear("self_attn.linear_qkv.weight", &[3 * d, d])?,
             pos: load_linear("self_attn.linear_pos.weight", &[d, d])?,
             out: load_linear("self_attn.linear_out.weight", &[d, d])?,
             bias_u: load("self_attn.pos_bias_u", &[spec.heads, head_dim])?,
@@ -506,6 +564,12 @@ impl CudaEncoder {
         let positions = 2 * frames - 1;
         let pos_emb = stream.clone_htod(&relative_positions(frames, d))?;
         let pos_emb_f16 = self.fp16_copy(runtime, &pos_emb)?;
+        #[cfg_attr(not(feature = "low-precision"), allow(unused_mut))]
+        let mut act = Activations::new(runtime, spec, self.math, rows)?;
+        #[cfg(feature = "low-precision")]
+        if let Some(quant) = &self.quant {
+            act.quant.inputs = quant.inputs(runtime, spec, rows, positions)?;
+        }
 
         Ok(EncoderWorkspace {
             batch,
@@ -526,7 +590,7 @@ impl CudaEncoder {
             host_lens: vec![0; batch],
             maps: [zeros(stream, maps[1].len())?, zeros(stream, maps[2].len())?],
             flat: zeros(stream, rows * channels * maps[3].features)?,
-            act: Activations::new(runtime, spec, self.math, rows)?,
+            act,
             q_u: zeros(stream, rows * d)?,
             q_v: zeros(stream, rows * d)?,
             k: zeros(stream, rows * d)?,
@@ -875,6 +939,28 @@ impl CudaEncoder {
         Ok(())
     }
 
+    /// [`Self::linear`], or for a quantized weight its product, which quantizes `a`
+    /// into `quant` first; only the offline pass runs quantized products
+    fn linear_or_quantized<C: DevicePtrMut<f32>>(
+        &self,
+        runtime: &CudaRuntime,
+        spec: Sgemm,
+        a: Operand<'_>,
+        weight: &Linear,
+        c: &mut C,
+        #[cfg_attr(not(feature = "low-precision"), allow(unused_variables))]
+        quant: &mut QuantScratch,
+    ) -> Result<(), TranscriptionError> {
+        #[cfg(feature = "low-precision")]
+        if let (Operand::Fp16(a), Linear::Quantized(w), EncoderMath::Quantized(_)) =
+            (&a, weight, self.math)
+        {
+            let state = self.quant.as_ref().ok_or_else(mixed_precision)?;
+            return state.linear(runtime, spec, a, w, c, quant.inputs.as_mut());
+        }
+        self.linear(runtime, spec, a, weight, c)
+    }
+
     /// `x += 0.5 * linear2(silu(linear1(normed)))`, with `normed` the sublayer's
     /// norm of `x`
     fn feed_forward(
@@ -886,12 +972,13 @@ impl CudaEncoder {
         let (d, hidden) = (self.spec.d_model, self.spec.ff_hidden);
         let math = self.math.single();
         let rows = act.rows;
-        self.linear(
+        self.linear_or_quantized(
             runtime,
             linear(rows, hidden, d, 1.0, 0.0, math),
             normed_in(self.math, &act.normed, act.fp16.as_ref())?,
             &weights.linear1,
             &mut act.hidden.slice_mut(..rows * hidden),
+            &mut act.quant,
         )?;
         let stream = runtime.stream();
         match act.fp16.as_mut() {
@@ -910,12 +997,13 @@ impl CudaEncoder {
             act.fp16.as_ref().map(|fp16| fp16.hidden.slice(..)),
         )?;
         // NeMo scales the feed-forward residual by 0.5 (`fc_factor`)
-        self.linear(
+        self.linear_or_quantized(
             runtime,
             linear(rows, d, hidden, 0.5, 1.0, math),
             activated,
             &weights.linear2,
             &mut act.x,
+            &mut act.quant,
         )?;
         Ok(())
     }
@@ -942,12 +1030,13 @@ impl CudaEncoder {
         };
 
         let math = self.math.single();
-        self.linear(
+        self.linear_or_quantized(
             runtime,
             linear(rows, 3 * d, d, 1.0, 0.0, math),
             normed_in(self.math, &ws.act.normed, ws.act.fp16.as_ref())?,
             &weights.qkv,
             &mut ws.act.qkv,
+            &mut ws.act.quant,
         )?;
         self.kernels.split_qkv(
             stream,
@@ -965,12 +1054,13 @@ impl CudaEncoder {
             ws.pos_emb.slice(..),
             ws.pos_emb_f16.as_ref().map(|table| table.slice(..)),
         )?;
-        self.linear(
+        self.linear_or_quantized(
             runtime,
             linear(positions, d, d, 1.0, 0.0, math),
             table,
             &weights.pos,
             &mut ws.pos,
+            &mut ws.act.quant,
         )?;
         self.kernels.split_heads(
             stream,
@@ -1029,12 +1119,13 @@ impl CudaEncoder {
             ws.act.merged_out(self.math)?,
             shape,
         )?;
-        self.linear(
+        self.linear_or_quantized(
             runtime,
             linear(rows, d, d, 1.0, 1.0, math),
             merged_in(self.math, &ws.act.merged, ws.act.fp16.as_ref())?,
             &weights.out,
             &mut ws.act.x,
+            &mut ws.act.quant,
         )?;
         Ok(())
     }
@@ -1052,12 +1143,13 @@ impl CudaEncoder {
         let rows = ws.batch * ws.frames;
         let pw1_len = rows * 2 * d;
         let act = &mut ws.act;
-        self.linear(
+        self.linear_or_quantized(
             runtime,
             linear(rows, 2 * d, d, 1.0, 0.0, math),
             normed_in(self.math, &act.normed, act.fp16.as_ref())?,
             &weights.pointwise1,
             &mut act.hidden.slice_mut(..pw1_len),
+            &mut act.quant,
         )?;
         let Activations {
             hidden,
@@ -1083,12 +1175,13 @@ impl CudaEncoder {
             d,
             self.spec.conv_kernel,
         )?;
-        self.linear(
+        self.linear_or_quantized(
             runtime,
             linear(rows, d, d, 1.0, 1.0, math),
             merged_in(self.math, &act.merged, act.fp16.as_ref())?,
             &weights.pointwise2,
             &mut act.x,
+            &mut act.quant,
         )?;
         Ok(())
     }
@@ -1120,10 +1213,10 @@ fn gemm_output<'a>(
     single: &'a mut CudaSlice<f32>,
     fp16: Option<&'a mut CudaSlice<u16>>,
 ) -> Result<GemmOperand<'a>, TranscriptionError> {
-    match (math, fp16) {
-        (EncoderMath::Single(_), _) => Ok(GemmOperand::Single(single.slice_mut(..))),
-        (EncoderMath::Fp16, Some(fp16)) => Ok(GemmOperand::Fp16(fp16.slice_mut(..))),
-        (EncoderMath::Fp16, None) => Err(mixed_precision()),
+    match (math.fp16(), fp16) {
+        (false, _) => Ok(GemmOperand::Single(single.slice_mut(..))),
+        (true, Some(fp16)) => Ok(GemmOperand::Fp16(fp16.slice_mut(..))),
+        (true, None) => Err(mixed_precision()),
     }
 }
 
@@ -1134,10 +1227,10 @@ fn gemm_input<'a>(
     single: CudaView<'a, f32>,
     fp16: Option<CudaView<'a, u16>>,
 ) -> Result<Operand<'a>, TranscriptionError> {
-    match (math, fp16) {
-        (EncoderMath::Single(_), _) => Ok(Operand::Single(single)),
-        (EncoderMath::Fp16, Some(fp16)) => Ok(Operand::Fp16(fp16)),
-        (EncoderMath::Fp16, None) => Err(mixed_precision()),
+    match (math.fp16(), fp16) {
+        (false, _) => Ok(Operand::Single(single)),
+        (true, Some(fp16)) => Ok(Operand::Fp16(fp16)),
+        (true, None) => Err(mixed_precision()),
     }
 }
 
@@ -1421,7 +1514,7 @@ mod tests {
 
     /// Checks one graph replay of `encoder` on the v3 reference `set` against its
     /// eager pass and prints the mean replay time
-    fn time_graph(runtime: &CudaRuntime, encoder: &CudaEncoder, name: &str, set: &str) {
+    pub(super) fn time_graph(runtime: &CudaRuntime, encoder: &CudaEncoder, name: &str, set: &str) {
         const REPLAYS: u32 = 100;
         let reference = NemoReference::open(ParakeetVersion::V3, set);
         let mel = reference
