@@ -153,7 +153,7 @@ impl StreamKernels {
     }
 
     /// First causal subsampling convolution with bias, window mask and ReLU
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "launchers mirror their kernel's parameter list so each launch reads against it"
     )]
@@ -214,7 +214,7 @@ impl StreamKernels {
     }
 
     /// Causal depthwise subsampling convolution with bias and window mask
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "launchers mirror their kernel's parameter list so each launch reads against it"
     )]
@@ -339,7 +339,7 @@ impl StreamKernels {
 
     /// Chunked rel-pos attention over the cached and chunk frames of `layer`, into
     /// the merged heads `out`, `[batch * frames, d_model]`
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "launchers mirror their kernel's parameter list so each launch reads against it"
     )]
@@ -510,7 +510,7 @@ impl StreamKernels {
     }
 
     /// GLU, causal depthwise convolution over the cached frames, LayerNorm and SiLU
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "launchers mirror their kernel's parameter list so each launch reads against it"
     )]
@@ -604,7 +604,7 @@ impl StreamKernels {
     }
 
     /// Moves each row's conv cache of `layer` on by its chunk's GLU frames
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "launchers mirror their kernel's parameter list so each launch reads against it"
     )]

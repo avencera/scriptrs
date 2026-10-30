@@ -345,7 +345,7 @@ impl EncoderKernels {
     }
 
     /// `out = LayerNorm(x)` over rows of `width`
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "launchers mirror their kernel's parameter list so each launch reads against it"
     )]
@@ -382,7 +382,7 @@ impl EncoderKernels {
     /// `x = LayerNorm(x)` in place with `norm`, then with `next` the next layer's
     /// first LayerNorm of the result into `out`, in FP32 or as FP16 bits for an FP16
     /// GEMM; without `next`, `out` is untouched
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "launchers mirror their kernel's parameter list so each launch reads against it"
     )]
@@ -492,7 +492,7 @@ impl EncoderKernels {
     }
 
     /// Splits the fused QKV projection into `q + u`, `q + v`, `k` and `v`
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "launchers mirror their kernel's parameter list so each launch reads against it"
     )]
@@ -673,7 +673,7 @@ impl EncoderKernels {
     }
 
     /// GLU, pad mask, depthwise convolution, folded BatchNorm and SiLU
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "launchers mirror their kernel's parameter list so each launch reads against it"
     )]
@@ -772,7 +772,7 @@ impl EncoderKernels {
     }
 
     /// First subsampling convolution with bias, mask and ReLU
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "launchers mirror their kernel's parameter list so each launch reads against it"
     )]
@@ -834,7 +834,7 @@ impl EncoderKernels {
     }
 
     /// Depthwise 3x3 stride-2 subsampling convolution with bias and mask
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "launchers mirror their kernel's parameter list so each launch reads against it"
     )]
@@ -1013,7 +1013,7 @@ impl AttentionKernels {
     /// `qkv` is the fused `[batch * frames, 3 * d_model]` projection, `pos` the
     /// projected `[2 * frames - 1, d_model]` position table, and `out` the `[batch *
     /// frames, d_model]` context; `lens` holds the valid frames per batch row
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "launchers mirror their kernel's parameter list so each launch reads against it"
     )]
@@ -1041,7 +1041,7 @@ impl AttentionKernels {
 
     /// [`rel_pos_f16`](Self::rel_pos_f16) from FP32 projections to the FP32 context,
     /// with TF32 products
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "launchers mirror their kernel's parameter list so each launch reads against it"
     )]
@@ -1069,7 +1069,7 @@ impl AttentionKernels {
 
     /// Checks the buffers against `shape` and launches `kernel`, which takes `qkv`,
     /// `pos` and `out` as `T`
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "launchers mirror their kernel's parameter list so each launch reads against it"
     )]
@@ -1281,7 +1281,7 @@ impl DecodeKernels {
     /// A nonzero `filter.top_k` must be at most `shape.classes` and
     /// [`MAX_FILTER_TOP_K`]; the kernel clamps it to stay in bounds, so a wider one
     /// would search fewer candidates than asked
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "launchers mirror their kernel's parameter list so each launch reads against it"
     )]

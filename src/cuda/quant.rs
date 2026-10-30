@@ -365,7 +365,7 @@ impl QuantKernels {
 
     /// NVFP4 of rows of `width` with the tensor scale from `partials`, and `alpha[0] =
     /// alpha_base * tensor scale`
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "launchers mirror their kernel's parameter list so each launch reads against it"
     )]

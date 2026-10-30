@@ -691,7 +691,10 @@ impl CudaEncoder {
         let positions = 2 * frames - 1;
         let pos_emb = stream.clone_htod(&relative_positions(frames, d))?;
         let pos_emb_f16 = self.fp16_copy(runtime, &pos_emb)?;
-        #[cfg_attr(not(feature = "low-precision"), allow(unused_mut))]
+        #[cfg_attr(
+            not(feature = "low-precision"),
+            expect(unused_mut, reason = "only quantized encoders attach scratch")
+        )]
         let mut act = Activations::new(runtime, spec, self.math, rows)?;
         #[cfg(feature = "low-precision")]
         if let Some(quant) = &self.quant {
@@ -1098,7 +1101,10 @@ impl CudaEncoder {
         a: Operand<'_>,
         weight: &Linear,
         c: &mut C,
-        #[cfg_attr(not(feature = "low-precision"), allow(unused_variables))]
+        #[cfg_attr(
+            not(feature = "low-precision"),
+            expect(unused_variables, reason = "only quantized weights read the scratch")
+        )]
         quant: &mut QuantScratch,
     ) -> Result<(), TranscriptionError> {
         #[cfg(feature = "low-precision")]
