@@ -1109,7 +1109,8 @@ mod tests {
     }
 
     /// A preprocessor error stops the parallel and batched workers, which join and
-    /// return that error rather than finishing the plan
+    /// return that error rather than finishing the plan, and leaves the caller's
+    /// control uncancelled
     #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "needs a CUDA GPU and the native weights; `just gpu-parity` runs it on gpu0"]
@@ -1142,9 +1143,10 @@ mod tests {
             let config = path.config(&base);
             let planned = planned_windows(audio.len(), &config).len();
             let hook = FailingHook(RecordingHook(Arc::new(Mutex::new(Vec::new()))));
+            let control = recording_control(planned);
 
             let error = pipeline
-                .run_with_preprocessor(&audio, &config, &recording_control(planned), &hook)
+                .run_with_preprocessor(&audio, &config, &control, &hook)
                 .expect_err("a preprocessor failure should join every worker");
 
             assert!(
@@ -1160,6 +1162,8 @@ mod tests {
                 observed < planned,
                 "{path:?} preprocessed all {planned} windows after the first error"
             );
+            // stopping the workers must not cancel the caller's control
+            assert_eq!(control.check(), Ok(()), "{path:?} cancelled the caller");
         }
     }
 

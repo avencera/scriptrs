@@ -84,11 +84,18 @@ pub enum TranscriptionControlError {
 }
 
 /// Shared cancellation, deadline, and task-limit state for one transcription
+///
+/// Only [`TranscriptionControl::cancel`] cancels a control. A run that fails
+/// stops its own workers without cancelling the control it was given, so the
+/// same control can start another run after an error
 #[derive(Debug, Clone)]
 pub struct TranscriptionControl {
     deadline: TranscriptionDeadline,
     max_windows: WindowLimit,
     cancelled: Arc<AtomicBool>,
+    // a run's own stop signal, kept apart from `cancelled` so stopping a run's
+    // workers after a failure never cancels the caller's control
+    run_stopped: Arc<AtomicBool>,
 }
 
 impl TranscriptionControl {
@@ -98,6 +105,7 @@ impl TranscriptionControl {
             deadline,
             max_windows,
             cancelled: Arc::new(AtomicBool::new(false)),
+            run_stopped: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -114,9 +122,28 @@ impl TranscriptionControl {
         self.cancelled.store(true, Ordering::Release);
     }
 
+    /// Derive control for one run's workers
+    ///
+    /// The result shares this control's cancellation, deadline and window limit,
+    /// and adds a stop signal of its own for [`Self::stop_run`]
+    pub(crate) fn run_scope(&self) -> Self {
+        Self {
+            run_stopped: Arc::new(AtomicBool::new(false)),
+            ..self.clone()
+        }
+    }
+
+    /// Stop every worker of this run without cancelling the caller's control
+    ///
+    /// Workers see the stop as [`TranscriptionControlError::Cancelled`]; the run
+    /// reports the failure that stopped it instead
+    pub(crate) fn stop_run(&self) {
+        self.run_stopped.store(true, Ordering::Release);
+    }
+
     /// Check cancellation and the absolute deadline
     pub fn check(&self) -> Result<(), TranscriptionControlError> {
-        if self.cancelled.load(Ordering::Acquire) {
+        if self.cancelled.load(Ordering::Acquire) || self.run_stopped.load(Ordering::Acquire) {
             return Err(TranscriptionControlError::Cancelled);
         }
         if self.deadline.is_expired() {
@@ -385,6 +412,43 @@ mod tests {
         clone.cancel();
 
         assert_eq!(control.check(), Err(TranscriptionControlError::Cancelled));
+    }
+
+    /// A run that stops its own workers after a failure leaves the caller's
+    /// control usable for the next run
+    #[test]
+    fn stopping_a_run_leaves_the_caller_control_usable() {
+        let caller = TranscriptionControl::new(
+            TranscriptionDeadline::from_now(Duration::from_secs(1)),
+            WindowLimit::new(1).expect("one is valid"),
+        );
+        let run = caller.run_scope();
+        run.stop_run();
+
+        assert_eq!(run.check(), Err(TranscriptionControlError::Cancelled));
+        assert_eq!(caller.check(), Ok(()));
+        assert_eq!(caller.run_scope().check(), Ok(()));
+    }
+
+    /// A run still stops when its caller cancels or the shared deadline passes
+    #[test]
+    fn run_scope_observes_caller_cancellation_and_deadline() {
+        let caller = TranscriptionControl::new(
+            TranscriptionDeadline::from_now(Duration::from_secs(1)),
+            WindowLimit::new(1).expect("one is valid"),
+        );
+        let run = caller.run_scope();
+        caller.cancel();
+        let expired = TranscriptionControl::new(
+            TranscriptionDeadline::at(Instant::now() - Duration::from_secs(1)),
+            WindowLimit::new(1).expect("one is valid"),
+        );
+
+        assert_eq!(run.check(), Err(TranscriptionControlError::Cancelled));
+        assert_eq!(
+            expired.run_scope().check(),
+            Err(TranscriptionControlError::DeadlineExpired)
+        );
     }
 
     #[test]
