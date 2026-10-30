@@ -312,6 +312,7 @@ fn precision_name(precision: Precision) -> &'static str {
         Precision::Int8 => "int8",
         #[cfg(feature = "low-precision")]
         Precision::Nvfp4 => "nvfp4",
+        _ => "other",
     }
 }
 
