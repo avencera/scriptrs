@@ -196,7 +196,10 @@ impl OverlapChunkConfig {
         raw / SAMPLES_PER_ENCODER_FRAME * SAMPLES_PER_ENCODER_FRAME
     }
 
-    /// Longest window the planner builds, left context included
+    /// Longest overlap window the planner builds, left context included
+    ///
+    /// VAD segments and the single-window path are capped at `max_model_samples`
+    /// on their own
     fn max_window_samples(&self) -> usize {
         self.context_samples + self.chunk_samples()
     }

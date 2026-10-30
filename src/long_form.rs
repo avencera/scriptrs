@@ -700,20 +700,32 @@ mod tests {
         assert!(config.validate_for(&deployment).is_err());
     }
 
-    /// Every deployment's defaults validate, and so do a native bundle's
+    /// Every deployment's defaults validate, and so do a native bundle's, until the
+    /// context leaves no room in a window for one frame of audio
     #[test]
-    fn default_configs_validate() {
+    fn default_configs_validate_until_context_fills_the_window() {
+        let check = |mut config: LongFormConfig, deployment: &ParakeetDeployment| {
+            config
+                .validate_for(deployment)
+                .expect("the defaults should validate");
+
+            let frame = deployment.frontend().samples_per_encoder_frame();
+            let window = config.overlap.max_model_samples;
+            config.overlap.context_samples = (window - frame) / frame * frame;
+            config
+                .validate_for(deployment)
+                .expect("a context leaving room for one frame should validate");
+            config.overlap.context_samples += frame;
+            assert!(config.validate_for(deployment).is_err());
+        };
+
         for deployment in [ParakeetDeployment::v2(), ParakeetDeployment::v3()] {
-            LongFormConfig::from_deployment(&deployment)
-                .validate_for(&deployment)
-                .expect("the deployment defaults should validate");
+            check(LongFormConfig::from_deployment(&deployment), &deployment);
 
             #[cfg(feature = "cuda")]
             {
                 let bundle = crate::models::ModelBundle::from_native_dir("models", deployment);
-                LongFormConfig::for_bundle(&bundle)
-                    .validate_for(bundle.deployment())
-                    .expect("the native defaults should validate");
+                check(LongFormConfig::for_bundle(&bundle), bundle.deployment());
             }
         }
     }
