@@ -28,7 +28,6 @@ use crate::native::weights::WeightFile;
 
 /// A quantized `[out, inputs]` weight on the device
 pub(super) struct QuantLinear {
-    scheme: Scheme,
     out: usize,
     inputs: usize,
     values: CudaSlice<u8>,
@@ -45,12 +44,21 @@ enum DeviceScales {
 
 /// What [`EncoderMath::Quantized`] adds to the encoder
 pub(super) struct QuantState {
-    scheme: Scheme,
     kernels: QuantKernels,
-    /// cuBLASLt products, for FP8 and NVFP4
-    lt: Option<LtGemm>,
-    /// The dequantized FP16 weight of an INT8 product, sized for the largest
-    dequant: Option<Mutex<CudaSlice<u16>>>,
+    backend: QuantBackend,
+}
+
+/// How a scheme's products run
+enum QuantBackend {
+    /// FP8 and NVFP4: each product quantizes its activation for a cuBLASLt product
+    Lt { gemm: LtGemm, format: LtFormat },
+    /// INT8: each product dequantizes its weight to FP16 here, sized for the
+    /// largest, for an FP16 product
+    // one buffer serves every product: each queues its dequantize and its GEMM on
+    // the runtime's one stream, so the next dequantize, from any thread or graph
+    // replay, runs only after the last GEMM read the buffer. The lock only lets the
+    // encoder be shared between threads
+    Dequant(Mutex<CudaSlice<u16>>),
 }
 
 /// One quantized activation at a time: each product quantizes its input here just
@@ -105,11 +113,10 @@ pub(super) fn load_linear(
     let stream = runtime.stream();
     let values = match read_linear(file, name, shape)? {
         StoredLinear::Quantized(weight) => {
-            let EncoderMath::Quantized(scheme) = math else {
+            let EncoderMath::Quantized(_) = math else {
                 return Err(mixed_precision());
             };
-            return QuantLinear::upload(runtime, scheme, &weight, out, inputs)
-                .map(Linear::Quantized);
+            return QuantLinear::upload(runtime, &weight, out, inputs).map(Linear::Quantized);
         }
         StoredLinear::F16(bits) if math == EncoderMath::Fp16 => {
             return Ok(Linear::Fp16(stream.clone_htod(bits.as_ref())?));
@@ -120,7 +127,7 @@ pub(super) fn load_linear(
     match math {
         EncoderMath::Quantized(scheme) => {
             let weight = scheme.weight(&values, out, inputs);
-            QuantLinear::upload(runtime, scheme, &weight, out, inputs).map(Linear::Quantized)
+            QuantLinear::upload(runtime, &weight, out, inputs).map(Linear::Quantized)
         }
         math => Linear::new(
             runtime,
@@ -134,7 +141,6 @@ pub(super) fn load_linear(
 impl QuantLinear {
     fn upload(
         runtime: &CudaRuntime,
-        scheme: Scheme,
         weight: &QuantizedWeight,
         out: usize,
         inputs: usize,
@@ -160,7 +166,6 @@ impl QuantLinear {
             ),
         };
         Ok(Self {
-            scheme,
             out,
             inputs,
             values: stream.clone_htod(values)?,
@@ -204,31 +209,26 @@ impl QuantState {
             )));
         }
 
-        let stream = runtime.stream();
-        let lt = match format(scheme) {
+        let backend = match format(scheme) {
             Some(format) => {
-                let lt = LtGemm::new(runtime)?;
-                if !lt.supports(runtime, format) {
+                let gemm = LtGemm::new(runtime)?;
+                if !gemm.supports(runtime, format) {
                     return Err(TranscriptionError::InvalidConfiguration(format!(
                         "`{}` needs cuBLASLt {format:?} products, which this GPU or cuBLAS \
                          does not run",
                         scheme.name()
                     )));
                 }
-                Some(lt)
+                QuantBackend::Lt { gemm, format }
             }
-            None => None,
-        };
-        let largest = (spec.ff_hidden * spec.d_model).max(3 * spec.d_model * spec.d_model);
-        let dequant = match scheme.weight_only() {
-            true => Some(Mutex::new(zeros(stream, largest)?)),
-            false => None,
+            None => {
+                let largest = (spec.ff_hidden * spec.d_model).max(3 * spec.d_model * spec.d_model);
+                QuantBackend::Dequant(Mutex::new(zeros(runtime.stream(), largest)?))
+            }
         };
         Ok(Some(Self {
-            scheme,
             kernels: QuantKernels::load(runtime)?,
-            lt,
-            dequant,
+            backend,
         }))
     }
 
@@ -241,9 +241,9 @@ impl QuantState {
         rows: usize,
         positions: usize,
     ) -> Result<Option<QuantInputs>, TranscriptionError> {
-        if self.scheme.weight_only() {
+        let QuantBackend::Lt { format, .. } = self.backend else {
             return Ok(None);
-        }
+        };
         let stream = runtime.stream();
         let (d, hidden) = (spec.d_model, spec.ff_hidden);
         // every product's activation: the normed or merged rows, the SiLU output and
@@ -256,11 +256,13 @@ impl QuantState {
                 .max()
                 .unwrap_or(0)
         };
-        let blocks = match self.scheme {
-            Scheme::Nvfp4 => {
+        // FP8 reads no block scales, but keeps a one-byte buffer so every workspace
+        // has the same fields
+        let blocks = match format {
+            LtFormat::Nvfp4 => {
                 largest(&|rows, width| ScaleLayout::new(rows, width, NV_BLOCK).bytes())
             }
-            _ => 1,
+            LtFormat::Fp8 => 1,
         };
         Ok(Some(QuantInputs {
             values: zeros(stream, largest(&|rows, width| rows * width))?,
@@ -289,23 +291,30 @@ impl QuantState {
             )));
         }
         let stream = runtime.stream();
-        if let Some(dequant) = &self.dequant {
-            let mut weight = dequant.lock().map_err(|_| {
-                TranscriptionError::InvalidModelOutput(
-                    "the dequantize lock was poisoned".to_owned(),
-                )
-            })?;
-            let mut weight = weight.slice_mut(..w.out * w.inputs);
-            let DeviceScales::Float(scales) = &w.scales else {
-                return Err(mixed_precision());
-            };
-            self.kernels
-                .dequant_i8(stream, &w.values.slice(..), &scales.slice(..), &mut weight)?;
-            linear_fp16(runtime, spec, a, &weight, c)?;
-            return Ok(());
-        }
-
-        let (Some(lt), Some(quant), Some(format)) = (&self.lt, inputs, format(w.scheme)) else {
+        let (lt, format) = match &self.backend {
+            QuantBackend::Dequant(dequant) => {
+                let mut weight = dequant.lock().map_err(|_| {
+                    TranscriptionError::InvalidModelOutput(
+                        "the dequantize lock was poisoned".to_owned(),
+                    )
+                })?;
+                let mut weight = weight.slice_mut(..w.out * w.inputs);
+                let DeviceScales::Float(scales) = &w.scales else {
+                    return Err(mixed_precision());
+                };
+                self.kernels.dequant_i8(
+                    stream,
+                    &w.values.slice(..),
+                    &scales.slice(..),
+                    &mut weight,
+                )?;
+                linear_fp16(runtime, spec, a, &weight, c)?;
+                return Ok(());
+            }
+            QuantBackend::Lt { gemm, format } => (gemm, *format),
+        };
+        // a workspace of this encoder holds the quantized activations
+        let Some(quant) = inputs else {
             return Err(mixed_precision());
         };
         let (rows, width) = (spec.m, spec.k);
@@ -383,7 +392,7 @@ mod tests {
     use cudakit::{Library, Math, Options};
     use ndarray::{ArrayD, Ix3};
 
-    use super::{DeviceScales, QuantLinear, QuantState};
+    use super::{DeviceScales, QuantBackend, QuantLinear, QuantState};
     use crate::cuda::encoder::tests::time_graph;
     use crate::cuda::encoder::{CudaEncoder, EncoderMath, Linear};
     use crate::cuda::kernels::CudaRuntime;
@@ -606,9 +615,9 @@ mod tests {
                 let weight = file.tensor(tensor, &[out, inputs]).expect("weight");
                 let quantized = scheme.weight(weight, out, inputs);
                 let device =
-                    QuantLinear::upload(&runtime, scheme, &quantized, out, inputs).expect("upload");
+                    QuantLinear::upload(&runtime, &quantized, out, inputs).expect("upload");
                 let mut restored = quantized.dequantize(out, inputs);
-                if scheme.weight_only() {
+                if matches!(quant.backend, QuantBackend::Dequant(_)) {
                     // the dequantize kernel rounds the weight to FP16 for the product
                     for value in &mut restored {
                         *value = f16_value(f16_bits(*value));

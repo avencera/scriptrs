@@ -76,11 +76,6 @@ impl Scheme {
         }
     }
 
-    /// Whether the product reads FP16 activations and a dequantized FP16 weight
-    pub(crate) fn weight_only(self) -> bool {
-        self == Self::Int8
-    }
-
     /// The name of the scheme in a quantized weight file's metadata
     pub(crate) fn name(self) -> &'static str {
         match self {
