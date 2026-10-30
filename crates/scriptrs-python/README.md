@@ -71,9 +71,9 @@ overlapping windows and the transcripts are merged. For recordings that are
 mostly silence or noise, load the pipeline with `vad=True` to split at detected
 speech instead.
 
-To transcribe many short clips, such as utterances, use `transcribe_many`. It
-prepares the next clips while the model runs and, on CUDA, runs up to 16 clips
-in one pass:
+To transcribe many clips, such as utterances, use `transcribe_many`. It
+prepares the next clips while the model runs and, on CUDA, batches the clips'
+windows together, up to 32 in one pass:
 
 ```python
 results = pipeline.transcribe_many([clip_a, clip_b, clip_c])

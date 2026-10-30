@@ -6,7 +6,7 @@
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use pyo3::prelude::*;
-use scriptrs::{ParakeetDeployment, QueueError, TranscriptionError, V3_LANGUAGES};
+use scriptrs::{ParakeetDeployment, TranscriptionError, V3_LANGUAGES};
 
 pyo3::import_exception!(scriptrs._errors, ScriptrsError);
 
@@ -54,17 +54,8 @@ pub(crate) fn transcription_code(error: &TranscriptionError) -> &'static str {
         TranscriptionError::Cuda(_) => "cuda",
         TranscriptionError::CoreMl(_) => "coreml",
         TranscriptionError::Io(_) => "io",
+        TranscriptionError::SchedulerStopped(_) | TranscriptionError::SchedulerFull => "scheduler",
         _ => "transcription",
-    }
-}
-
-pub(crate) fn queue_err(error: QueueError) -> PyErr {
-    match error {
-        QueueError::InvalidConfig(error) => transcription_err(error),
-        QueueError::InvalidMaxBatch | QueueError::InvalidCapacity => {
-            scriptrs_err("configuration", error)
-        }
-        error => scriptrs_err("queue", error),
     }
 }
 

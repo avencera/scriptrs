@@ -84,7 +84,7 @@ print(pipeline.transcribe_file("meeting.mp3").text)
 
 One package carries both models; the model is picked when the pipeline loads,
 and only that model downloads. The wheel includes long-form transcription, VAD,
-the batching queue, and audio file decoding. See the
+the scheduler behind `transcribe_many`, and audio file decoding. See the
 [Python README](crates/scriptrs-python/README.md).
 
 ## Model downloads

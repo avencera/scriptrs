@@ -238,15 +238,17 @@ class Pipeline:
         inputs: Sequence[Samples],
         *,
         language: Optional[str] = None,
-        max_batch: int = 16,
+        max_batch: int = 32,
     ) -> list[TranscriptionResult]:
         """Transcribe many 16 kHz mono clips faster than calling :meth:`transcribe` in a loop.
 
-        Clips up to :attr:`max_chunk_seconds` go through a queue that prepares
-        the next clips while the model runs, and on CUDA runs up to
-        ``max_batch`` (1 to 64) of them in one pass. Longer clips are transcribed
-        one at a time afterwards. Results keep input order. If any clip fails, the
-        whole call raises :class:`ScriptrsError` naming that clip's index.
+        Every clip goes through a scheduler that prepares the next windows while
+        the model runs. On CUDA it encodes up to ``max_batch`` (1 to 64) windows of
+        a similar length in one pass, from any of the clips, short or long, and
+        decodes them together. Each clip is transcribed as :meth:`transcribe`
+        would, though batching can change a rare token. Results keep input order.
+        If any clip fails, the whole call raises :class:`ScriptrsError` naming that
+        clip's index.
         """
         return self._native.transcribe_many(list(inputs), language, max_batch)
 
