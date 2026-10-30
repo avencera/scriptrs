@@ -65,7 +65,11 @@ impl Default for VadSegmentationConfig {
         Self {
             min_speech_duration: 0.15,
             min_silence_duration: 0.75,
-            speech_padding: 0.1,
+            // Silero crosses the threshold up to ~220 ms into a soft onset, so 0.1 s
+            // clipped short first words ("a cold" became "cold"); 0.2 s lowered
+            // long-form WER on every set measured, larger values cost AMI headset
+            // accuracy (README)
+            speech_padding: 0.2,
             silence_threshold_for_split: 0.3,
             negative_threshold: None,
             negative_threshold_offset: 0.15,
@@ -353,6 +357,7 @@ pub(crate) fn plan_region_subsegments(
     }
 
     let min_silence_samples = (config.min_silence_at_max_speech * SAMPLE_RATE as f64) as usize;
+    let speech_pad_samples = (config.speech_padding * SAMPLE_RATE as f64) as usize;
     let silence_threshold = config.silence_threshold_for_split;
     let mut spans = silence_spans(region, region_probabilities, silence_threshold);
     spans.retain(|span| span.end.saturating_sub(span.start) >= min_silence_samples);
@@ -368,11 +373,20 @@ pub(crate) fn plan_region_subsegments(
             .filter(|span| span.start > cursor && span.start < search_end)
             .max_by_key(|span| span.end.saturating_sub(span.start));
         let span = best_span?;
+
+        // pad both sides of the split like region edges, since Silero lags a soft
+        // onset here too; half the gap at most keeps the segments apart, and the
+        // window limit still caps the segment before it
+        let pad = speech_pad_samples.min(span.end.saturating_sub(span.start) / 2);
         segments.push(SampleRange {
             start: cursor,
-            end: span.start,
+            end: (span.start + pad).min(search_end),
         });
-        cursor = span.end;
+        cursor = if span.end >= region.end {
+            region.end
+        } else {
+            span.end - pad
+        };
     }
 
     if cursor < region.end {
@@ -436,7 +450,7 @@ mod tests {
         assert_eq!(vad.default_threshold, 0.5);
         assert_eq!(segmentation.min_speech_duration, 0.15);
         assert_eq!(segmentation.min_silence_duration, 0.75);
-        assert_eq!(segmentation.speech_padding, 0.10);
+        assert_eq!(segmentation.speech_padding, 0.2);
     }
 
     #[cfg(feature = "vad")]
@@ -546,7 +560,7 @@ mod tests {
 
     #[cfg(feature = "vad")]
     #[test]
-    fn speech_padding_is_one_tenth_of_a_second() {
+    fn speech_padding_is_two_tenths_of_a_second() {
         let mut probabilities = vec![0.9; 16];
         probabilities.extend(std::iter::repeat_n(0.1, 25));
         let audio_len = probabilities.len() * VAD_WINDOW_SAMPLES;
@@ -558,7 +572,7 @@ mod tests {
         );
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].start, 0);
-        assert_eq!(regions[0].end, 16 * VAD_WINDOW_SAMPLES + 1_600);
+        assert_eq!(regions[0].end, 16 * VAD_WINDOW_SAMPLES + 3_200);
     }
 
     #[cfg(feature = "vad")]
@@ -578,6 +592,43 @@ mod tests {
         .unwrap();
         assert_eq!(segments.len(), 2);
         assert!(segments[0].end <= 5 * VAD_WINDOW_SAMPLES);
+    }
+
+    #[cfg(feature = "vad")]
+    #[test]
+    fn silence_split_pads_both_sides_of_the_gap() {
+        // speech, a 0.32 s gap, speech: the region is just over the window limit
+        let mut probabilities = vec![0.9; 40];
+        probabilities.extend(std::iter::repeat_n(0.1, 10));
+        probabilities.extend(std::iter::repeat_n(0.9, 40));
+        let region = SampleRange {
+            start: 0,
+            end: probabilities.len() * VAD_WINDOW_SAMPLES,
+        };
+        let max_chunk_samples = region.end - VAD_WINDOW_SAMPLES;
+        let config = VadSegmentationConfig::default();
+
+        let segments =
+            plan_region_subsegments(region, &probabilities, &config, max_chunk_samples).unwrap();
+
+        // half the 5_120-sample gap caps the 3_200-sample padding
+        let gap = SampleRange {
+            start: 40 * VAD_WINDOW_SAMPLES,
+            end: 50 * VAD_WINDOW_SAMPLES,
+        };
+        assert_eq!(
+            segments,
+            vec![
+                SampleRange {
+                    start: 0,
+                    end: gap.start + 2_560,
+                },
+                SampleRange {
+                    start: gap.end - 2_560,
+                    end: region.end,
+                },
+            ]
+        );
     }
 
     #[cfg(feature = "vad")]

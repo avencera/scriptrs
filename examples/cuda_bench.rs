@@ -23,7 +23,8 @@
 //! as do `--fp8`, `--int8` and `--nvfp4` with the `low-precision` feature,
 //! and `--vad` (with the `vad` feature) plans long recordings from Silero speech
 //! regions instead of overlap windows over the whole recording, at
-//! `--vad-threshold <p>` if given
+//! `--vad-threshold <p>` and with `--vad-padding <seconds>` around each region if
+//! given
 //!
 //! ```sh
 //! cargo run --release --features cuda,long-form --example cuda_bench -- \
@@ -63,6 +64,7 @@ struct Args {
     precision: Precision,
     vad: bool,
     vad_threshold: Option<f32>,
+    vad_padding: Option<f64>,
     queue: bool,
 }
 
@@ -105,6 +107,7 @@ fn run() -> Result<()> {
         "long": !args.long.is_empty(),
         "vad": args.vad,
         "vad_threshold": args.vad_threshold,
+        "vad_padding": args.vad_padding,
         "queue": args.queue,
         "n_utts": texts.len(),
         "audio_s": audio_s,
@@ -245,6 +248,9 @@ fn bench_long(bundle: ModelBundle, paths: &[PathBuf], args: &Args) -> Result<Ben
         if let Some(threshold) = args.vad_threshold {
             config.vad.default_threshold = threshold;
         }
+        if let Some(padding) = args.vad_padding {
+            config.segmentation.speech_padding = padding;
+        }
     }
     let pipeline = LongFormTranscriptionPipeline::from_bundle(bundle)?;
     let recordings = long_recordings(paths)?;
@@ -329,6 +335,7 @@ fn parse_args() -> Result<Args> {
     let mut precision = Precision::default();
     let mut vad = false;
     let mut vad_threshold = None;
+    let mut vad_padding = None;
     let mut queue = false;
     let mut args = env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -366,6 +373,7 @@ fn parse_args() -> Result<Args> {
             "--vad" if cfg!(feature = "vad") => vad = true,
             "--vad" => return Err(eyre!("--vad needs the `vad` feature")),
             "--vad-threshold" => vad_threshold = Some(value()?.parse()?),
+            "--vad-padding" => vad_padding = Some(value()?.parse()?),
             "--queue" => queue = true,
             other => return Err(eyre!("unknown argument {other}")),
         }
@@ -376,6 +384,9 @@ fn parse_args() -> Result<Args> {
     }
     if vad_threshold.is_some() && !vad {
         return Err(eyre!("--vad-threshold needs --vad"));
+    }
+    if vad_padding.is_some() && !vad {
+        return Err(eyre!("--vad-padding needs --vad"));
     }
 
     Ok(Args {
@@ -392,6 +403,7 @@ fn parse_args() -> Result<Args> {
         precision,
         vad,
         vad_threshold,
+        vad_padding,
         queue,
     })
 }
