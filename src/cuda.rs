@@ -8,6 +8,7 @@ pub(crate) mod encoder;
 pub(crate) mod fp16;
 pub(crate) mod kernels;
 pub(crate) mod model;
+pub(crate) mod streaming;
 #[cfg(test)]
 pub(crate) mod test_support;
 
