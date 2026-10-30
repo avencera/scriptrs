@@ -2,7 +2,7 @@
 name = "scriptrs"
 version = "0.4.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.96"
 exclude = ["fixtures/", "dev-tools/", "crates/"]
 authors = ["Praveen Perera"]
 description = "Fast NVIDIA Parakeet TDT v2 and v3 speech-to-text in Rust, on Core ML (macOS) and native CUDA (Linux)"
