@@ -104,7 +104,8 @@ pub(crate) struct StreamingSpec {
     pub frontend: FrontendConfig,
     pub encoder: EncoderSpec,
     pub transducer: TransducerSpec,
-    /// Encoder frames of left context each layer caches
+    /// Encoder frames of left context each layer caches, a nonzero multiple of
+    /// every chunk length
     pub left_context: usize,
     /// Lookaheads (right contexts) the model was trained with, in encoder frames
     pub lookaheads: Vec<usize>,
@@ -294,10 +295,12 @@ impl StreamingSpec {
                 ));
             }
             // chunked_limited attention sees whole chunks of `lookahead + 1` frames
-            // to its left, so the cache is a whole number of chunks
-            if left % chunk != 0 {
+            // to its left, so the cache is a whole number of chunks, and at least
+            // one: the cache is a ring indexed modulo its length
+            if left == 0 || left % chunk != 0 {
                 return Err(invalid(format!(
-                    "left context {left} is not a whole number of {chunk}-frame chunks"
+                    "left context {left} is not a whole, nonzero number of \
+                     {chunk}-frame chunks"
                 )));
             }
             lookaheads.push(lookahead);
@@ -807,6 +810,7 @@ mod tests {
             ("encoder", "att_context_style", json!("regular")),
             ("encoder", "att_context_size", json!([[56, 3], [70, 13]])),
             ("encoder", "att_context_size", json!([[56, 4]])),
+            ("encoder", "att_context_size", json!([[0, 3]])),
             ("encoder", "att_context_size", json!([[-1, -1]])),
             ("encoder", "att_context_size", json!([])),
             ("encoder", "att_context_size", json!([[70, u64::MAX]])),
