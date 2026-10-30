@@ -19,7 +19,7 @@ use crate::backend::{ChunkDecode, DecodePolicy, EncoderChunk, LanguageMask};
 use crate::cuda::decoder::{CudaDecoder, DecodeWorkspace};
 use crate::cuda::encoder::{CudaEncoder, EncoderWorkspace};
 use crate::cuda::kernels::CudaRuntime;
-use crate::cuda::math;
+use crate::cuda::{math, replay_or_capture};
 use crate::deployment::ParakeetDeployment;
 use crate::error::TranscriptionError;
 use crate::models::Precision;
@@ -28,10 +28,6 @@ use crate::native::weights::WeightFile;
 /// Mel frames a batch is padded up to a multiple of: 0.64 s, so padding costs a
 /// 10 s utterance at most 6 % more encoder work
 const MEL_BUCKET: usize = 64;
-
-/// Decode steps per replay of the decode graph, between host checks of the frame
-/// cursors
-pub(crate) const STEPS_PER_CHECK: usize = 16;
 
 /// Cached shapes may hold up to this fraction (1 / divisor) of the device memory
 /// free once the weights are loaded; the rest stays free for other work on the same
@@ -309,22 +305,15 @@ impl Engine {
                     padding.fill(0.0);
                 }
             })?;
-        match &shape.encoder_graph {
-            Some(graph) => graph.launch()?,
-            None => {
-                self.encoder.enqueue(runtime, &mut shape.encoder)?;
-                let encoder_ws = &mut shape.encoder;
-                let _exclusive = exclusive_device_work();
-                // SAFETY: the graph is stored in the same `Shape` as the workspace it
-                // records, ahead of it, so it drops first; the workspace's buffers are
-                // never reallocated, and every launch is on the runtime's stream. The
-                // closure returns errors instead of panicking
-                let graph = unsafe {
-                    runtime.capture_nonempty(|| self.encoder.enqueue(runtime, encoder_ws))
-                }?;
-                shape.encoder_graph = Some(graph);
-            }
-        }
+        // SAFETY: the graph is stored in the same `Shape` as the workspace it records,
+        // ahead of it, so it drops first; the workspace's buffers are never
+        // reallocated, and every launch is on the runtime's stream. The encoder
+        // returns errors instead of panicking
+        unsafe {
+            replay_or_capture(runtime, &mut shape.encoder_graph, || {
+                self.encoder.enqueue(runtime, &mut shape.encoder)
+            })
+        }?;
 
         // written outside capture, so the decode graph reads this call's filter
         self.decoder
@@ -335,28 +324,11 @@ impl Engine {
             shape.encoder.output(),
             shape.encoder.output_lens(),
         )?;
-        match &shape.decode_graph {
-            Some(graph) => {
-                self.decoder
-                    .run_with(runtime, &mut shape.decoder, STEPS_PER_CHECK, |_| {
-                        Ok(graph.launch()?)
-                    })?
-            }
-            None => {
-                self.decoder
-                    .run(runtime, &mut shape.decoder, STEPS_PER_CHECK)?;
-                let decoder_ws = &mut shape.decoder;
-                let _exclusive = exclusive_device_work();
-                // SAFETY: as for the encoder graph above
-                let graph = unsafe {
-                    runtime.capture_nonempty(|| {
-                        (0..STEPS_PER_CHECK)
-                            .try_for_each(|_| self.decoder.step(runtime, decoder_ws))
-                    })
-                }?;
-                shape.decode_graph = Some(graph);
-            }
-        }
+        // SAFETY: as for the encoder graph above
+        unsafe {
+            self.decoder
+                .run_graphed(runtime, &mut shape.decoder, &mut shape.decode_graph)
+        }?;
 
         Ok(self
             .decoder

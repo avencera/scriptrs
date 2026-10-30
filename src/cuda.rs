@@ -24,10 +24,11 @@ use cudakit::cudarc::driver::sys::CU_MEMHOSTALLOC_WRITECOMBINED;
 use cudakit::cudarc::driver::{
     CudaEvent, CudaSlice, CudaStream, DeviceRepr, PinnedHostSlice, ValidAsZeroBits,
 };
-use cudakit::{DeviceTensor, Error, Math, Sgemm};
+use cudakit::{DeviceTensor, Error, Graph, Math, Sgemm};
 
 use crate::cuda::encoder::EncoderMath;
 use crate::cuda::kernels::CudaRuntime;
+use crate::cuda::model::exclusive_device_work;
 #[cfg(feature = "low-precision")]
 use crate::cuda::quant::Scheme;
 use crate::error::TranscriptionError;
@@ -150,6 +151,46 @@ impl<T> Drop for HostStaging<T> {
         // a copy still queued would read or write the memory freed next
         let _ = self.done.synchronize();
     }
+}
+
+/// Captures `enqueue` into a CUDA graph, apart from every other engine's loads,
+/// captures and teardown
+///
+/// # Safety
+///
+/// [`cudakit::Runtime::capture`]'s contract: every buffer `enqueue` touches must
+/// stay allocated and in place for as long as the graph exists, and be used only on
+/// the runtime's stream. `enqueue` must return errors rather than panic, since a
+/// panic leaves the stream capturing
+pub(crate) unsafe fn capture(
+    runtime: &CudaRuntime,
+    enqueue: impl FnOnce() -> Result<(), TranscriptionError>,
+) -> Result<Graph, TranscriptionError> {
+    let _exclusive = exclusive_device_work();
+    // SAFETY: the caller upholds the contract for `enqueue`
+    unsafe { runtime.capture_nonempty(enqueue) }
+}
+
+/// Launches `graph`, or the first time runs `enqueue` eagerly, which also finishes
+/// cuBLAS's lazy setup, then captures it into `graph` for later calls
+///
+/// # Safety
+///
+/// [`capture`]'s contract for `enqueue`, kept for as long as `graph` holds the graph
+pub(crate) unsafe fn replay_or_capture(
+    runtime: &CudaRuntime,
+    graph: &mut Option<Graph>,
+    mut enqueue: impl FnMut() -> Result<(), TranscriptionError>,
+) -> Result<(), TranscriptionError> {
+    match graph {
+        Some(captured) => captured.launch()?,
+        None => {
+            enqueue()?;
+            // SAFETY: the caller upholds the contract for `enqueue` and `graph`
+            *graph = Some(unsafe { capture(runtime, enqueue) }?);
+        }
+    }
+    Ok(())
 }
 
 /// The encoder GEMM precision of a model precision

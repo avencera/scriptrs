@@ -7,18 +7,22 @@
 //! between replays to see whether every row has reached its last frame
 
 use cudakit::cudarc::driver::CudaSlice;
-use cudakit::{DeviceTensor, Math};
+use cudakit::{DeviceTensor, Graph, Math};
 
 use crate::backend::LanguageMask;
 use crate::cuda::kernels::{
     CudaRuntime, DecodeFilter, DecodeKernels, DecodeOutput, DecodeShape, DecodeState,
     EncoderKernels, LstmInput, LstmState, LstmWeights, MAX_FILTER_TOP_K, Projection, StreamKernels,
 };
-use crate::cuda::{Direction, HostStaging, linear, upload, upload_host, zeros};
+use crate::cuda::{Direction, HostStaging, capture, linear, upload, upload_host, zeros};
 use crate::decode::{RawToken, RawTranscription};
 use crate::error::TranscriptionError;
 use crate::native::spec::TransducerSpec;
 use crate::native::weights::WeightFile;
+
+/// Decode steps per replay of the decode graph, between host checks of the frame
+/// cursors
+pub(crate) const STEPS_PER_CHECK: usize = 16;
 
 /// A PyTorch `Linear` with bias
 struct Linear {
@@ -716,8 +720,43 @@ impl CudaDecoder {
         Ok(self.steps_left(&ws.host_lens, frames.iter().map(|frame| *frame as usize)))
     }
 
+    /// Runs every row to its end like [`Self::run`], replaying `graph`, a capture of
+    /// [`STEPS_PER_CHECK`] steps; the first time, with `graph` empty, it runs the
+    /// steps eagerly, which also finishes cuBLAS's lazy setup, then captures them
+    ///
+    /// # Safety
+    ///
+    /// `graph` must drop before `ws`, whose buffers it records, and `ws` must stay
+    /// on the runtime's stream without its buffers being reallocated while `graph`
+    /// holds the graph, as [`capture`] requires
+    pub(crate) unsafe fn run_graphed(
+        &self,
+        runtime: &CudaRuntime,
+        ws: &mut DecodeWorkspace,
+        graph: &mut Option<Graph>,
+    ) -> Result<(), TranscriptionError> {
+        match graph {
+            Some(captured) => {
+                self.run_with(runtime, ws, STEPS_PER_CHECK, |_| Ok(captured.launch()?))
+            }
+            None => {
+                self.run(runtime, ws, STEPS_PER_CHECK)?;
+                // SAFETY: the caller upholds the contract for `ws` and `graph`, and the
+                // steps launch only on the runtime's stream and return errors instead of
+                // panicking
+                let captured = unsafe {
+                    capture(runtime, || {
+                        (0..STEPS_PER_CHECK).try_for_each(|_| self.step(runtime, ws))
+                    })
+                }?;
+                *graph = Some(captured);
+                Ok(())
+            }
+        }
+    }
+
     /// Runs steps eagerly, `steps_per_check` at a time, until every row finishes
-    pub(crate) fn run(
+    fn run(
         &self,
         runtime: &CudaRuntime,
         ws: &mut DecodeWorkspace,
@@ -735,7 +774,7 @@ impl CudaDecoder {
     /// still needs ([`Self::steps_left`]), so the GPU runs them back to back and
     /// only waits on the host when the decode may be done. A row that finishes
     /// early idles through the rest, as it would on any batch
-    pub(crate) fn run_with(
+    fn run_with(
         &self,
         runtime: &CudaRuntime,
         ws: &mut DecodeWorkspace,
@@ -826,7 +865,7 @@ mod tests {
     use cudakit::{Library, Math, Options};
     use ndarray::Ix3;
 
-    use super::{CudaDecoder, DecodeWorkspace};
+    use super::{CudaDecoder, DecodeWorkspace, STEPS_PER_CHECK};
     use crate::backend::{DecodePolicy, LanguageMask, decide_from_logits};
     use crate::cuda::encoder::{CudaEncoder, EncoderMath};
     use crate::cuda::kernels::CudaRuntime;
@@ -836,9 +875,6 @@ mod tests {
     use crate::language::{LanguageSelection, ParakeetLanguage};
     use crate::models::ModelBundle;
     use crate::test_support::{NemoReference, deployment};
-
-    /// Steps per host check of the frame cursors
-    const STEPS_PER_CHECK: usize = 16;
 
     const SETS: [&str; 3] = ["b1", "b8", "long-full"];
 
