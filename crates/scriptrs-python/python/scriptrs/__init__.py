@@ -15,7 +15,6 @@ running while a call is in progress.
 
 from __future__ import annotations
 
-import os
 from enum import Enum
 from importlib import metadata
 from os import PathLike
@@ -109,25 +108,6 @@ def _precision(precision: str) -> str:
     return precision
 
 
-def _cache_dir(cache_dir: Optional[StrPath]) -> Optional[Path]:
-    """The hub cache to download into, or ``None`` for the scriptrs default.
-
-    The Rust downloader always uses ``~/.cache/huggingface/hub``, so the
-    variables Python users set for ``huggingface_hub`` are read here, and a model
-    they already downloaded is not fetched twice.
-    """
-    if cache_dir is not None:
-        return Path(cache_dir)
-    # without a cache dir, the downloader honors SCRIPTRS_MODELS_DIR, which wins
-    if os.environ.get("SCRIPTRS_MODELS_DIR"):
-        return None
-    if hub_cache := os.environ.get("HF_HUB_CACHE"):
-        return Path(hub_cache)
-    if hf_home := os.environ.get("HF_HOME"):
-        return Path(hf_home) / "hub"
-    return None
-
-
 class Pipeline:
     """A loaded Parakeet model.
 
@@ -167,7 +147,8 @@ class Pipeline:
         model = _model(model)
         precision = _precision(precision)
         _cuda.prepare()
-        return cls(_native._from_pretrained(model.value, vad, precision, _cache_dir(cache_dir)))
+        cache = None if cache_dir is None else Path(cache_dir)
+        return cls(_native._from_pretrained(model.value, vad, precision, cache))
 
     @classmethod
     def from_dir(
