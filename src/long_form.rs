@@ -6,7 +6,7 @@ pub(crate) mod vad;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, sync_channel};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Condvar, Mutex, PoisonError};
 use std::thread;
 
 use crate::config::TranscriptionConfig;
@@ -260,12 +260,18 @@ impl LongFormTranscriptionPipeline {
         }
         validate_finite_samples(audio, 0)?;
 
+        let request = RunRequest {
+            audio,
+            config,
+            control,
+            preprocessor,
+        };
         if audio.len() <= config.transcription.max_audio_samples {
             control.check_plan(1)?;
-            return self.run_single_task(audio, config, control, preprocessor);
+            return self.run_single_task(request);
         }
 
-        self.run_long_form(audio, config, control, preprocessor)
+        self.run_long_form(request)
     }
 
     /// Run the inner single-chunk pipeline directly
@@ -287,8 +293,13 @@ impl LongFormTranscriptionPipeline {
         }
         validate_finite_samples(audio, 0)?;
         control.check_plan(1).map_err(TranscriptionError::from)?;
-        self.run_single_task(audio, config, &control, &IdentityPreprocessor)
-            .map_err(identity_error)
+        self.run_single_task(RunRequest {
+            audio,
+            config,
+            control: &control,
+            preprocessor: &IdentityPreprocessor,
+        })
+        .map_err(identity_error)
     }
 
     /// Return the single-chunk pipeline this pipeline wraps
@@ -306,26 +317,26 @@ impl LongFormTranscriptionPipeline {
 
     fn run_long_form<P: WindowPreprocessor + ?Sized>(
         &self,
-        audio: &[f32],
-        config: &LongFormConfig,
-        control: &TranscriptionControl,
-        preprocessor: &P,
+        request: RunRequest<'_, P>,
     ) -> Result<TranscriptionResult, PreprocessedTranscriptionError<P::Error>> {
-        match config.mode {
-            LongFormMode::Fast => self.run_fast_long_form(audio, config, control, preprocessor),
+        match request.config.mode {
+            LongFormMode::Fast => self.run_fast_long_form(request),
             #[cfg(feature = "vad")]
-            LongFormMode::Vad => self.run_vad_long_form(audio, config, control, preprocessor),
+            LongFormMode::Vad => self.run_vad_long_form(request),
         }
     }
 
     #[cfg(feature = "vad")]
     fn run_vad_long_form<P: WindowPreprocessor + ?Sized>(
         &self,
-        audio: &[f32],
-        config: &LongFormConfig,
-        control: &TranscriptionControl,
-        preprocessor: &P,
+        request: RunRequest<'_, P>,
     ) -> Result<TranscriptionResult, PreprocessedTranscriptionError<P::Error>> {
+        let RunRequest {
+            audio,
+            config,
+            control,
+            ..
+        } = request;
         control.check()?;
         let vad = self
             .vad
@@ -342,373 +353,75 @@ impl LongFormTranscriptionPipeline {
             config.segmentation.threshold(config.vad.default_threshold),
             &config.segmentation,
         );
-        let execution_plan = self.build_execution_plan(&regions, &probabilities, config);
+        let execution_plan = build_vad_execution_plan(&regions, &probabilities, config);
         control.check_plan(execution_plan.tasks.len())?;
-        self.execute_plan(audio, execution_plan, config, control, preprocessor)
+        self.run_plan(request, execution_plan)
     }
 
     fn run_fast_long_form<P: WindowPreprocessor + ?Sized>(
         &self,
-        audio: &[f32],
-        config: &LongFormConfig,
-        control: &TranscriptionControl,
-        preprocessor: &P,
+        request: RunRequest<'_, P>,
     ) -> Result<TranscriptionResult, PreprocessedTranscriptionError<P::Error>> {
-        control.check()?;
-        let execution_plan = Self::build_fast_execution_plan(audio.len(), config);
-        control.check_plan(execution_plan.tasks.len())?;
-        self.execute_plan(audio, execution_plan, config, control, preprocessor)
+        request.control.check()?;
+        let execution_plan = build_fast_execution_plan(request.audio.len(), request.config);
+        request.control.check_plan(execution_plan.tasks.len())?;
+        self.run_plan(request, execution_plan)
     }
 
     fn run_single_task<P: WindowPreprocessor + ?Sized>(
         &self,
-        audio: &[f32],
-        config: &LongFormConfig,
-        control: &TranscriptionControl,
-        preprocessor: &P,
+        request: RunRequest<'_, P>,
     ) -> Result<TranscriptionResult, PreprocessedTranscriptionError<P::Error>> {
+        let audio_len = request.audio.len();
         let task = ChunkTask {
             audio_start: 0,
-            audio_end: audio.len(),
+            audio_end: audio_len,
             global_sample_offset: 0,
             context_samples: 0,
-            #[cfg(feature = "vad")]
-            kind: ChunkTaskKind::Segment {
-                sample_offset: 0,
-                duration_samples: audio.len(),
-            },
         };
-        let preparer = TranscriptionPipeline::chunk_preparer(&config.transcription);
-        let context = TaskContext {
-            pipeline: &self.inner,
-            preparer: &preparer,
-            preparation: PreparationContext {
-                audio,
-                control,
-                preprocessor,
-            },
-            language: config.transcription.language,
-        };
-        let raw = transcribe_task(&context, &task, WindowIndex::new(0))?;
-        control.check()?;
-
-        Ok(self.inner.decode_raw(&raw, duration_seconds(audio.len())))
-    }
-
-    fn execute_plan<P: WindowPreprocessor + ?Sized>(
-        &self,
-        audio: &[f32],
-        execution_plan: LongFormExecutionPlan,
-        config: &LongFormConfig,
-        control: &TranscriptionControl,
-        preprocessor: &P,
-    ) -> Result<TranscriptionResult, PreprocessedTranscriptionError<P::Error>> {
-        control.check()?;
-        if execution_plan.tasks.is_empty() {
-            return Ok(TranscriptionResult::empty(duration_seconds(audio.len())));
-        }
-        // a host-loop backend runs a batch one window at a time with no control
-        // checks between them, so it stays on the per-window paths
-        if config.batch_size > 1 && self.inner.batches_on_device() {
-            return self.run_batched_plan(audio, execution_plan, config, control, preprocessor);
-        }
-        let worker_count = parallel_worker_count(execution_plan.tasks.len(), config.worker_count);
-        if worker_count <= 1 {
-            return self.run_serial_plan(audio, execution_plan, config, control, preprocessor);
-        }
-
-        self.run_parallel_regions(
-            audio,
-            execution_plan,
-            config,
-            worker_count,
-            control,
-            preprocessor,
-        )
-    }
-
-    fn run_serial_plan<P: WindowPreprocessor + ?Sized>(
-        &self,
-        audio: &[f32],
-        execution_plan: LongFormExecutionPlan,
-        config: &LongFormConfig,
-        control: &TranscriptionControl,
-        preprocessor: &P,
-    ) -> Result<TranscriptionResult, PreprocessedTranscriptionError<P::Error>> {
-        let LongFormExecutionPlan { tasks, regions } = execution_plan;
-        let preparer = TranscriptionPipeline::chunk_preparer(&config.transcription);
-        let context = TaskContext {
-            pipeline: &self.inner,
-            preparer: &preparer,
-            preparation: PreparationContext {
-                audio,
-                control,
-                preprocessor,
-            },
-            language: config.transcription.language,
-        };
-        let mut raw_tasks = vec![None; tasks.len()];
-        for (task_idx, task) in tasks.iter().enumerate() {
-            context.preparation.control.check()?;
-            raw_tasks[task_idx] =
-                Some(transcribe_task(&context, task, WindowIndex::new(task_idx))?);
-        }
-        control.check()?;
-        Ok(self.build_parallel_result(audio.len(), &tasks, regions, raw_tasks)?)
-    }
-
-    /// Runs the plan's windows `batch_size` at a time through the pipeline's model
-    ///
-    /// `worker_count` threads prepare windows on the CPU ahead of the model, so the
-    /// next batch is ready while the model runs the current one; on a 1 h recording
-    /// preparation was 30 % of the wall time when it ran in between, and the first
-    /// batch still waits on it. Workers stay at most one batch ahead of the model,
-    /// which bounds the prepared windows held in memory
-    fn run_batched_plan<P: WindowPreprocessor + ?Sized>(
-        &self,
-        audio: &[f32],
-        execution_plan: LongFormExecutionPlan,
-        config: &LongFormConfig,
-        control: &TranscriptionControl,
-        preprocessor: &P,
-    ) -> Result<TranscriptionResult, PreprocessedTranscriptionError<P::Error>> {
-        let LongFormExecutionPlan { tasks, regions } = execution_plan;
-        let batch_size = config.batch_size;
-        let worker_count = parallel_worker_count(tasks.len(), config.worker_count);
-        let next_task = AtomicUsize::new(0);
-        let lookahead = Lookahead::new(batch_size);
-
-        let raw_tasks = thread::scope(
-            |scope| -> Result<Vec<_>, PreprocessedTranscriptionError<P::Error>> {
-                let (sender, receiver) = sync_channel(batch_size);
-                for _ in 0..worker_count {
-                    let sender = sender.clone();
-                    let (next_task, lookahead, tasks) = (&next_task, &lookahead, &tasks);
-                    scope.spawn(move || {
-                        // a panicking worker closes the gate, so the others stop and
-                        // drop their senders, the model side sees the channel close,
-                        // and the scope's join raises the panic instead of hanging
-                        let _stop_on_panic = StopOnPanic(lookahead);
-                        let preparer = TranscriptionPipeline::chunk_preparer(&config.transcription);
-                        let preparation = PreparationContext {
-                            audio,
-                            control,
-                            preprocessor,
-                        };
-                        loop {
-                            let task_idx = next_task.fetch_add(1, Ordering::Relaxed);
-                            let Some(task) = tasks.get(task_idx) else {
-                                break;
-                            };
-                            if !lookahead.wait_for(task_idx) {
-                                break;
-                            }
-                            let window = prepare_window(&preparation, &preparer, task, task_idx);
-                            let failed = window.is_err();
-                            // a closed channel means the model side has stopped
-                            if sender.send((task_idx, window)).is_err() || failed {
-                                break;
-                            }
-                        }
-                    });
-                }
-                drop(sender);
-                // a panic in the model call unwinds past the cleanup below, and the
-                // scope would then wait on workers parked at the gate
-                let _stop_on_panic = StopOnPanic(&lookahead);
-
-                // windows arrive in any order; batches are cut in plan order, and an
-                // error surfaces when its window is reached, as on the serial path
-                let consume = || -> Result<Vec<_>, PreprocessedTranscriptionError<P::Error>> {
-                    let mut ready = BTreeMap::new();
-                    let mut raw_tasks = Vec::with_capacity(tasks.len());
-                    for batch_start in (0..tasks.len()).step_by(batch_size) {
-                        let batch_end = (batch_start + batch_size).min(tasks.len());
-                        let mut windows = Vec::with_capacity(batch_end - batch_start);
-                        for task_idx in batch_start..batch_end {
-                            while !ready.contains_key(&task_idx) {
-                                let (done_idx, window) = receiver.recv().map_err(|_| {
-                                    TranscriptionError::InvalidModelOutput(format!(
-                                        "long-form window {task_idx} was never prepared"
-                                    ))
-                                })?;
-                                ready.insert(done_idx, window);
-                            }
-                            if let Some(window) = ready.remove(&task_idx) {
-                                windows.push(window?);
-                            }
-                        }
-                        // the next batch prepares while this one runs
-                        lookahead.allow(batch_end + batch_size);
-
-                        control.check()?;
-                        let raws = self
-                            .inner
-                            .transcribe_prepared_batch(&windows, config.transcription.language)?;
-                        raw_tasks.extend(raws.into_iter().map(Some));
-                        control.check()?;
-                    }
-                    Ok(raw_tasks)
-                };
-                let result = consume();
-
-                // the scope joins the workers next: stop them rather than wait for
-                // windows nobody will read, as the parallel path does after an error
-                if let Err(error) = &result
-                    && should_cancel_after_error(error)
-                {
-                    control.cancel();
-                }
-                lookahead.stop();
-                drop(receiver);
-                result
-            },
+        let raw = transcribe_task(
+            &request.task_context(&self.inner),
+            &task,
+            WindowIndex::new(0),
         )?;
+        request.control.check()?;
 
-        Ok(self.build_parallel_result(audio.len(), &tasks, regions, raw_tasks)?)
+        Ok(self.inner.decode_raw(&raw, duration_seconds(audio_len)))
     }
 
-    fn run_parallel_regions<P: WindowPreprocessor + ?Sized>(
+    /// Runs every window of the plan, then decodes and merges them in plan order
+    fn run_plan<P: WindowPreprocessor + ?Sized>(
         &self,
-        audio: &[f32],
+        request: RunRequest<'_, P>,
         execution_plan: LongFormExecutionPlan,
-        config: &LongFormConfig,
-        worker_count: usize,
-        control: &TranscriptionControl,
-        preprocessor: &P,
     ) -> Result<TranscriptionResult, PreprocessedTranscriptionError<P::Error>> {
-        let LongFormExecutionPlan { tasks, regions } = execution_plan;
-        let queue_capacity = (worker_count * 2).max(1);
+        request.control.check()?;
+        let audio_len = request.audio.len();
+        if execution_plan.tasks.is_empty() {
+            return Ok(TranscriptionResult::empty(duration_seconds(audio_len)));
+        }
 
-        thread::scope(
-            |scope| -> Result<TranscriptionResult, PreprocessedTranscriptionError<P::Error>> {
-                let next_task = Arc::new(AtomicUsize::new(0));
-                let (sender, receiver) = sync_channel::<
-                    Result<CompletedTask, PreprocessedTranscriptionError<P::Error>>,
-                >(queue_capacity);
-
-                for _ in 0..worker_count {
-                    let sender = sender.clone();
-                    let next_task = Arc::clone(&next_task);
-                    let tasks = &tasks;
-                    let bundle = self.inner.bundle().clone();
-                    let transcription = &config.transcription;
-                    let control = control.clone();
-                    scope.spawn(move || {
-                        let pipeline = match TranscriptionPipeline::from_bundle(bundle.clone()) {
-                            Ok(pipeline) => pipeline,
-                            Err(error) => {
-                                control.cancel();
-                                let _ =
-                                    sender.send(Err(PreprocessedTranscriptionError::from(error)));
-                                return;
-                            }
-                        };
-                        let preparer = TranscriptionPipeline::chunk_preparer(transcription);
-                        let context = TaskContext {
-                            pipeline: &pipeline,
-                            preparer: &preparer,
-                            preparation: PreparationContext {
-                                audio,
-                                control: &control,
-                                preprocessor,
-                            },
-                            language: transcription.language,
-                        };
-                        loop {
-                            let task_idx = next_task.fetch_add(1, Ordering::Relaxed);
-                            if task_idx >= tasks.len() {
-                                break;
-                            }
-
-                            if control.check().is_err() {
-                                break;
-                            }
-                            let result = transcribe_task(
-                                &context,
-                                &tasks[task_idx],
-                                WindowIndex::new(task_idx),
-                            )
-                            .map(|raw| CompletedTask { task_idx, raw });
-                            if let Err(error) = &result
-                                && should_cancel_after_error(error)
-                            {
-                                control.cancel();
-                            }
-                            if sender.send(result).is_err() {
-                                break;
-                            }
-                        }
-                    });
-                }
-                drop(sender);
-
-                self.consume_prepared_tasks(audio.len(), &tasks, regions, receiver, control)
-            },
-        )
+        let raw_tasks = execute_plan(&self.inner, request, &execution_plan.tasks)?;
+        Ok(self.build_plan_result(audio_len, execution_plan, raw_tasks)?)
     }
 
-    fn consume_prepared_tasks<E>(
+    fn build_plan_result(
         &self,
         audio_len: usize,
-        tasks: &[ChunkTask],
-        regions: Vec<RegionTask>,
-        receiver: Receiver<Result<CompletedTask, PreprocessedTranscriptionError<E>>>,
-        control: &TranscriptionControl,
-    ) -> Result<TranscriptionResult, PreprocessedTranscriptionError<E>>
-    where
-        E: std::error::Error + Send + Sync + 'static,
-    {
-        let mut raw_tasks = vec![None; tasks.len()];
-        let mut pending = BTreeMap::new();
-        let mut first_error = None;
-
-        while let Ok(message) = receiver.recv() {
-            match message {
-                Ok(completed) => {
-                    pending.insert(completed.task_idx, completed.raw);
-                }
-                Err(error) => remember_parallel_error(&mut first_error, error),
-            }
-        }
-
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-
-        for (task_idx, raw) in pending {
-            raw_tasks[task_idx] = Some(raw);
-        }
-        if raw_tasks.iter().any(Option::is_none) {
-            control.check()?;
-            return Err(TranscriptionError::CoreMl(
-                "parallel chunk preparation stopped before all tasks completed".to_owned(),
-            )
-            .into());
-        }
-
-        control.check()?;
-        Ok(self.build_parallel_result(audio_len, tasks, regions, raw_tasks)?)
-    }
-
-    fn build_parallel_result(
-        &self,
-        audio_len: usize,
-        tasks: &[ChunkTask],
-        regions: Vec<RegionTask>,
+        execution_plan: LongFormExecutionPlan,
         mut raw_tasks: Vec<Option<RawTranscription>>,
     ) -> Result<TranscriptionResult, TranscriptionError> {
-        #[cfg(not(feature = "vad"))]
-        let _ = tasks;
         let mut tokens = Vec::new();
         let mut chunks = Vec::new();
 
-        for region in regions {
+        for region in execution_plan.regions {
             let region_tokens = match region.kind {
                 #[cfg(feature = "vad")]
-                RegionTaskKind::Segments => {
-                    self.decode_segment_tasks(tasks, &region.task_indices, &mut raw_tasks)?
-                }
+                RegionTaskKind::Segments => self.decode_segment_tasks(
+                    &execution_plan.tasks,
+                    &region.task_indices,
+                    &mut raw_tasks,
+                )?,
                 RegionTaskKind::Overlap => {
                     self.decode_overlap_tasks(audio_len, &region.task_indices, &mut raw_tasks)?
                 }
@@ -723,6 +436,8 @@ impl LongFormTranscriptionPipeline {
         Ok(build_result(audio_len, chunks, tokens))
     }
 
+    /// Decodes each VAD segment on its own and moves it to where it starts in the
+    /// recording
     #[cfg(feature = "vad")]
     fn decode_segment_tasks(
         &self,
@@ -733,19 +448,13 @@ impl LongFormTranscriptionPipeline {
         let mut tokens = Vec::new();
         for task_idx in task_indices {
             let task = &tasks[*task_idx];
-            let ChunkTaskKind::Segment {
-                sample_offset,
-                duration_samples,
-            } = task.kind
-            else {
-                unreachable!("segment region should only reference segment tasks");
-            };
             let raw = take_raw_task(raw_tasks, *task_idx)?;
+            let duration_samples = task.audio_end.saturating_sub(task.audio_start);
             let mut chunk_tokens = self
                 .inner
                 .decode_raw(&raw, duration_seconds(duration_samples))
                 .tokens;
-            offset_tokens(&mut chunk_tokens, sample_offset);
+            offset_tokens(&mut chunk_tokens, task.audio_start);
             tokens.extend(chunk_tokens);
         }
         Ok(tokens)
@@ -767,46 +476,42 @@ impl LongFormTranscriptionPipeline {
             .decode_raw(&merged, duration_seconds(audio_len))
             .tokens)
     }
+}
 
-    #[cfg(feature = "vad")]
-    fn build_execution_plan(
-        &self,
-        regions: &[SampleRange],
-        probabilities: &[f32],
-        config: &LongFormConfig,
-    ) -> LongFormExecutionPlan {
-        let mut tasks = Vec::new();
-        let mut region_tasks = Vec::with_capacity(regions.len());
-        for region in regions.iter().copied() {
-            region_tasks.push(build_region_plan(region, probabilities, config, &mut tasks));
-        }
-        LongFormExecutionPlan {
-            tasks,
-            regions: region_tasks,
-        }
+#[cfg(feature = "vad")]
+fn build_vad_execution_plan(
+    regions: &[SampleRange],
+    probabilities: &[f32],
+    config: &LongFormConfig,
+) -> LongFormExecutionPlan {
+    let mut tasks = Vec::new();
+    let mut region_tasks = Vec::with_capacity(regions.len());
+    for region in regions.iter().copied() {
+        region_tasks.push(build_region_plan(region, probabilities, config, &mut tasks));
     }
+    LongFormExecutionPlan {
+        tasks,
+        regions: region_tasks,
+    }
+}
 
-    fn build_fast_execution_plan(
-        audio_len: usize,
-        config: &LongFormConfig,
-    ) -> LongFormExecutionPlan {
-        let mut tasks = Vec::new();
-        let full_audio = SampleRange {
-            start: 0,
-            end: audio_len,
-        };
-        let task_indices = config
-            .overlap
-            .plan(full_audio)
-            .into_iter()
-            .map(|chunk| push_overlap_task(&mut tasks, chunk, config))
-            .collect();
-        let regions = vec![RegionTask {
-            task_indices,
-            kind: RegionTaskKind::Overlap,
-        }];
-        LongFormExecutionPlan { tasks, regions }
-    }
+fn build_fast_execution_plan(audio_len: usize, config: &LongFormConfig) -> LongFormExecutionPlan {
+    let mut tasks = Vec::new();
+    let full_audio = SampleRange {
+        start: 0,
+        end: audio_len,
+    };
+    let task_indices = config
+        .overlap
+        .plan(full_audio)
+        .into_iter()
+        .map(|chunk| push_overlap_task(&mut tasks, chunk, config))
+        .collect();
+    let regions = vec![RegionTask {
+        task_indices,
+        kind: RegionTaskKind::Overlap,
+    }];
+    LongFormExecutionPlan { tasks, regions }
 }
 
 #[derive(Debug)]
@@ -821,19 +526,6 @@ struct ChunkTask {
     audio_end: usize,
     global_sample_offset: usize,
     context_samples: usize,
-    #[cfg(feature = "vad")]
-    kind: ChunkTaskKind,
-}
-
-#[cfg(feature = "vad")]
-#[derive(Debug, Clone, Copy)]
-enum ChunkTaskKind {
-    #[cfg(feature = "vad")]
-    Segment {
-        sample_offset: usize,
-        duration_samples: usize,
-    },
-    Overlap,
 }
 
 #[derive(Debug)]
@@ -847,12 +539,6 @@ enum RegionTaskKind {
     #[cfg(feature = "vad")]
     Segments,
     Overlap,
-}
-
-#[derive(Debug)]
-struct CompletedTask {
-    task_idx: usize,
-    raw: RawTranscription,
 }
 
 #[cfg(feature = "vad")]
@@ -905,11 +591,6 @@ fn push_segment_task(tasks: &mut Vec<ChunkTask>, segment: SampleRange) -> usize 
         audio_end: segment.end,
         global_sample_offset: 0,
         context_samples: 0,
-        #[cfg(feature = "vad")]
-        kind: ChunkTaskKind::Segment {
-            sample_offset: segment.start,
-            duration_samples: segment.end.saturating_sub(segment.start),
-        },
     });
     task_idx
 }
@@ -926,25 +607,311 @@ fn push_overlap_task(
         audio_end: chunk.end,
         global_sample_offset: chunk.start,
         context_samples: chunk.start - context_start,
-        #[cfg(feature = "vad")]
-        kind: ChunkTaskKind::Overlap,
     });
     task_idx
+}
+
+/// One long-form run's input, shared by every execution path
+struct RunRequest<'a, P: ?Sized> {
+    audio: &'a [f32],
+    config: &'a LongFormConfig,
+    control: &'a TranscriptionControl,
+    preprocessor: &'a P,
+}
+
+// derived impls would require `P: Clone`, but only references are copied
+impl<P: ?Sized> Clone for RunRequest<'_, P> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<P: ?Sized> Copy for RunRequest<'_, P> {}
+
+impl<'a, P: ?Sized> RunRequest<'a, P> {
+    fn chunk_preparer(&self) -> ChunkPreparer {
+        TranscriptionPipeline::chunk_preparer(&self.config.transcription)
+    }
+
+    /// Context for running this request's windows through `pipeline`
+    fn task_context<'p>(self, pipeline: &'p TranscriptionPipeline) -> TaskContext<'p, P>
+    where
+        'a: 'p,
+    {
+        TaskContext {
+            pipeline,
+            preparer: self.chunk_preparer(),
+            request: self,
+        }
+    }
+}
+
+/// Runs the plan's windows on the path the config and backend select
+///
+/// Returns each window's raw transcription in plan order
+fn execute_plan<P: WindowPreprocessor + ?Sized>(
+    pipeline: &TranscriptionPipeline,
+    request: RunRequest<'_, P>,
+    tasks: &[ChunkTask],
+) -> Result<Vec<Option<RawTranscription>>, PreprocessedTranscriptionError<P::Error>> {
+    // a host-loop backend runs a batch one window at a time with no control
+    // checks between them, so it stays on the per-window paths
+    if request.config.batch_size > 1 && pipeline.batches_on_device() {
+        return run_batched_plan(pipeline, request, tasks);
+    }
+    let worker_count = parallel_worker_count(tasks.len(), request.config.worker_count);
+    if worker_count <= 1 {
+        return run_serial_plan(pipeline, request, tasks);
+    }
+
+    run_parallel_plan(pipeline, request, tasks, worker_count)
+}
+
+fn run_serial_plan<P: WindowPreprocessor + ?Sized>(
+    pipeline: &TranscriptionPipeline,
+    request: RunRequest<'_, P>,
+    tasks: &[ChunkTask],
+) -> Result<Vec<Option<RawTranscription>>, PreprocessedTranscriptionError<P::Error>> {
+    let context = request.task_context(pipeline);
+    let mut raw_tasks = vec![None; tasks.len()];
+    for (task_idx, task) in tasks.iter().enumerate() {
+        request.control.check()?;
+        raw_tasks[task_idx] = Some(transcribe_task(&context, task, WindowIndex::new(task_idx))?);
+    }
+    request.control.check()?;
+    Ok(raw_tasks)
+}
+
+/// Runs the plan's windows `batch_size` at a time through the pipeline's model
+///
+/// `worker_count` threads prepare windows on the CPU ahead of the model, so the
+/// next batch is ready while the model runs the current one; on a 1 h recording
+/// preparation was 30 % of the wall time when it ran in between, and the first
+/// batch still waits on it. Workers stay at most one batch ahead of the model,
+/// which bounds the prepared windows held in memory
+fn run_batched_plan<P: WindowPreprocessor + ?Sized>(
+    pipeline: &TranscriptionPipeline,
+    request: RunRequest<'_, P>,
+    tasks: &[ChunkTask],
+) -> Result<Vec<Option<RawTranscription>>, PreprocessedTranscriptionError<P::Error>> {
+    let RunRequest {
+        config, control, ..
+    } = request;
+    let batch_size = config.batch_size;
+    let worker_count = parallel_worker_count(tasks.len(), config.worker_count);
+    let next_task = AtomicUsize::new(0);
+    let lookahead = Lookahead::new(batch_size);
+
+    thread::scope(
+        |scope| -> Result<Vec<_>, PreprocessedTranscriptionError<P::Error>> {
+            let (sender, receiver) = sync_channel(batch_size);
+            for _ in 0..worker_count {
+                let sender = sender.clone();
+                let (next_task, lookahead) = (&next_task, &lookahead);
+                scope.spawn(move || {
+                    // a panicking worker closes the gate, so the others stop and
+                    // drop their senders, the model side sees the channel close,
+                    // and the scope's join raises the panic instead of hanging
+                    let _stop_on_panic = StopOnPanic(lookahead);
+                    let preparer = request.chunk_preparer();
+                    loop {
+                        let task_idx = next_task.fetch_add(1, Ordering::Relaxed);
+                        let Some(task) = tasks.get(task_idx) else {
+                            break;
+                        };
+                        if !lookahead.wait_for(task_idx) {
+                            break;
+                        }
+                        let window = prepare_window(&request, &preparer, task, task_idx);
+                        let failed = window.is_err();
+                        // a closed channel means the model side has stopped
+                        if sender.send((task_idx, window)).is_err() || failed {
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(sender);
+            // a panic in the model call unwinds past the cleanup below, and the
+            // scope would then wait on workers parked at the gate
+            let _stop_on_panic = StopOnPanic(&lookahead);
+
+            // windows arrive in any order; batches are cut in plan order, and an
+            // error surfaces when its window is reached, as on the serial path
+            let consume = || -> Result<Vec<_>, PreprocessedTranscriptionError<P::Error>> {
+                let mut ready = BTreeMap::new();
+                let mut raw_tasks = Vec::with_capacity(tasks.len());
+                for batch_start in (0..tasks.len()).step_by(batch_size) {
+                    let batch_end = (batch_start + batch_size).min(tasks.len());
+                    let mut windows = Vec::with_capacity(batch_end - batch_start);
+                    for task_idx in batch_start..batch_end {
+                        while !ready.contains_key(&task_idx) {
+                            let (done_idx, window) = receiver.recv().map_err(|_| {
+                                TranscriptionError::InvalidModelOutput(format!(
+                                    "long-form window {task_idx} was never prepared"
+                                ))
+                            })?;
+                            ready.insert(done_idx, window);
+                        }
+                        let window = ready.remove(&task_idx).ok_or_else(|| {
+                            TranscriptionError::InvalidModelOutput(format!(
+                                "long-form window {task_idx} was lost before its batch"
+                            ))
+                        })?;
+                        windows.push(window?);
+                    }
+                    // the next batch prepares while this one runs
+                    lookahead.allow(batch_end + batch_size);
+
+                    control.check()?;
+                    let raws = pipeline
+                        .transcribe_prepared_batch(&windows, config.transcription.language)?;
+                    raw_tasks.extend(raws.into_iter().map(Some));
+                    control.check()?;
+                }
+                Ok(raw_tasks)
+            };
+            let result = consume();
+
+            // the scope joins the workers next: stop them rather than wait for
+            // windows nobody will read, as the parallel path does after an error
+            if let Err(error) = &result
+                && !is_interruption(error)
+            {
+                control.cancel();
+            }
+            lookahead.stop();
+            drop(receiver);
+            result
+        },
+    )
+}
+
+/// Runs the plan's windows on `worker_count` threads, each with its own model
+fn run_parallel_plan<P: WindowPreprocessor + ?Sized>(
+    pipeline: &TranscriptionPipeline,
+    request: RunRequest<'_, P>,
+    tasks: &[ChunkTask],
+    worker_count: usize,
+) -> Result<Vec<Option<RawTranscription>>, PreprocessedTranscriptionError<P::Error>> {
+    let control = request.control;
+    let queue_capacity = (worker_count * 2).max(1);
+    let next_task = AtomicUsize::new(0);
+
+    thread::scope(|scope| {
+        let (sender, receiver) = sync_channel::<
+            Result<CompletedTask, PreprocessedTranscriptionError<P::Error>>,
+        >(queue_capacity);
+
+        for _ in 0..worker_count {
+            let sender = sender.clone();
+            let next_task = &next_task;
+            // the pipeline is not shared across threads, so each worker builds its
+            // own from the bundle
+            let bundle = pipeline.bundle().clone();
+            scope.spawn(move || {
+                let pipeline = match TranscriptionPipeline::from_bundle(bundle) {
+                    Ok(pipeline) => pipeline,
+                    Err(error) => {
+                        control.cancel();
+                        let _ = sender.send(Err(PreprocessedTranscriptionError::from(error)));
+                        return;
+                    }
+                };
+                let context = request.task_context(&pipeline);
+                loop {
+                    let task_idx = next_task.fetch_add(1, Ordering::Relaxed);
+                    if task_idx >= tasks.len() {
+                        break;
+                    }
+
+                    if control.check().is_err() {
+                        break;
+                    }
+                    let result =
+                        transcribe_task(&context, &tasks[task_idx], WindowIndex::new(task_idx))
+                            .map(|raw| CompletedTask { task_idx, raw });
+                    if let Err(error) = &result
+                        && !is_interruption(error)
+                    {
+                        control.cancel();
+                    }
+                    if sender.send(result).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(sender);
+
+        collect_completed_tasks(tasks.len(), receiver, control)
+    })
+}
+
+/// Gathers the parallel workers' windows into plan order, or the error that
+/// stopped them
+fn collect_completed_tasks<E>(
+    task_count: usize,
+    receiver: Receiver<Result<CompletedTask, PreprocessedTranscriptionError<E>>>,
+    control: &TranscriptionControl,
+) -> Result<Vec<Option<RawTranscription>>, PreprocessedTranscriptionError<E>>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let mut raw_tasks = vec![None; task_count];
+    let mut first_error = None;
+
+    while let Ok(message) = receiver.recv() {
+        match message {
+            Ok(completed) => raw_tasks[completed.task_idx] = Some(completed.raw),
+            Err(error) => remember_parallel_error(&mut first_error, error),
+        }
+    }
+
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+
+    if raw_tasks.iter().any(Option::is_none) {
+        control.check()?;
+        return Err(TranscriptionError::CoreMl(
+            "parallel chunk preparation stopped before all tasks completed".to_owned(),
+        )
+        .into());
+    }
+
+    control.check()?;
+    Ok(raw_tasks)
+}
+
+#[derive(Debug)]
+struct CompletedTask {
+    task_idx: usize,
+    raw: RawTranscription,
 }
 
 /// Lets batched-plan workers prepare a window only while it is less than a bound
 /// ahead of the model, so prepared windows waiting in memory stay bounded however
 /// unevenly the workers finish
 struct Lookahead {
-    /// Windows below this index may be prepared, and whether the model side stopped
-    state: Mutex<(usize, bool)>,
+    state: Mutex<LookaheadState>,
     changed: Condvar,
+}
+
+struct LookaheadState {
+    /// Windows below this index may be prepared
+    allowed: usize,
+    /// Whether the model side has stopped
+    stopped: bool,
 }
 
 impl Lookahead {
     fn new(allowed: usize) -> Self {
         Self {
-            state: Mutex::new((allowed, false)),
+            state: Mutex::new(LookaheadState {
+                allowed,
+                stopped: false,
+            }),
             changed: Condvar::new(),
         }
     }
@@ -954,11 +921,10 @@ impl Lookahead {
     fn wait_for(&self, task_idx: usize) -> bool {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
-            let (allowed, stopped) = *state;
-            if stopped {
+            if state.stopped {
                 return false;
             }
-            if task_idx < allowed {
+            if task_idx < state.allowed {
                 return true;
             }
             state = self
@@ -970,12 +936,15 @@ impl Lookahead {
 
     fn allow(&self, allowed: usize) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.0 = state.0.max(allowed);
+        state.allowed = state.allowed.max(allowed);
         self.changed.notify_all();
     }
 
     fn stop(&self) {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner).1 = true;
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .stopped = true;
         self.changed.notify_all();
     }
 }
@@ -993,15 +962,8 @@ impl Drop for StopOnPanic<'_> {
 
 struct TaskContext<'a, P: ?Sized> {
     pipeline: &'a TranscriptionPipeline,
-    preparer: &'a ChunkPreparer,
-    preparation: PreparationContext<'a, P>,
-    language: crate::language::LanguageSelection,
-}
-
-struct PreparationContext<'a, P: ?Sized> {
-    audio: &'a [f32],
-    control: &'a TranscriptionControl,
-    preprocessor: &'a P,
+    preparer: ChunkPreparer,
+    request: RunRequest<'a, P>,
 }
 
 fn transcribe_task<P: WindowPreprocessor + ?Sized>(
@@ -1009,29 +971,30 @@ fn transcribe_task<P: WindowPreprocessor + ?Sized>(
     task: &ChunkTask,
     index: WindowIndex,
 ) -> Result<RawTranscription, PreprocessedTranscriptionError<P::Error>> {
-    context.preparation.control.check()?;
-    let samples = prepare_window_samples(&context.preparation, task, index)?;
+    let control = context.request.control;
+    control.check()?;
+    let samples = prepare_window_samples(&context.request, task, index)?;
 
     let prepared = context.preparer.prepare(&samples)?;
-    context.preparation.control.check()?;
+    control.check()?;
     let raw = context.pipeline.transcribe_prepared_raw(
         prepared,
         task.global_sample_offset,
         task.context_samples,
-        context.language,
+        context.request.config.transcription.language,
     )?;
-    context.preparation.control.check()?;
+    control.check()?;
     Ok(raw)
 }
 
 /// Prepares window `task_idx` of the plan for the model
 fn prepare_window<P: WindowPreprocessor + ?Sized>(
-    context: &PreparationContext<'_, P>,
+    request: &RunRequest<'_, P>,
     preparer: &ChunkPreparer,
     task: &ChunkTask,
     task_idx: usize,
 ) -> Result<PreparedWindow, PreprocessedTranscriptionError<P::Error>> {
-    let samples = prepare_window_samples(context, task, WindowIndex::new(task_idx))?;
+    let samples = prepare_window_samples(request, task, WindowIndex::new(task_idx))?;
     Ok(PreparedWindow {
         prepared: preparer.prepare(&samples)?,
         global_sample_offset: task.global_sample_offset,
@@ -1040,24 +1003,24 @@ fn prepare_window<P: WindowPreprocessor + ?Sized>(
 }
 
 fn prepare_window_samples<P: WindowPreprocessor + ?Sized>(
-    context: &PreparationContext<'_, P>,
+    request: &RunRequest<'_, P>,
     task: &ChunkTask,
     index: WindowIndex,
 ) -> Result<Vec<f32>, PreprocessedTranscriptionError<P::Error>> {
-    context.control.check()?;
+    request.control.check()?;
     let source_range = SourceSampleRange::new(task.audio_start, task.audio_end);
-    let mut samples = context.audio[source_range.start()..source_range.end()].to_vec();
+    let mut samples = request.audio[source_range.start()..source_range.end()].to_vec();
     validate_finite_samples(&samples, source_range.start())?;
 
     {
         let mut window = AudioWindowMut::new(&mut samples, source_range, index);
-        context
+        request
             .preprocessor
-            .process(&mut window, context.control)
+            .process(&mut window, request.control)
             .map_err(PreprocessedTranscriptionError::Preprocessing)?;
     }
 
-    context.control.check()?;
+    request.control.check()?;
     validate_finite_samples(&samples, source_range.start())?;
     Ok(samples)
 }
@@ -1088,19 +1051,22 @@ fn identity_error(
     }
 }
 
-fn should_cancel_after_error<E>(error: &PreprocessedTranscriptionError<E>) -> bool
+/// Whether the error only reports that the run was cancelled or ran out of time,
+/// rather than a failure that should stop the other workers
+fn is_interruption<E>(error: &PreprocessedTranscriptionError<E>) -> bool
 where
     E: std::error::Error + Send + Sync + 'static,
 {
-    match error {
-        PreprocessedTranscriptionError::Preprocessing(_) => true,
-        PreprocessedTranscriptionError::Transcription(error) => !matches!(
-            error,
+    matches!(
+        error,
+        PreprocessedTranscriptionError::Transcription(
             TranscriptionError::Cancelled | TranscriptionError::DeadlineExpired
-        ),
-    }
+        )
+    )
 }
 
+/// Keeps the first error, unless it was only an interruption and a real failure
+/// arrives after it
 fn remember_parallel_error<E>(
     first_error: &mut Option<PreprocessedTranscriptionError<E>>,
     error: PreprocessedTranscriptionError<E>,
@@ -1109,19 +1075,8 @@ fn remember_parallel_error<E>(
 {
     match first_error {
         None => *first_error = Some(error),
-        Some(PreprocessedTranscriptionError::Transcription(TranscriptionError::Cancelled))
-        | Some(PreprocessedTranscriptionError::Transcription(
-            TranscriptionError::DeadlineExpired,
-        )) => {
-            if !matches!(
-                error,
-                PreprocessedTranscriptionError::Transcription(TranscriptionError::Cancelled)
-                    | PreprocessedTranscriptionError::Transcription(
-                        TranscriptionError::DeadlineExpired
-                    )
-            ) {
-                *first_error = Some(error);
-            }
+        Some(existing) if is_interruption(existing) && !is_interruption(&error) => {
+            *first_error = Some(error);
         }
         Some(_) => {}
     }
@@ -1207,12 +1162,12 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     use super::LongFormTranscriptionPipeline;
-    #[cfg(feature = "vad")]
-    use super::{ChunkTaskKind, SampleRange, build_region_plan};
     use super::{
-        LongFormConfig, LongFormMode, PreparationContext, RegionTaskKind, WindowPreprocessor,
-        parallel_worker_count, prepare_window_samples,
+        LongFormConfig, LongFormMode, RegionTaskKind, RunRequest, WindowPreprocessor,
+        build_fast_execution_plan, parallel_worker_count, prepare_window_samples,
     };
+    #[cfg(feature = "vad")]
+    use super::{SampleRange, build_region_plan};
     #[cfg(all(feature = "cuda", feature = "vad"))]
     use super::{SileroVad, detect_speech_regions};
     #[cfg(all(feature = "cuda", feature = "vad"))]
@@ -1276,13 +1231,7 @@ mod tests {
         assert!(matches!(plan.kind, RegionTaskKind::Segments));
         assert_eq!(plan.task_indices, vec![0]);
         assert_eq!(tasks.len(), 1);
-        assert!(matches!(
-            tasks[0].kind,
-            ChunkTaskKind::Segment {
-                sample_offset: 16_000,
-                duration_samples: 16_000,
-            }
-        ));
+        assert_eq!((tasks[0].audio_start, tasks[0].audio_end), (16_000, 32_000));
     }
 
     #[cfg(feature = "vad")]
@@ -1340,7 +1289,7 @@ mod tests {
             mode: LongFormMode::Fast,
             ..LongFormConfig::default()
         };
-        let plan = super::LongFormTranscriptionPipeline::build_fast_execution_plan(96_000, &config);
+        let plan = build_fast_execution_plan(96_000, &config);
 
         assert_eq!(plan.regions.len(), 1);
         assert!(matches!(plan.regions[0].kind, RegionTaskKind::Overlap));
@@ -1353,22 +1302,22 @@ mod tests {
         let mut config = LongFormConfig::default();
         config.overlap.max_model_samples = 48_000;
         let audio = vec![0.0; 96_000];
-        let plan =
-            super::LongFormTranscriptionPipeline::build_fast_execution_plan(audio.len(), &config);
+        let plan = build_fast_execution_plan(audio.len(), &config);
         let control = TranscriptionControl::new(
             TranscriptionDeadline::from_now(std::time::Duration::from_secs(1)),
             WindowLimit::new(plan.tasks.len()).expect("the plan has windows"),
         );
         let observed = Arc::new(Mutex::new(Vec::new()));
         let hook = RecordingHook(Arc::clone(&observed));
-        let context = PreparationContext {
+        let request = RunRequest {
             audio: &audio,
+            config: &config,
             control: &control,
             preprocessor: &hook,
         };
 
         for (index, task) in plan.tasks.iter().enumerate() {
-            prepare_window_samples(&context, task, super::WindowIndex::new(index))
+            prepare_window_samples(&request, task, super::WindowIndex::new(index))
                 .expect("the recording hook should succeed");
         }
 
@@ -1515,8 +1464,7 @@ mod tests {
             "the audio must exceed the single-input limit"
         );
 
-        let plan =
-            LongFormTranscriptionPipeline::build_fast_execution_plan(LONG_AUDIO_SAMPLES, &config);
+        let plan = build_fast_execution_plan(LONG_AUDIO_SAMPLES, &config);
         assert!(
             plan.tasks.len() > config.batch_size,
             "the plan must span more than one batch"
@@ -1544,7 +1492,7 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     fn planned_windows(audio_len: usize, config: &LongFormConfig) -> Vec<(usize, usize, usize)> {
-        LongFormTranscriptionPipeline::build_fast_execution_plan(audio_len, config)
+        build_fast_execution_plan(audio_len, config)
             .tasks
             .iter()
             .enumerate()
