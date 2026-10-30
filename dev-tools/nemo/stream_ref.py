@@ -161,7 +161,7 @@ def main() -> None:
     torch.set_grad_enabled(False)
 
     rows = [json.loads(line) for line in open(LS_MANIFEST)]
-    if args.limit:
+    if args.limit is not None:
         rows = rows[: args.limit]
     model = load_model(args.model, args.lang)
     left = model.encoder.att_context_size_all[0][0]

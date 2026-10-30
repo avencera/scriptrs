@@ -470,6 +470,7 @@ for piece in live_audio() {
 }
 stream.finish()?;
 model.process(&mut [&mut stream])?;
+println!("{}", stream.transcript().text);
 ```
 
 `StreamingConfig` also sets the most streams open at once (`max_streams`, 64 by

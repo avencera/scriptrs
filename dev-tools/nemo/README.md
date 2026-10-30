@@ -73,7 +73,9 @@ uv run python stream_ref.py --model nemotron-en --lookahead 13 --lookahead 1 \
 ```
 
 `examples/stream_bench.rs` writes the scriptrs side for `wer.py`. `--fp32` gives
-NeMo's text exactly; the FP16 default changes a few utterances:
+NeMo's tokens exactly, though `--against` still lists a few texts that differ only
+in apostrophe spacing (`whether 'tis` against `whether'tis`); the FP16 default
+changes a few more:
 
 ```sh
 cargo run --release --features cuda --example stream_bench -- \

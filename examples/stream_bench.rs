@@ -69,10 +69,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     let args = parse_args()?;
-    let mut utterances = load_manifest(&args.manifest)?;
-    if let Some(limit) = args.limit {
-        utterances.truncate(limit);
-    }
+    let utterances = load_manifest(&args.manifest, args.limit)?;
     if utterances.is_empty() {
         bail!("no utterances in {}", args.manifest.display());
     }
@@ -255,10 +252,12 @@ fn parse_args() -> Result<Args> {
     })
 }
 
-fn load_manifest(path: &Path) -> Result<Vec<Utterance>> {
+/// The first `limit` utterances of the manifest, or all of them
+fn load_manifest(path: &Path, limit: Option<usize>) -> Result<Vec<Utterance>> {
     fs::read_to_string(path)?
         .lines()
         .filter(|line| !line.trim().is_empty())
+        .take(limit.unwrap_or(usize::MAX))
         .map(|line| {
             let row: Value = serde_json::from_str(line)?;
             let field = |key: &str| {
