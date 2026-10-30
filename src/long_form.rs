@@ -125,6 +125,15 @@ impl LongFormConfig {
         config
     }
 
+    /// Longest audio, in samples, transcribed as one window without planning
+    ///
+    /// This is the planner's own window, `overlap.max_model_samples`, rather than
+    /// the deployment's input limit: longer audio is split into windows of this
+    /// size in either mode, and in VAD mode only longer audio is scanned for speech
+    pub fn single_window_samples(&self) -> usize {
+        self.overlap.max_model_samples
+    }
+
     /// Validate all settings against the deployment that owns the pipeline
     pub fn validate_for(&self, deployment: &ParakeetDeployment) -> Result<(), TranscriptionError> {
         if self.batch_size == 0 {
@@ -149,6 +158,8 @@ pub enum LongFormMode {
     #[default]
     Fast,
     /// Detect speech with VAD before chunk planning
+    ///
+    /// Audio that fits one window is transcribed whole without a VAD scan
     #[cfg(feature = "vad")]
     Vad,
 }
@@ -209,9 +220,9 @@ impl LongFormTranscriptionPipeline {
 
     /// Transcribe audio with the default long-form config
     ///
-    /// Short clips still go through the base single-chunk path. Longer clips use
-    /// overlap chunking by default, with optional VAD planning when
-    /// `vad` is enabled
+    /// Clips up to [`LongFormConfig::single_window_samples`] run as one window.
+    /// Longer clips use overlap chunking by default, with optional VAD planning
+    /// when `vad` is enabled
     pub fn run(&self, audio: &[f32]) -> Result<TranscriptionResult, TranscriptionError> {
         self.run_with_config(audio, &self.default_config)
     }
@@ -254,7 +265,7 @@ impl LongFormTranscriptionPipeline {
             control,
             preprocessor,
         };
-        if audio.len() <= self.inner.chunk_spec().max_samples() {
+        if audio.len() <= config.single_window_samples() {
             control.check_plan(1)?;
             return self.run_single_task(request);
         }
@@ -549,11 +560,11 @@ mod tests {
     use std::fmt::{Display, Formatter};
     use std::sync::{Arc, Mutex};
 
+    #[cfg(feature = "cuda")]
+    use super::LongFormTranscriptionPipeline;
     #[cfg(all(feature = "cuda", feature = "vad"))]
     use super::planner::{SampleRange, build_region_plan};
-    use super::{LongFormConfig, LongFormMode, WindowPreprocessor};
-    #[cfg(feature = "cuda")]
-    use super::{LongFormTranscriptionPipeline, build_fast_execution_plan};
+    use super::{LongFormConfig, LongFormMode, WindowPreprocessor, build_fast_execution_plan};
     #[cfg(all(feature = "cuda", feature = "vad"))]
     use super::{SileroVad, detect_speech_regions};
     #[cfg(all(feature = "cuda", feature = "vad"))]
@@ -659,6 +670,25 @@ mod tests {
         config.overlap.max_model_samples = 0;
 
         assert!(config.validate_for(&deployment).is_err());
+    }
+
+    /// The planner's own window, not the model's input limit, decides when audio
+    /// is planned, so lowering it plans clips the model could take whole
+    #[test]
+    fn audio_past_the_planner_window_is_planned() {
+        let deployment = ParakeetDeployment::v3();
+        let mut config = LongFormConfig::from_deployment(&deployment);
+        config.overlap.max_model_samples = 48_000;
+        let window = config.single_window_samples();
+
+        assert_eq!(window, 48_000);
+        let plan = build_fast_execution_plan(deployment.hard_sample_max(), &config);
+        assert!(plan.tasks.len() > 1);
+        assert!(
+            plan.tasks
+                .iter()
+                .all(|task| task.audio_end - task.audio_start <= window)
+        );
     }
 
     /// Silence past the native single-input limit, so it takes the long-form path
@@ -769,6 +799,28 @@ mod tests {
             .expect("short audio should transcribe");
 
         assert_eq!(observed_hooks(&hook), vec![(0, 0, audio.len())]);
+    }
+
+    /// Audio the model could take whole but longer than the configured window runs
+    /// as the planned windows, not one
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs a CUDA GPU and the native weights; `just gpu-parity` runs it on gpu0"]
+    fn gpu_audio_past_the_window_runs_the_planned_windows() {
+        let (pipeline, config) = native_pipeline();
+        let audio = vec![0.0; 100_000];
+        let planned = planned_windows(audio.len(), &config);
+        assert!(planned.len() > 1);
+        assert!(audio.len() < pipeline.base_pipeline().deployment().hard_sample_max());
+        let hook = RecordingHook(Arc::new(Mutex::new(Vec::new())));
+
+        pipeline
+            .run_with_preprocessor(&audio, &config, &recording_control(planned.len()), &hook)
+            .expect("audio past the window should transcribe");
+
+        let mut observed = observed_hooks(&hook);
+        observed.sort_unstable();
+        assert_eq!(observed, planned);
     }
 
     /// Every path preprocesses each planned window exactly once, with its index and

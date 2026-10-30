@@ -213,12 +213,6 @@ impl ChunkSpec {
         }
     }
 
-    /// Longest input one model call takes, in samples
-    #[cfg(feature = "long-form")]
-    pub(crate) fn max_samples(self) -> usize {
-        self.max_samples
-    }
-
     /// Duration of `samples` at the deployment's sample rate
     pub(crate) fn duration_seconds(self, samples: usize) -> f64 {
         samples as f64 / self.frontend.sample_rate() as f64

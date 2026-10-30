@@ -111,7 +111,7 @@ impl PyPipeline {
 
     #[getter]
     fn max_chunk_seconds(&self) -> f64 {
-        self.deployment.hard_sample_max() as f64 / self.deployment.frontend().sample_rate() as f64
+        self.config.single_window_samples() as f64 / self.deployment.frontend().sample_rate() as f64
     }
 
     #[pyo3(signature = (samples, language=None))]
@@ -192,6 +192,9 @@ impl PyPipeline {
 /// Transcribe every input, short ones through a batching queue on a clone of the
 /// pipeline's model, and inputs longer than one window through long-form
 ///
+/// The cutoff is the one long-form uses for a single window, so each input gets
+/// the transcript `transcribe` would give it
+///
 /// Results keep input order. A failure stops nothing: each input gets its own
 /// result, and the caller decides what to raise
 fn run_many(
@@ -200,7 +203,7 @@ fn run_many(
     config: &LongFormConfig,
     queue: QueueConfig,
 ) -> PyResult<Vec<Result<TranscriptionResult, TranscriptionError>>> {
-    let max_samples = pipeline.base_pipeline().deployment().hard_sample_max();
+    let max_samples = config.single_window_samples();
     let mut results: Vec<Option<Result<TranscriptionResult, TranscriptionError>>> =
         audios.iter().map(|_| None).collect();
     let mut short = Vec::new();
