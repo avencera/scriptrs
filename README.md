@@ -31,6 +31,7 @@ The base crate exposes a single-chunk `TranscriptionPipeline`. Fast long-audio c
 - Streaming transcription of many live streams at once with Nemotron Speech
   Streaming EN 0.6B and Nemotron 3.5 ASR Streaming 0.6B on CUDA
 - Hugging Face download support with optional local model loading
+- Python package on PyPI, with wheels for macOS arm64 and Linux x86_64
 
 ## What it does not do yet
 
@@ -66,6 +67,24 @@ For VAD-backed long-form transcription:
 [dependencies]
 scriptrs = { version = "0.4", features = ["vad"] }
 ```
+
+## Python
+
+```sh
+pip install scriptrs
+```
+
+```python
+import scriptrs
+
+pipeline = scriptrs.Pipeline.from_pretrained("parakeet/v2")  # or "parakeet/v3" for 25 languages
+print(pipeline.transcribe_file("meeting.mp3").text)
+```
+
+One package carries both models; the model is picked when the pipeline loads,
+and only that model downloads. The wheel includes long-form transcription, VAD,
+the batching queue, and audio file decoding. See the
+[Python README](crates/scriptrs-python/README.md).
 
 ## Model downloads
 

@@ -641,6 +641,8 @@ impl HuggingFaceModelSource {
 /// directory or want to prefetch assets before building a pipeline.
 #[cfg(feature = "online")]
 pub struct ModelManager {
+    // only native weights live outside the Core ML repository, in per-model ones
+    #[cfg(feature = "cuda")]
     api: hf_hub::api::sync::Api,
     repo: hf_hub::api::sync::ApiRepo,
 }
@@ -663,6 +665,7 @@ impl ModelManager {
     fn from_api(api: hf_hub::api::sync::Api) -> Self {
         Self {
             repo: HuggingFaceModelSource::runtime().api_repo(&api),
+            #[cfg(feature = "cuda")]
             api,
         }
     }
@@ -772,6 +775,8 @@ fn native_hub_vocab(deployment: &ParakeetDeployment) -> &'static str {
     vocab.rsplit_once('/').map_or(vocab, |(_, name)| name)
 }
 
+// metadata.json is left out: Core ML never reads it, and the published v3 encoder
+// has none, so requiring it made every v3 download fail with a 404
 #[cfg(feature = "online")]
 fn mlmodelc_files(prefix: &str) -> Vec<String> {
     vec![
@@ -779,7 +784,6 @@ fn mlmodelc_files(prefix: &str) -> Vec<String> {
         format!("{prefix}/coremldata.bin"),
         format!("{prefix}/weights/weight.bin"),
         format!("{prefix}/analytics/coremldata.bin"),
-        format!("{prefix}/metadata.json"),
     ]
 }
 

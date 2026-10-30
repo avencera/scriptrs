@@ -291,6 +291,19 @@ impl LongFormTranscriptionPipeline {
             .map_err(identity_error)
     }
 
+    /// Return the single-chunk pipeline this pipeline wraps
+    ///
+    /// Clones share the loaded model, so a clone can move onto a background queue
+    /// with [`TranscriptionPipeline::into_queued`] without loading the model again
+    pub fn base_pipeline(&self) -> &TranscriptionPipeline {
+        &self.inner
+    }
+
+    /// Return the default long-form config
+    pub fn config(&self) -> &LongFormConfig {
+        &self.default_config
+    }
+
     fn run_long_form<P: WindowPreprocessor + ?Sized>(
         &self,
         audio: &[f32],
