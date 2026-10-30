@@ -5,7 +5,7 @@ use crate::decode::{ParakeetTdtDecoder, RawTranscription};
 use crate::deployment::ParakeetDeployment;
 use crate::error::TranscriptionError;
 use crate::frontend::ParakeetFeatureExtractor;
-use crate::model::ParakeetModel;
+use crate::model::{BatcherShape, ModelBatcher, ParakeetModel};
 use crate::models::ModelBundle;
 use crate::types::TranscriptionResult;
 use ndarray::Array2;
@@ -186,6 +186,29 @@ impl TranscriptionPipeline {
             .collect())
     }
 
+    /// A batcher on the pipeline's model; see [`ParakeetModel::batcher`]
+    pub(crate) fn batcher(
+        &self,
+        language: crate::language::LanguageSelection,
+        shape: BatcherShape,
+    ) -> Result<ModelBatcher, TranscriptionError> {
+        self.model.batcher(language, shape)
+    }
+
+    /// Places a window's tokens on its recording's timeline, dropping those in its
+    /// left context, as [`Self::transcribe_prepared_batch`] does
+    pub(crate) fn place_window(
+        raw: &mut RawTranscription,
+        global_sample_offset: usize,
+        context_samples: usize,
+    ) {
+        apply_time_offsets(
+            raw,
+            global_sample_offset / SAMPLES_PER_ENCODER_FRAME,
+            context_samples / SAMPLES_PER_ENCODER_FRAME,
+        );
+    }
+
     pub(crate) fn chunk_preparer(config: &TranscriptionConfig) -> ChunkPreparer {
         ChunkPreparer::new(config)
     }
@@ -215,6 +238,16 @@ pub(crate) struct PreparedWindow {
 }
 
 impl PreparedChunk {
+    /// Log-mel features, `[frames, features]`
+    pub(crate) fn features(&self) -> &Array2<f32> {
+        &self.features
+    }
+
+    /// Mel frames
+    pub(crate) fn frames(&self) -> usize {
+        self.features.nrows()
+    }
+
     fn from_audio(
         audio: &[f32],
         config: &TranscriptionConfig,
