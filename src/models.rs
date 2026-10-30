@@ -49,6 +49,26 @@ pub(crate) enum RuntimeBundle {
     Native(NativeLayout),
 }
 
+impl RuntimeBundle {
+    fn vocab_path(&self) -> &Path {
+        match self {
+            Self::CoreMl(layout) => &layout.vocab_path,
+            #[cfg(feature = "cuda")]
+            Self::Native(layout) => &layout.vocab_path,
+        }
+    }
+
+    /// Where the bundle's VAD model is, whether or not it is there
+    #[cfg(feature = "vad")]
+    fn vad_path(&self) -> &Path {
+        match self {
+            Self::CoreMl(layout) => &layout.vad_dir,
+            #[cfg(feature = "cuda")]
+            Self::Native(layout) => &layout.vad_path,
+        }
+    }
+}
+
 /// Arithmetic precision of the CUDA backend's encoder matrix multiplies
 ///
 /// The residual stream, the matrix multiplies' outputs and their accumulation stay
@@ -381,20 +401,22 @@ impl ModelBundle {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_default();
-        let mut bundle = Self::from_native_dir(root, deployment);
-        if let RuntimeBundle::Native(layout) = &mut bundle.runtime {
-            layout.weights_path = weights_path;
-            layout.vocab_path = vocab_path;
-
-            #[cfg(feature = "vad")]
-            if let Some(vad_path) = vad_path {
-                layout.vad_path = vad_path;
-            }
-        }
-
+        #[cfg(feature = "vad")]
+        let vad_path = vad_path.unwrap_or_else(|| root.join(NATIVE_VAD_PATH));
         #[cfg(not(feature = "vad"))]
         let _ = vad_path;
-        bundle
+        let runtime = RuntimeBundle::Native(NativeLayout {
+            weights_path,
+            vocab_path,
+            #[cfg(feature = "vad")]
+            vad_path,
+            precision: Precision::default(),
+        });
+        Self {
+            root,
+            deployment: deployment.with_hard_sample_max(NATIVE_HARD_SAMPLE_MAX),
+            runtime,
+        }
     }
 
     /// Set the precision of the CUDA encoder's matrix multiplies, FP16 by default
@@ -431,62 +453,29 @@ impl ModelBundle {
         }
     }
 
-    #[cfg(feature = "vad")]
     /// Validate that the Parakeet and VAD model assets are present
+    #[cfg(feature = "vad")]
     pub fn validate_long_form(&self) -> Result<(), TranscriptionError> {
         self.validate_base()?;
-        match &self.runtime {
-            RuntimeBundle::CoreMl(layout) if !layout.vad_dir.exists() => {
-                Err(TranscriptionError::MissingModelAsset {
-                    path: layout.vad_dir.clone(),
-                })
-            }
-            RuntimeBundle::CoreMl(_) => Ok(()),
-            #[cfg(feature = "cuda")]
-            RuntimeBundle::Native(layout) if !layout.vad_path.exists() => {
-                Err(self.missing_vad_error())
-            }
-            #[cfg(feature = "cuda")]
-            RuntimeBundle::Native(_) => Ok(()),
+        if !self.runtime.vad_path().exists() {
+            return Err(self.missing_vad_error());
         }
+        Ok(())
     }
 
     pub(crate) fn runtime(&self) -> &RuntimeBundle {
         &self.runtime
     }
 
-    #[cfg(test)]
-    pub(crate) fn vocab_path(&self) -> &Path {
-        match &self.runtime {
-            RuntimeBundle::CoreMl(layout) => &layout.vocab_path,
-            #[cfg(feature = "cuda")]
-            RuntimeBundle::Native(layout) => &layout.vocab_path,
-        }
-    }
-
     pub(crate) fn vocabulary(&self) -> Result<Vocabulary, TranscriptionError> {
-        match &self.runtime {
-            RuntimeBundle::CoreMl(layout) => {
-                Vocabulary::load_for_deployment(&layout.vocab_path, &self.deployment)
-            }
-            #[cfg(feature = "cuda")]
-            RuntimeBundle::Native(layout) => {
-                Vocabulary::load_for_deployment(&layout.vocab_path, &self.deployment)
-            }
-        }
+        Vocabulary::load_for_deployment(self.runtime.vocab_path(), &self.deployment)
     }
 
     /// Error to return when a VAD run is requested but the bundle has no VAD model
     #[cfg(feature = "vad")]
     pub(crate) fn missing_vad_error(&self) -> TranscriptionError {
-        match &self.runtime {
-            RuntimeBundle::CoreMl(layout) => TranscriptionError::MissingModelAsset {
-                path: layout.vad_dir.clone(),
-            },
-            #[cfg(feature = "cuda")]
-            RuntimeBundle::Native(layout) => TranscriptionError::MissingModelAsset {
-                path: layout.vad_path.clone(),
-            },
+        TranscriptionError::MissingModelAsset {
+            path: self.runtime.vad_path().to_path_buf(),
         }
     }
 
@@ -495,47 +484,46 @@ impl ModelBundle {
         &self.root
     }
 
-    #[cfg(feature = "online")]
     /// Download the v2 Parakeet model bundle from Hugging Face
     ///
     /// By default this resolves models from the pinned `avencera/scriptrs-models`
     /// snapshot. Set `SCRIPTRS_MODELS_DIR` to force a local bundle.
+    #[cfg(feature = "online")]
     pub fn from_pretrained() -> Result<Self, HubError> {
         Self::from_pretrained_with_deployment(ParakeetDeployment::v2())
     }
 
-    #[cfg(feature = "online")]
     /// Download a Parakeet bundle for an explicit deployment
+    #[cfg(feature = "online")]
     pub fn from_pretrained_with_deployment(
         deployment: ParakeetDeployment,
     ) -> Result<Self, HubError> {
-        if let Ok(models_dir) = std::env::var(SCRIPTRS_MODELS_DIR_ENV) {
+        if let Some(models_dir) = models_dir_override() {
             return Ok(Self::from_dir_with_deployment(models_dir, deployment));
         }
         ModelManager::new()?.ensure_with_deployment(deployment, false)
     }
 
-    #[cfg(all(feature = "online", feature = "vad"))]
     /// Download the Parakeet and VAD model bundle from Hugging Face
     ///
     /// By default this resolves models from the pinned `avencera/scriptrs-models`
     /// snapshot. Set `SCRIPTRS_MODELS_DIR` to force a local bundle.
+    #[cfg(all(feature = "online", feature = "vad"))]
     pub fn from_pretrained_long_form() -> Result<Self, HubError> {
         Self::from_pretrained_long_form_with_deployment(ParakeetDeployment::v2())
     }
 
-    #[cfg(all(feature = "online", feature = "vad"))]
     /// Download Parakeet and VAD assets for an explicit deployment
+    #[cfg(all(feature = "online", feature = "vad"))]
     pub fn from_pretrained_long_form_with_deployment(
         deployment: ParakeetDeployment,
     ) -> Result<Self, HubError> {
-        if let Ok(models_dir) = std::env::var(SCRIPTRS_MODELS_DIR_ENV) {
+        if let Some(models_dir) = models_dir_override() {
             return Ok(Self::from_dir_with_deployment(models_dir, deployment));
         }
         ModelManager::new()?.ensure_with_deployment(deployment, true)
     }
 
-    #[cfg(all(feature = "online", feature = "cuda"))]
     /// Download native CUDA weights for a deployment from Hugging Face
     ///
     /// This resolves `model.safetensors` and the vocabulary from a pinned
@@ -543,23 +531,24 @@ impl ModelBundle {
     /// `avencera/parakeet-tdt-0.6b-v2-cuda` or `avencera/parakeet-tdt-0.6b-v3-cuda`,
     /// then behaves like [`Self::from_native_dir`]. Set `SCRIPTRS_MODELS_DIR` to
     /// force a local native bundle.
+    #[cfg(all(feature = "online", feature = "cuda"))]
     pub fn from_pretrained_native(deployment: ParakeetDeployment) -> Result<Self, HubError> {
-        if let Ok(models_dir) = std::env::var(SCRIPTRS_MODELS_DIR_ENV) {
+        if let Some(models_dir) = models_dir_override() {
             return Ok(Self::from_native_dir(models_dir, deployment));
         }
         ModelManager::new()?.ensure_native(deployment, false)
     }
 
-    #[cfg(all(feature = "online", feature = "cuda", feature = "vad"))]
     /// Download native CUDA weights and the native Silero VAD weights
     ///
     /// The VAD weights come from a pinned snapshot of
     /// `avencera/silero-vad-v5-safetensors`. Set `SCRIPTRS_MODELS_DIR` to force a
     /// local native bundle.
+    #[cfg(all(feature = "online", feature = "cuda", feature = "vad"))]
     pub fn from_pretrained_native_long_form(
         deployment: ParakeetDeployment,
     ) -> Result<Self, HubError> {
-        if let Ok(models_dir) = std::env::var(SCRIPTRS_MODELS_DIR_ENV) {
+        if let Some(models_dir) = models_dir_override() {
             return Ok(Self::from_native_dir(models_dir, deployment));
         }
         ModelManager::new()?.ensure_native(deployment, true)
@@ -675,11 +664,11 @@ impl ModelManager {
         self.ensure_with_deployment(ParakeetDeployment::v2(), false)
     }
 
-    #[cfg(feature = "vad")]
     /// Ensure the Parakeet and VAD model bundle is cached locally
     ///
     /// The returned [`ModelBundle`] points at the resolved snapshot directory
     /// inside the Hugging Face cache.
+    #[cfg(feature = "vad")]
     pub fn ensure_long_form(&self) -> Result<ModelBundle, HubError> {
         self.ensure_with_deployment(ParakeetDeployment::v2(), true)
     }
@@ -753,8 +742,11 @@ impl ModelManager {
             }
         }
 
+        // every layout lists files; an empty list names no file to root the snapshot at
         let Some((cached_path, relative_path)) = first else {
-            unreachable!("model file list should never be empty");
+            return Err(HubError::InvalidFile {
+                file: String::new(),
+            });
         };
         Ok(snapshot_root_from_cached_file(&cached_path, relative_path))
     }
@@ -788,6 +780,12 @@ fn repo_files(deployment: &ParakeetDeployment) -> Vec<String> {
     files.extend(mlmodelc_files(layout.decoder()));
     files.extend(mlmodelc_files(layout.joint_decision()));
     files
+}
+
+/// `SCRIPTRS_MODELS_DIR`, which replaces any download with a local bundle
+#[cfg(feature = "online")]
+fn models_dir_override() -> Option<String> {
+    std::env::var(SCRIPTRS_MODELS_DIR_ENV).ok()
 }
 
 #[cfg(feature = "online")]
@@ -839,7 +837,12 @@ mod tests {
                 .encoder_dir()
                 .ends_with("parakeet-v2/encoder.mlmodelc")
         );
-        assert!(bundle.vocab_path().ends_with("parakeet-v2/vocab.txt"));
+        assert!(
+            bundle
+                .runtime()
+                .vocab_path()
+                .ends_with("parakeet-v2/vocab.txt")
+        );
     }
 
     #[test]
