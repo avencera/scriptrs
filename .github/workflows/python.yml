@@ -73,6 +73,18 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # release tags are named after the scriptrs version, so a bindings version that
+      # lags behind fails here on the pull request instead of at publish time
+      - name: Check the bindings version matches scriptrs
+        run: |
+          set -euo pipefail
+          crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          bindings=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/scriptrs-python/Cargo.toml | head -1)
+          if [ "$crate" != "$bindings" ]; then
+            echo "crates/scriptrs-python is $bindings but scriptrs is $crate; bump crates/scriptrs-python/Cargo.toml"
+            exit 1
+          fi
+
       - name: Build sdist
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
