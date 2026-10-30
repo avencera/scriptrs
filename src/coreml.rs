@@ -9,7 +9,7 @@ use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use block2::RcBlock;
-use ndarray::{Array1, Array2, Array3};
+use ndarray::{Array, Array1, Array2, Array3, Dimension};
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2_core_ml::{MLComputeUnits, MLFeatureProvider, MLModel};
@@ -60,66 +60,6 @@ impl ParakeetSplitCoreMlModel {
             joint_decision: JointDecisionCoreMlModel::new(joint_decision_path, io, dims)?,
         })
     }
-
-    pub(crate) fn run_encoder(
-        &self,
-        mel: &[f32],
-        feature_size: usize,
-        target_frames: usize,
-        lengths: &[i32],
-    ) -> Result<(Array3<f32>, usize), TranscriptionError> {
-        self.encoder.run(mel, feature_size, target_frames, lengths)
-    }
-
-    pub(crate) fn run_decoder(
-        &self,
-        targets: &Array2<i32>,
-        target_length: &Array1<i32>,
-        hidden_state: &Array3<f32>,
-        cell_state: &Array3<f32>,
-    ) -> Result<SplitDecoderCoreMlOutput, TranscriptionError> {
-        self.decoder.run(
-            targets.as_slice().ok_or_else(|| {
-                TranscriptionError::InvalidModelOutput(
-                    "decoder targets were not contiguous".to_owned(),
-                )
-            })?,
-            target_length.as_slice().ok_or_else(|| {
-                TranscriptionError::InvalidModelOutput(
-                    "decoder target lengths were not contiguous".to_owned(),
-                )
-            })?,
-            hidden_state.as_slice().ok_or_else(|| {
-                TranscriptionError::InvalidModelOutput(
-                    "decoder hidden state was not contiguous".to_owned(),
-                )
-            })?,
-            cell_state.as_slice().ok_or_else(|| {
-                TranscriptionError::InvalidModelOutput(
-                    "decoder cell state was not contiguous".to_owned(),
-                )
-            })?,
-        )
-    }
-
-    pub(crate) fn run_joint(
-        &self,
-        encoder_step: &Array3<f32>,
-        decoder_step: &Array3<f32>,
-    ) -> Result<JointOutputs, TranscriptionError> {
-        self.joint_decision.run(
-            encoder_step.as_slice().ok_or_else(|| {
-                TranscriptionError::InvalidModelOutput(
-                    "joint encoder step was not contiguous".to_owned(),
-                )
-            })?,
-            decoder_step.as_slice().ok_or_else(|| {
-                TranscriptionError::InvalidModelOutput(
-                    "joint decoder step was not contiguous".to_owned(),
-                )
-            })?,
-        )
-    }
 }
 
 impl StepRuntime for ParakeetSplitCoreMlModel {
@@ -130,13 +70,8 @@ impl StepRuntime for ParakeetSplitCoreMlModel {
         target_frames: usize,
         feature_frames: usize,
     ) -> Result<(Array3<f32>, usize), TranscriptionError> {
-        ParakeetSplitCoreMlModel::run_encoder(
-            self,
-            input,
-            feature_size,
-            target_frames,
-            &[feature_frames as i32],
-        )
+        self.encoder
+            .run(input, feature_size, target_frames, &[feature_frames as i32])
     }
 
     fn run_decoder(
@@ -146,18 +81,12 @@ impl StepRuntime for ParakeetSplitCoreMlModel {
         hidden_state: &Array3<f32>,
         cell_state: &Array3<f32>,
     ) -> Result<DecoderStepOutputs, TranscriptionError> {
-        let output = ParakeetSplitCoreMlModel::run_decoder(
-            self,
-            targets,
-            target_length,
-            hidden_state,
-            cell_state,
-        )?;
-        Ok(DecoderStepOutputs {
-            decoder_step: output.decoder_step,
-            hidden_state: output.hidden_state,
-            cell_state: output.cell_state,
-        })
+        self.decoder.run(
+            contiguous(targets, "decoder targets were not contiguous")?,
+            contiguous(target_length, "decoder target lengths were not contiguous")?,
+            contiguous(hidden_state, "decoder hidden state was not contiguous")?,
+            contiguous(cell_state, "decoder cell state was not contiguous")?,
+        )
     }
 
     fn run_joint(
@@ -165,8 +94,22 @@ impl StepRuntime for ParakeetSplitCoreMlModel {
         encoder_step: &Array3<f32>,
         decoder_step: &Array3<f32>,
     ) -> Result<JointOutputs, TranscriptionError> {
-        ParakeetSplitCoreMlModel::run_joint(self, encoder_step, decoder_step)
+        self.joint_decision.run(
+            contiguous(encoder_step, "joint encoder step was not contiguous")?,
+            contiguous(decoder_step, "joint decoder step was not contiguous")?,
+        )
     }
+}
+
+/// The elements of `array` in row-major order, which Core ML reads through the
+/// cached contiguous strides
+fn contiguous<'a, T, D: Dimension>(
+    array: &'a Array<T, D>,
+    message: &str,
+) -> Result<&'a [T], TranscriptionError> {
+    array
+        .as_slice()
+        .ok_or_else(|| TranscriptionError::InvalidModelOutput(message.to_owned()))
 }
 
 #[cfg(feature = "vad")]
@@ -370,7 +313,7 @@ impl DecoderCoreMlModel {
         target_length: &[i32],
         hidden_state: &[f32],
         cell_state: &[f32],
-    ) -> Result<SplitDecoderCoreMlOutput, TranscriptionError> {
+    ) -> Result<DecoderStepOutputs, TranscriptionError> {
         self.model.predict(
             &[
                 CachedCoreMlInput::I32 {
@@ -391,7 +334,7 @@ impl DecoderCoreMlModel {
                 },
             ],
             |output| {
-                Ok(SplitDecoderCoreMlOutput {
+                Ok(DecoderStepOutputs {
                     decoder_step: array3_from_output(output, &self.decoder_output, "decoder step")?,
                     hidden_state: array3_from_output(
                         output,
@@ -478,13 +421,6 @@ impl JointDecisionCoreMlModel {
             },
         )
     }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct SplitDecoderCoreMlOutput {
-    pub decoder_step: Array3<f32>,
-    pub hidden_state: Array3<f32>,
-    pub cell_state: Array3<f32>,
 }
 
 #[cfg(feature = "vad")]
