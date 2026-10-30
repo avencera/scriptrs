@@ -68,18 +68,44 @@ impl ShapeCache {
         self.bytes = 0;
     }
 
-    /// Adds `shape`, then evicts the least recently used others while over budget;
-    /// a shape larger than the whole budget is still kept, alone
-    fn insert(&mut self, key: (usize, usize), shape: Shape) {
-        self.bytes += shape.bytes;
-        self.shapes.insert(key, shape);
+    /// The shape at `key`, marked most recently used; when the cache lacks it,
+    /// `build` makes it, given the cache to free others' memory, and the least
+    /// recently used others are evicted while over budget. A shape larger than the
+    /// whole budget is still kept, alone
+    fn get_or_try_insert_with<E>(
+        &mut self,
+        key: (usize, usize),
+        build: impl FnOnce(&mut Self) -> Result<Shape, E>,
+    ) -> Result<&mut Shape, E> {
+        // taken out and put back, so the shape returned is borrowed only once the
+        // map holds it
+        let shape = match self.shapes.remove(&key) {
+            Some(shape) => shape,
+            None => {
+                // adding a shape may free others' graphs and buffers, by eviction or
+                // in `build`, and a failed `build` frees what it had made
+                let _exclusive = exclusive_device_work();
+                let shape = build(self)?;
+                self.evict_for(shape.bytes);
+                shape
+            }
+        };
+        self.uses += 1;
+        let shape = self.shapes.entry(key).insert_entry(shape).into_mut();
+        shape.last_used = self.uses;
+        Ok(shape)
+    }
+
+    /// Counts `bytes` more, for a shape about to be added, then evicts the least
+    /// recently used shapes while over budget
+    fn evict_for(&mut self, bytes: usize) {
+        self.bytes += bytes;
         while self.bytes > self.budget {
             let Some(oldest) = self
                 .shapes
                 .iter()
-                .filter(|(other, _)| **other != key)
                 .min_by_key(|(_, shape)| shape.last_used)
-                .map(|(other, _)| *other)
+                .map(|(key, _)| *key)
             else {
                 break;
             };
@@ -87,13 +113,6 @@ impl ShapeCache {
                 self.bytes -= evicted.bytes;
             }
         }
-    }
-
-    fn get(&mut self, key: (usize, usize)) -> Option<&mut Shape> {
-        self.uses += 1;
-        let shape = self.shapes.get_mut(&key)?;
-        shape.last_used = self.uses;
-        Some(shape)
     }
 }
 
@@ -238,27 +257,22 @@ impl CudaModel {
         let longest = lens.iter().copied().max().unwrap_or(0).max(1);
         let mel_frames = longest.div_ceil(MEL_BUCKET) * MEL_BUCKET;
         let batch = chunks.len();
-        let mut shapes = engine.shapes.lock().map_err(|_| {
-            TranscriptionError::InvalidModelOutput("the CUDA model lock was poisoned".to_owned())
-        })?;
-        let key = (batch, mel_frames);
-        if !shapes.shapes.contains_key(&key) {
-            // adding a shape may free others' graphs and buffers, by eviction or by the
-            // retry below, and a failed allocation frees what it had made
-            let _exclusive = exclusive_device_work();
-            let shape = match engine.shape(batch, mel_frames) {
-                Ok(shape) => shape,
+        // a shape's graph is stored only once its capture returns, and every call
+        // rewrites each input and cursor of its workspaces before reading them, so
+        // the shapes a panic leaves behind are no worse than an error's
+        let mut shapes = engine.shapes.lock().unwrap_or_else(PoisonError::into_inner);
+        let shape = shapes.get_or_try_insert_with((batch, mel_frames), |shapes| {
+            match engine.shape(batch, mel_frames) {
+                Ok(shape) => Ok(shape),
                 // the allocation may have failed on memory cached shapes hold: free
-                // them all and try once more
+                // them all and try once more. Only the retry's error is returned: it
+                // says what fails with nothing cached, and folding the first into
+                // its message would change its variant
                 Err(_) => {
                     shapes.clear();
-                    engine.shape(batch, mel_frames)?
+                    engine.shape(batch, mel_frames)
                 }
-            };
-            shapes.insert(key, shape);
-        }
-        let shape = shapes.get(key).ok_or_else(|| {
-            TranscriptionError::InvalidModelOutput("a cached CUDA shape went missing".to_owned())
+            }
         })?;
         engine.transcribe(shape, chunks, &lens, policy.language_mask().as_ref())
     }

@@ -9,6 +9,7 @@
 mod prompt;
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 
@@ -216,18 +217,16 @@ impl StreamEngine {
         // the lock guards device buffers a panic leaves no worse than an error does
         let mut device = engine.device.lock().unwrap_or_else(PoisonError::into_inner);
         let device = &mut *device;
-        if !device.shapes.contains_key(&batch) {
-            let _exclusive = exclusive_device_work();
-            let shape = engine
-                .shape(&device.caches, batch)
-                .map_err(RunError::before)?;
-            device.shapes.insert(batch, shape);
-        }
-        let shape = device.shapes.get_mut(&batch).ok_or_else(|| {
-            RunError::before(TranscriptionError::InvalidModelOutput(
-                "a streaming shape went missing".to_owned(),
-            ))
-        })?;
+        let shape = match device.shapes.entry(batch) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let _exclusive = exclusive_device_work();
+                let shape = engine
+                    .shape(&device.caches, batch)
+                    .map_err(RunError::before)?;
+                entry.insert(shape)
+            }
+        };
         let rows = engine
             .stage(shape, &device.caches, chunks)
             .map_err(RunError::before)?;
