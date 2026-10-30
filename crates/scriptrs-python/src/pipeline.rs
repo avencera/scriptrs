@@ -192,8 +192,8 @@ impl PyPipeline {
 /// Transcribe every input, short ones through a batching queue on a clone of the
 /// pipeline's model, and inputs longer than one window through long-form
 ///
-/// The cutoff is the one long-form uses for a single window, so each input gets
-/// the transcript `transcribe` would give it
+/// The cutoff is the one long-form uses for a single window, so each input runs
+/// as the same windows `transcribe` would run it as
 ///
 /// Results keep input order. A failure stops nothing: each input gets its own
 /// result, and the caller decides what to raise

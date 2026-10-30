@@ -134,6 +134,15 @@ impl LongFormConfig {
         self.overlap.max_model_samples
     }
 
+    /// How a run transcribes `audio_len` samples
+    fn run_path(&self, audio_len: usize) -> RunPath {
+        if audio_len <= self.single_window_samples() {
+            return RunPath::SingleWindow;
+        }
+
+        RunPath::Planned(self.mode)
+    }
+
     /// Validate all settings against the deployment that owns the pipeline
     pub fn validate_for(&self, deployment: &ParakeetDeployment) -> Result<(), TranscriptionError> {
         if self.batch_size == 0 {
@@ -149,6 +158,15 @@ impl LongFormConfig {
 
         Ok(())
     }
+}
+
+/// How a run transcribes its audio
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunPath {
+    /// As one window, without planning
+    SingleWindow,
+    /// As the windows this mode plans
+    Planned(LongFormMode),
 }
 
 /// Long-form planning mode
@@ -220,8 +238,8 @@ impl LongFormTranscriptionPipeline {
 
     /// Transcribe audio with the default long-form config
     ///
-    /// Clips up to [`LongFormConfig::single_window_samples`] run as one window.
-    /// Longer clips use overlap chunking by default, with optional VAD planning
+    /// Clips up to [`LongFormConfig::single_window_samples`] run as one window, and
+    /// longer clips use overlap chunking by default, with optional VAD planning
     /// when `vad` is enabled
     pub fn run(&self, audio: &[f32]) -> Result<TranscriptionResult, TranscriptionError> {
         self.run_with_config(audio, &self.default_config)
@@ -265,12 +283,15 @@ impl LongFormTranscriptionPipeline {
             control,
             preprocessor,
         };
-        if audio.len() <= config.single_window_samples() {
-            control.check_plan(1)?;
-            return self.run_single_task(request);
+        match config.run_path(audio.len()) {
+            RunPath::SingleWindow => {
+                control.check_plan(1)?;
+                self.run_single_task(request)
+            }
+            RunPath::Planned(LongFormMode::Fast) => self.run_fast_long_form(request),
+            #[cfg(feature = "vad")]
+            RunPath::Planned(LongFormMode::Vad) => self.run_vad_long_form(request),
         }
-
-        self.run_long_form(request)
     }
 
     /// Run the inner single-chunk pipeline directly
@@ -304,17 +325,6 @@ impl LongFormTranscriptionPipeline {
     /// Return the default long-form config
     pub fn config(&self) -> &LongFormConfig {
         &self.default_config
-    }
-
-    fn run_long_form<P: WindowPreprocessor + ?Sized>(
-        &self,
-        request: RunRequest<'_, P>,
-    ) -> Result<TranscriptionResult, PreprocessedTranscriptionError<P::Error>> {
-        match request.config.mode {
-            LongFormMode::Fast => self.run_fast_long_form(request),
-            #[cfg(feature = "vad")]
-            LongFormMode::Vad => self.run_vad_long_form(request),
-        }
     }
 
     #[cfg(feature = "vad")]
@@ -576,7 +586,9 @@ mod tests {
     use super::planner::build_region_plan;
     #[cfg(feature = "vad")]
     use super::planner::{RegionTaskKind, SampleRange, build_vad_execution_plan};
-    use super::{LongFormConfig, LongFormMode, WindowPreprocessor, build_fast_execution_plan};
+    use super::{
+        LongFormConfig, LongFormMode, RunPath, WindowPreprocessor, build_fast_execution_plan,
+    };
     #[cfg(feature = "vad")]
     use super::{detect_speech_regions, merge_overlap_region};
     #[cfg(all(feature = "cuda", feature = "vad"))]
@@ -693,6 +705,13 @@ mod tests {
     /// The planner's own window, not the model's input limit, decides when audio
     /// is planned, so lowering it plans clips the model could take whole
     #[test]
+    #[cfg_attr(
+        not(feature = "vad"),
+        expect(
+            clippy::single_element_loop,
+            reason = "VAD mode exists only with `vad`"
+        )
+    )]
     fn audio_past_the_planner_window_is_planned() {
         let deployment = ParakeetDeployment::v3();
         let mut config = LongFormConfig::from_deployment(&deployment);
@@ -700,6 +719,17 @@ mod tests {
         let window = config.single_window_samples();
 
         assert_eq!(window, 48_000);
+        for mode in [
+            LongFormMode::Fast,
+            #[cfg(feature = "vad")]
+            LongFormMode::Vad,
+        ] {
+            config.mode = mode;
+            assert_eq!(config.run_path(window - 1), RunPath::SingleWindow);
+            assert_eq!(config.run_path(window), RunPath::SingleWindow);
+            assert_eq!(config.run_path(window + 1), RunPath::Planned(mode));
+        }
+
         let plan = build_fast_execution_plan(deployment.hard_sample_max(), &config);
         assert!(plan.tasks.len() > 1);
         assert!(
