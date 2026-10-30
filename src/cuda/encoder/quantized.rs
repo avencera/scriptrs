@@ -8,9 +8,8 @@
 use std::borrow::Cow;
 use std::sync::Mutex;
 
-use cudakit::DeviceTensor;
-use cudakit::Sgemm;
 use cudakit::cudarc::driver::{CudaSlice, CudaView, DevicePtr, DevicePtrMut};
+use cudakit::{DeviceTensor, Error, Sgemm, check_len, element_count};
 
 use super::{EncoderMath, Linear, mixed_precision};
 use crate::cuda::fp16::linear_fp16;
@@ -317,6 +316,24 @@ impl QuantState {
         let Some(quant) = inputs else {
             return Err(mixed_precision());
         };
+        // the activation is quantized for the weight's scales and the product reads
+        // it in the backend's format, so the two must agree for the checks below
+        if matches!(
+            (&w.scales, format),
+            (DeviceScales::Float(_), LtFormat::Nvfp4) | (DeviceScales::Nvfp4 { .. }, LtFormat::Fp8)
+        ) {
+            return Err(mixed_precision());
+        }
+        check_lt_buffers(
+            spec,
+            format,
+            LtBuffers {
+                a: a.len(),
+                c: c.len(),
+                values: quant.values.len(),
+                blocks: quant.blocks.len(),
+            },
+        )?;
         let (rows, width) = (spec.m, spec.k);
         let n = rows * width;
         let kernels = &self.kernels;
@@ -361,10 +378,10 @@ impl QuantState {
             LtFormat::Nvfp4 => quant.blocks.device_ptr(stream),
         };
         let (c_ptr, _c_sync) = c.device_ptr_mut(stream);
-        // SAFETY: the activation and its scales were sized and written above for `rows
-        // x width`, the weight holds `out x inputs` in the scheme's format with
-        // matching scales, and `c` holds `rows x out`; all are ordered on the
-        // runtime's stream
+        // SAFETY: the activation and its scales were checked, sized and written above
+        // for `rows x width`, the weight holds `out x inputs` in the scheme's format
+        // with matching scales, and `c` was checked to hold `rows x out`; all are
+        // ordered on the runtime's stream
         unsafe {
             lt.run(
                 runtime,
@@ -387,18 +404,69 @@ impl QuantState {
     }
 }
 
+/// Element counts of the buffers a cuBLASLt product reads and writes
+#[derive(Debug, Clone, Copy)]
+struct LtBuffers {
+    /// The FP16 activation
+    a: usize,
+    /// The FP32 output
+    c: usize,
+    /// The quantized-activation workspace, sized for the largest product
+    values: usize,
+    /// The NVFP4 block-scale workspace, sized for the largest product
+    blocks: usize,
+}
+
+/// Checks the buffers of `spec` in `format` before the activation is quantized
+///
+/// cuBLASLt reads and writes them through raw pointers with no length checks, and
+/// the workspaces are only sliced to the product's size, which would panic
+fn check_lt_buffers(spec: Sgemm, format: LtFormat, buffers: LtBuffers) -> Result<(), Error> {
+    let activation = element_count("quantized linear a", &[spec.m, spec.k])?;
+    check_len("quantized linear a", activation, buffers.a)?;
+    check_len(
+        "quantized linear c",
+        element_count("quantized linear c", &[spec.m, spec.n])?,
+        buffers.c,
+    )?;
+    let (values, blocks) = match format {
+        LtFormat::Fp8 => (activation, 0),
+        // two E2M1 values per byte
+        LtFormat::Nvfp4 => (
+            activation / 2,
+            ScaleLayout::new(spec.m, spec.k, NV_BLOCK).bytes(),
+        ),
+    };
+    for (context, needed, actual) in [
+        ("quantized activation", values, buffers.values),
+        ("quantized activation scales", blocks, buffers.blocks),
+    ] {
+        if actual < needed {
+            return Err(Error::BufferLength {
+                context,
+                expected: needed,
+                actual,
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use cudakit::{Library, Math, Options};
     use ndarray::{ArrayD, Ix3};
 
-    use super::{DeviceScales, QuantBackend, QuantLinear, QuantState};
+    use super::{DeviceScales, LtBuffers, QuantBackend, QuantLinear, QuantState, check_lt_buffers};
     use crate::cuda::encoder::tests::time_graph;
     use crate::cuda::encoder::{CudaEncoder, EncoderMath, Linear};
     use crate::cuda::kernels::CudaRuntime;
     use crate::cuda::linear;
+    use crate::cuda::lt::LtFormat;
     use crate::cuda::quant::test_support::e4m3_value;
-    use crate::cuda::quant::{QuantizedWeight, Scheme, f16_bits, f16_value, fp8_tensor, nvfp4};
+    use crate::cuda::quant::{
+        NV_BLOCK, QuantizedWeight, ScaleLayout, Scheme, f16_bits, f16_value, fp8_tensor, nvfp4,
+    };
     use crate::cuda::test_support::weights;
     use crate::deployment::{ParakeetDeployment, ParakeetVersion};
     use crate::error::TranscriptionError;
@@ -551,6 +619,54 @@ mod tests {
                 (values, restored)
             }
             Scheme::Int8 => (Vec::new(), values.to_vec()),
+        }
+    }
+
+    /// A buffer short of the product's size is an error before the quantizer
+    /// slices the workspaces or cuBLASLt reads past them
+    #[test]
+    fn quantized_products_reject_short_buffers() {
+        let (rows, out, inputs) = (130, 32, 64);
+        let spec = linear(rows, out, inputs, 1.0, 0.0, Math::Tf32);
+        let blocks = ScaleLayout::new(rows, inputs, NV_BLOCK).bytes();
+        for (format, values, blocks) in [
+            (LtFormat::Fp8, rows * inputs, 1),
+            (LtFormat::Nvfp4, rows * inputs / 2, blocks),
+        ] {
+            let sized = LtBuffers {
+                a: rows * inputs,
+                c: rows * out,
+                values,
+                blocks,
+            };
+            check_lt_buffers(spec, format, sized).expect("buffers sized for the product");
+
+            let mut short = vec![
+                LtBuffers {
+                    a: sized.a - 1,
+                    ..sized
+                },
+                LtBuffers {
+                    c: sized.c - 1,
+                    ..sized
+                },
+                LtBuffers {
+                    values: sized.values - 1,
+                    ..sized
+                },
+            ];
+            if format == LtFormat::Nvfp4 {
+                short.push(LtBuffers {
+                    blocks: sized.blocks - 1,
+                    ..sized
+                });
+            }
+            for buffers in short {
+                assert!(
+                    check_lt_buffers(spec, format, buffers).is_err(),
+                    "{format:?} accepted {buffers:?}"
+                );
+            }
         }
     }
 
