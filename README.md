@@ -10,11 +10,11 @@ Fast [NVIDIA Parakeet TDT](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) s
 
 On an RTX 5090, the CUDA backend transcribes LibriSpeech test-clean at 1534x real
 time one utterance at a time, 3.1x as fast as NVIDIA NeMo and 6.1x as fast as
-parakeet-rs, at the same word error rate. Batched, it is 1.5x as fast as NeMo at
-batch 8 and about even at batch 32 (4928x against 5242x). On 31.6 h of
+parakeet-rs, at the same word error rate. Batched, it is 1.6x as fast as NeMo at
+batch 8 and about even at batch 32 (5338x against 5242x). On 31.6 h of
 multilingual speech the default FP16 mode scores the same WER as the FP32 mode,
 which matches NeMo. On six harder English sets it has a lower WER than Whisper
-large-v3 at about 18x its speed. See [CUDA](#cuda) for the numbers.
+large-v3 at about 20x its speed. See [CUDA](#cuda) for the numbers.
 
 `scriptrs` is early: the public API is still moving.
 
@@ -44,28 +44,28 @@ The base crate exposes a single-chunk `TranscriptionPipeline`. Fast long-audio c
 
 ```toml
 [dependencies]
-scriptrs = "0.3"
+scriptrs = "0.4"
 ```
 
 For native CUDA on Linux:
 
 ```toml
 [dependencies]
-scriptrs = { version = "0.3", features = ["cuda"] }
+scriptrs = { version = "0.4", features = ["cuda"] }
 ```
 
 For fast long-form transcription:
 
 ```toml
 [dependencies]
-scriptrs = { version = "0.3", features = ["long-form"] }
+scriptrs = { version = "0.4", features = ["long-form"] }
 ```
 
 For VAD-backed long-form transcription:
 
 ```toml
 [dependencies]
-scriptrs = { version = "0.3", features = ["vad"] }
+scriptrs = { version = "0.4", features = ["vad"] }
 ```
 
 ## Python
@@ -190,9 +190,9 @@ time:
 | parakeet-rs 0.4.3 (ONNX Runtime) | 253x | 0.52x | 1.93 % |
 
 Through the [queue](#many-short-inputs), which prepares the next inputs on the CPU
-while the GPU runs, the same set runs at 1761x one at a time with identical
-transcripts, and at 4770x in batches of up to 16 (the default). Batching changes 2
-of the 2620 transcripts by one word or punctuation mark, and WER stays 1.93 %.
+while the GPU runs, the same set runs at 1765x one at a time with identical
+transcripts, and at 5111x in batches of up to 16 (the default). Batching changes 2
+of the 2620 transcripts by one word or punctuation mark, and WER is 1.92 %.
 
 NeMo gains more from batching, because large batches are dominated by the
 encoder's matrix multiplies rather than launch overhead. Against NeMo in bf16,
@@ -201,9 +201,9 @@ batch sizes:
 
 | Batch | scriptrs (queue) | NVIDIA NeMo bf16 | vs NeMo |
 |---|---|---|---|
-| 1 | 1758x | 490x | 3.6x |
-| 8 | 4389x | 2958x | 1.5x |
-| 32 | 4928x | 5242x | 0.94x |
+| 1 | 1765x | 490x | 3.6x |
+| 8 | 4637x | 2958x | 1.6x |
+| 32 | 5338x | 5242x | 1.02x |
 
 WER is 1.92–1.93 % for both at every batch size.
 
@@ -218,23 +218,23 @@ default scores the same WER as FP32. Speed is for the FP16 default:
 | FLEURS de, es, fr, it, nl, pt (15.8 h) | 1839x | 4.57 % | 4.57 % |
 | MLS es, fr, it, pt (15.8 h) | 1921x | 6.25 % | 6.26 % |
 
-On all 44 Earnings-21 calls (39 h), long-form with the defaults runs at 3541x with
+On all 44 Earnings-21 calls (39 h), long-form with the defaults runs at 4011x with
 8.24 % pooled WER; NeMo transcribing each whole call with local attention scores
 9.58 %.
 
 On harder English audio, long-form with the defaults and English selected has a
 lower WER than Whisper large-v3 (run through WhisperX 3.8.6 in float16) on every
-set, and runs 14x to 20x as fast:
+set, and runs 16x to 22x as fast:
 
 | Set | Recordings | Hours | scriptrs WER | Whisper WER | scriptrs speed | Whisper speed | vs Whisper |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Earnings-21 earnings calls | 44 | 39.3 | **8.2 %** | 9.7 % | **3541x** | 186x | 19.0x |
-| AMI meetings, headset mix | 34 | 18.7 | **21.5 %** | 23.8 % | **3458x** | 182x | 19.0x |
-| AMI meetings, far-field microphone | 34 | 18.7 | **23.2 %** | 28.3 % | **3447x** | 199x | 17.3x |
-| EdAcc accented conversations | 40 | 18.2 | **16.0 %** | 19.2 % | **3472x** | 201x | 17.3x |
-| CHiME-6 dinner parties | 4 | 9.7 | **44.0 %** | 44.7 % | **3474x** | 176x | 19.7x |
-| AppTek call-center calls, 14 accents | 56 | 9.4 | **11.2 %** | 12.6 % | **3108x** | 224x | 13.9x |
-| Mean over sets | 212 | 114 | **20.7 %** | 23.1 % | **3456x** | 191x | 18.0x |
+| Earnings-21 earnings calls | 44 | 39.3 | **8.2 %** | 9.7 % | **4011x** | 186x | 21.6x |
+| AMI meetings, headset mix | 34 | 18.7 | **21.5 %** | 23.8 % | **3917x** | 182x | 21.5x |
+| AMI meetings, far-field microphone | 34 | 18.7 | **23.2 %** | 28.3 % | **3912x** | 199x | 19.6x |
+| EdAcc accented conversations | 40 | 18.2 | **16.0 %** | 19.2 % | **3949x** | 201x | 19.7x |
+| CHiME-6 dinner parties | 4 | 9.7 | **44.0 %** | 44.7 % | **3942x** | 176x | 22.4x |
+| AppTek call-center calls, 14 accents | 56 | 9.4 | **11.2 %** | 12.6 % | **3512x** | 224x | 15.7x |
+| Mean over sets | 212 | 114 | **20.7 %** | 23.1 % | **3918x** | 191x | 20.5x |
 
 WER is pooled over each set's recordings, both sides through Whisper's English
 normalizer. Speed is x real time for transcription alone on one RTX 5090, with
@@ -285,8 +285,8 @@ On an RTX 5090 with Parakeet v3 (speed in x real time, then WER):
 | | FP16 (default) | TF32 | FP32 |
 |---|---|---|---|
 | LibriSpeech test-clean, one utterance at a time | 1534x, 1.93 % | 1179x, 1.93 % | 848x, 1.93 % |
-| LibriSpeech test-clean, queue in batches of 16 | 4767x, 1.93 % | 3364x, 1.92 % | — |
-| Earnings-21, long-form | 3633x, 8.24 % | 2633x, 8.24 % | — |
+| LibriSpeech test-clean, queue in batches of 16 | 5111x, 1.92 % | 3438x, 1.93 % | — |
+| Earnings-21, long-form | 4173x, 8.24 % | 2772x, 8.24 % | — |
 | FLEURS de, es, fr, it, nl, pt (15.8 h) | 1839x, 4.57 % | 1450x, 4.57 % | 966x, 4.57 % |
 | MLS es, fr, it, pt (15.8 h) | 1921x, 6.25 % | 1524x, 6.26 % | 996x, 6.26 % |
 

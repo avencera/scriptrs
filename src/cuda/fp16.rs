@@ -2,8 +2,10 @@
 //!
 //! cudakit's [`Sgemm`](cudakit::Sgemm) takes FP32 operands only, so the FP16 products
 //! call `cublasGemmEx` on cudakit's shared handle. Operands are FP16 bit patterns in
-//! `u16` buffers, which the encoder kernels write; the output and the accumulation
-//! stay FP32, so a residual add through `beta = 1` keeps full precision
+//! `u16` buffers, which the encoder kernels write. The accumulation is FP32, and so is
+//! the output, so a residual add through `beta = 1` keeps full precision, except for
+//! the projections only the fused attention reads, which [`linear_fp16_to_fp16`]
+//! rounds to FP16
 
 use std::ffi::{CStr, c_void};
 
@@ -35,6 +37,41 @@ where
     A: DevicePtr<u16>,
     W: DevicePtr<u16>,
     C: DevicePtrMut<f32>,
+{
+    gemm_fp16(runtime, spec, a, w, c, cudaDataType::CUDA_R_32F)
+}
+
+/// [`linear_fp16`] with `c` in FP16 too, each output rounded once from the FP32
+/// accumulator
+pub(crate) fn linear_fp16_to_fp16<A, W, C>(
+    runtime: &CudaRuntime,
+    spec: Sgemm,
+    a: &A,
+    w: &W,
+    c: &mut C,
+) -> Result<(), Error>
+where
+    A: DevicePtr<u16>,
+    W: DevicePtr<u16>,
+    C: DevicePtrMut<u16>,
+{
+    gemm_fp16(runtime, spec, a, w, c, cudaDataType::CUDA_R_16F)
+}
+
+/// `c = alpha * a · wᵀ + beta * c` with FP16 `a` and `w`, FP32 compute and `c` of
+/// `c_type`, which must be `T`'s
+fn gemm_fp16<T, A, W, C>(
+    runtime: &CudaRuntime,
+    spec: Sgemm,
+    a: &A,
+    w: &W,
+    c: &mut C,
+    c_type: cudaDataType,
+) -> Result<(), Error>
+where
+    A: DevicePtr<u16>,
+    W: DevicePtr<u16>,
+    C: DevicePtrMut<T>,
 {
     let context = "fp16 linear";
     if spec.a_transposed || !spec.b_transposed {
@@ -81,7 +118,7 @@ where
             inputs,
             (&raw const spec.beta).cast::<c_void>(),
             c_ptr as *mut c_void,
-            cudaDataType::CUDA_R_32F,
+            c_type,
             out,
             cublasComputeType_t::CUBLAS_COMPUTE_32F,
             cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,

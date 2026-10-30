@@ -76,8 +76,12 @@ pub(crate) enum RuntimeBundle {
 ///
 /// The three apply to offline transcription only: a streaming model fails to load
 /// with them
+///
+/// Matches on `Precision` need a wildcard arm: the `low-precision` feature adds
+/// variants, and any crate in a build can turn it on
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Precision {
     /// The default, and the right choice for almost every use
     ///

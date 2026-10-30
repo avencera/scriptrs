@@ -15,10 +15,14 @@ path = "src/lib.rs"
 
 # one feature per area: each area is compiled on its own into one PTX file
 [features]
+# sm_80: the fused attention kernels need mma.sync and cp.async
+attention = []
 decode = []
 encoder = []
 quant = []
 
 [dependencies]
 # keep the rev in sync with speakrs and cudakit until cudakit-build owns the pin
+# fully unrolls the attention fragment loops
+seq-macro = "0.3"
 cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "918bbde123671153b29a89542f1781f1c7494c14" }
