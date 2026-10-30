@@ -35,6 +35,7 @@ pub(super) fn multi_array_f32(
 ) -> Result<Retained<MLMultiArray>, TranscriptionError> {
     multi_array(
         values.as_ptr().cast::<c_void>() as *mut c_void,
+        values.len(),
         cached,
         MLMultiArrayDataType::Float32,
         deallocator,
@@ -48,24 +49,36 @@ pub(super) fn multi_array_i32(
 ) -> Result<Retained<MLMultiArray>, TranscriptionError> {
     multi_array(
         values.as_ptr().cast::<c_void>() as *mut c_void,
+        values.len(),
         cached,
         MLMultiArrayDataType::Int32,
         deallocator,
     )
 }
 
+/// Wraps `len` borrowed values at `ptr` as an array of `cached`'s shape
 fn multi_array(
     ptr: *mut c_void,
+    len: usize,
     cached: &CachedInputShape,
     data_type: MLMultiArrayDataType,
     deallocator: &RcBlock<dyn Fn(NonNull<c_void>)>,
 ) -> Result<Retained<MLMultiArray>, TranscriptionError> {
+    // Core ML reads the whole cached shape through the pointer, so a shorter slice
+    // would be read past its end
+    if len != cached.total_elements {
+        return Err(TranscriptionError::CoreMl(format!(
+            "CoreML input `{}` has {len} values, not the {} of its shape",
+            cached.name, cached.total_elements
+        )));
+    }
     let ptr = NonNull::new(ptr).ok_or_else(|| {
         TranscriptionError::CoreMl("input tensor had a null data pointer".to_owned())
     })?;
 
     // SAFETY: the pointer, cached shape, and cached strides all describe the same borrowed
-    // tensor buffer, and CoreML only reads them during the prediction call
+    // tensor buffer, whose length was checked above, and CoreML only reads them during
+    // the prediction call
     unsafe {
         MLMultiArray::initWithDataPointer_shape_dataType_strides_deallocator_error(
             MLMultiArray::alloc(),
@@ -239,4 +252,29 @@ fn f16_to_f32(bits: u16) -> f32 {
 
     let f32_exp = (exp as i32) - 15 + 127;
     f32::from_bits((sign << 31) | ((f32_exp as u32) << 23) | (mantissa << 13))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::c_void;
+    use std::ptr::NonNull;
+
+    use block2::RcBlock;
+
+    use super::{multi_array_f32, multi_array_i32};
+    use crate::coreml::CachedInputShape;
+
+    /// Core ML reads a whole input's shape through its pointer, so a slice of any
+    /// other length is an error rather than a read past its end
+    #[test]
+    fn inputs_must_fill_their_cached_shape() {
+        let cached = CachedInputShape::new("audio_signal", &[1, 4]);
+        let deallocator: RcBlock<dyn Fn(NonNull<c_void>)> = RcBlock::new(|_: NonNull<c_void>| {});
+
+        assert!(multi_array_f32(&[0.0; 3], &cached, &deallocator).is_err());
+        assert!(multi_array_i32(&[0; 3], &cached, &deallocator).is_err());
+        assert!(multi_array_f32(&[0.0; 5], &cached, &deallocator).is_err());
+        multi_array_f32(&[0.0; 4], &cached, &deallocator).expect("a full input wraps");
+        multi_array_i32(&[0; 4], &cached, &deallocator).expect("a full input wraps");
+    }
 }
