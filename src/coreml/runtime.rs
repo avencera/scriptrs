@@ -23,7 +23,7 @@ pub(super) fn load_model(
     let path_str = NSString::from_str(&path.to_string_lossy());
     let url = NSURL::fileURLWithPath_isDirectory(&path_str, true);
     // SAFETY: the URL and configuration are valid Objective-C objects for the duration
-    // SAFETY: of this call, and CoreML retains anything it needs internally
+    // of this call, and CoreML retains anything it needs internally
     unsafe {
         let config = MLModelConfiguration::new();
         config.setComputeUnits(compute_units);
@@ -58,7 +58,7 @@ fn insert_input_feature(
     multi_array: &MLMultiArray,
 ) {
     // SAFETY: multi_array is a live CoreML object for this prediction call, and setObject retains
-    // SAFETY: the inserted feature value before the temporary Retained<MLFeatureValue> is dropped
+    // the inserted feature value before the temporary Retained<MLFeatureValue> is dropped
     unsafe {
         let feature_value = MLFeatureValue::featureValueWithMultiArray(multi_array);
         input_dict.setObject_forKey(feature_value_as_any_object(&feature_value), key_copy);
@@ -104,6 +104,6 @@ pub(super) fn output_multi_array(
 
 fn feature_value_as_any_object(feature_value: &MLFeatureValue) -> &AnyObject {
     // SAFETY: MLFeatureValue is an Objective-C object and shares pointer representation
-    // SAFETY: with AnyObject for APIs that erase the concrete class type
+    // with AnyObject for APIs that erase the concrete class type
     unsafe { &*(feature_value as *const MLFeatureValue).cast::<AnyObject>() }
 }

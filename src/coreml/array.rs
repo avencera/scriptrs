@@ -64,9 +64,8 @@ fn multi_array(
         TranscriptionError::CoreMl("input tensor had a null data pointer".to_owned())
     })?;
 
-    #[allow(deprecated)]
     // SAFETY: the pointer, cached shape, and cached strides all describe the same borrowed
-    // SAFETY: tensor buffer, and CoreML only reads them during the prediction call
+    // tensor buffer, and CoreML only reads them during the prediction call
     unsafe {
         MLMultiArray::initWithDataPointer_shape_dataType_strides_deallocator_error(
             MLMultiArray::alloc(),
@@ -80,12 +79,15 @@ fn multi_array(
     .map_err(|error| TranscriptionError::CoreMl(format!("failed to create MLMultiArray: {error}")))
 }
 
-#[allow(deprecated)]
+#[expect(
+    deprecated,
+    reason = "outputs are read through dataPointer rather than the block-based getBytesWithHandler"
+)]
 pub(super) fn extract_output(
     array: &MLMultiArray,
 ) -> Result<(Vec<f32>, Vec<usize>), TranscriptionError> {
     // SAFETY: CoreML guarantees these accessors describe the live MLMultiArray returned
-    // SAFETY: by prediction, including the element count, dtype, and backing pointer
+    // by prediction, including the element count, dtype, and backing pointer
     let (count, ptr, dtype, shape, strides) = unsafe {
         (
             array.count() as usize,
@@ -180,7 +182,7 @@ fn read_strided<T: Copy>(
     for linear_index in 0..count {
         let offset = linear_offset(linear_index, shape, strides)?;
         // SAFETY: `offset` is computed from the live MLMultiArray shape/strides and points
-        // SAFETY: to the logical element for this row-major linear index
+        // to the logical element for this row-major linear index
         values.push(unsafe { *ptr.offset(offset) });
     }
 
