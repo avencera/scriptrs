@@ -111,8 +111,7 @@ impl PyPipeline {
 
     #[getter]
     fn max_chunk_seconds(&self) -> f64 {
-        let transcription = &self.config.transcription;
-        transcription.max_audio_samples as f64 / transcription.sample_rate as f64
+        self.deployment.hard_sample_max() as f64 / self.deployment.frontend().sample_rate() as f64
     }
 
     #[pyo3(signature = (samples, language=None))]
@@ -201,7 +200,7 @@ fn run_many(
     config: &LongFormConfig,
     queue: QueueConfig,
 ) -> PyResult<Vec<Result<TranscriptionResult, TranscriptionError>>> {
-    let max_samples = config.transcription.max_audio_samples;
+    let max_samples = pipeline.base_pipeline().deployment().hard_sample_max();
     let mut results: Vec<Option<Result<TranscriptionResult, TranscriptionError>>> =
         audios.iter().map(|_| None).collect();
     let mut short = Vec::new();
@@ -244,8 +243,7 @@ fn run_queue(
     config: &LongFormConfig,
     queue: QueueConfig,
 ) -> Result<Vec<QueuedTranscriptionResult>, QueueError> {
-    let (sender, mut receiver) =
-        pipeline.into_queued_with_config(config.transcription.clone(), queue)?;
+    let (sender, mut receiver) = pipeline.into_queued_with_config(config.transcription, queue)?;
     let mut finished = Vec::with_capacity(inputs.len());
 
     for (index, audio) in inputs {

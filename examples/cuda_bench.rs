@@ -149,10 +149,7 @@ fn bench_manifest(
     queue: Option<QueueConfig>,
 ) -> Result<Bench> {
     let pipeline = TranscriptionPipeline::from_bundle(bundle)?;
-    let config = TranscriptionConfig {
-        language,
-        ..pipeline.config().clone()
-    };
+    let config = TranscriptionConfig { language };
     let mut utterances = load_manifest(manifest)?;
     utterances.sort_by(|a, b| b.audio.len().cmp(&a.audio.len()).then(a.id.cmp(&b.id)));
     let audio_s: f64 = utterances
@@ -180,9 +177,7 @@ fn bench_manifest(
                 }
             }
             Some(queue) => {
-                let (sender, receiver) = pipeline
-                    .clone()
-                    .into_queued_with_config(config.clone(), queue)?;
+                let (sender, receiver) = pipeline.clone().into_queued_with_config(config, queue)?;
                 let utterances = &utterances;
                 thread::scope(|scope| -> Result<()> {
                     let producer = scope.spawn(move || push_all(&sender, utterances));

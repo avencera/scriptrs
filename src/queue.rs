@@ -212,7 +212,7 @@ impl TranscriptionPipeline {
     /// # }
     /// ```
     pub fn into_queued(self) -> Result<(QueueSender, QueueReceiver), QueueError> {
-        let config = self.config().clone();
+        let config = *self.config();
         self.into_queued_with_config(config, QueueConfig::default())
     }
 
@@ -224,7 +224,7 @@ impl TranscriptionPipeline {
         queue: QueueConfig,
     ) -> Result<(QueueSender, QueueReceiver), QueueError> {
         queue.validate()?;
-        config.validate_for(self.deployment())?;
+        self.deployment().select_language(config.language)?;
 
         let (request_tx, request_rx) = sync_channel(queue.capacity);
         let (result_tx, result_rx) = sync_channel(queue.capacity);
@@ -233,7 +233,7 @@ impl TranscriptionPipeline {
         let worker = thread::Builder::new()
             .name("scriptrs-queue".to_owned())
             .spawn(move || {
-                run_worker(&self, &config, queue, request_rx, &result_tx, &worker_stop);
+                run_worker(&self, config, queue, request_rx, &result_tx, &worker_stop);
             })
             .map_err(QueueError::WorkerStart)?;
         let sender = QueueSender {
@@ -479,7 +479,7 @@ impl Drop for StopOnDrop<'_> {
 /// `prepared_rx`, which ends preparation within [`STOP_POLL`] or at its next send
 fn run_worker(
     pipeline: &TranscriptionPipeline,
-    config: &TranscriptionConfig,
+    config: TranscriptionConfig,
     queue: QueueConfig,
     request_rx: Receiver<(QueuedTranscriptionJobId, QueuedTranscriptionRequest)>,
     result_tx: &SyncSender<QueuedTranscriptionResult>,
@@ -488,11 +488,13 @@ fn run_worker(
     // the model drains up to a batch of prepared inputs while the next batch is
     // prepared, which bounds the features held in memory
     let (prepared_tx, prepared_rx) = sync_channel::<Prepared>(queue.max_batch);
+    // the pipeline is not `Sync`, so preparation gets the deployment's chunk spec
+    let chunk = pipeline.chunk_spec();
     thread::scope(|scope| {
         thread::Builder::new()
             .name("scriptrs-queue-prep".to_owned())
             .spawn_scoped(scope, move || {
-                let preparer = TranscriptionPipeline::chunk_preparer(config);
+                let preparer = chunk.preparer();
                 while !stop.load(Ordering::Acquire) {
                     let (job_id, request) = match request_rx.recv_timeout(STOP_POLL) {
                         Ok(next) => next,
@@ -524,7 +526,7 @@ fn run_worker(
 /// return or by panic, which wakes preparation if it is blocked on a full channel
 fn transcribe_prepared(
     pipeline: &TranscriptionPipeline,
-    config: &TranscriptionConfig,
+    config: TranscriptionConfig,
     max_batch: usize,
     prepared_rx: Receiver<Prepared>,
     result_tx: &SyncSender<QueuedTranscriptionResult>,
@@ -549,7 +551,7 @@ fn transcribe_prepared(
 /// false once the receiver is gone
 fn transcribe_batch(
     pipeline: &TranscriptionPipeline,
-    config: &TranscriptionConfig,
+    config: TranscriptionConfig,
     batch: &mut VecDeque<Prepared>,
     result_tx: &SyncSender<QueuedTranscriptionResult>,
 ) -> bool {
@@ -599,7 +601,7 @@ fn transcribe_batch(
                         )))
                     })
             });
-            let duration_seconds = samples as f64 / config.sample_rate as f64;
+            let duration_seconds = pipeline.chunk_spec().duration_seconds(samples);
             QueuedTranscriptionResult {
                 job_id,
                 id,

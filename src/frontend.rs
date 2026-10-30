@@ -5,14 +5,14 @@ use std::sync::Arc;
 use ndarray::Array2;
 use realfft::{RealFftPlanner, RealToComplex, num_complex::Complex};
 
-use crate::config::TranscriptionConfig;
+use crate::deployment::FrontendSpec;
 use crate::error::TranscriptionError;
 
 #[cfg(feature = "cuda")]
 pub(crate) mod stream;
 
 pub(crate) struct ParakeetFeatureExtractor {
-    config: TranscriptionConfig,
+    config: FrontendSpec,
     mel_filterbank: MelFilterbank,
     window: Vec<f32>,
     r2c: Arc<dyn RealToComplex<f32>>,
@@ -30,7 +30,7 @@ impl std::fmt::Debug for ParakeetFeatureExtractor {
 impl Clone for ParakeetFeatureExtractor {
     fn clone(&self) -> Self {
         Self {
-            config: self.config.clone(),
+            config: self.config,
             mel_filterbank: self.mel_filterbank.clone(),
             window: self.window.clone(),
             r2c: self.r2c.clone(),
@@ -89,17 +89,17 @@ impl StftWorkspace {
 }
 
 impl ParakeetFeatureExtractor {
-    pub(crate) fn new(config: &TranscriptionConfig) -> Self {
+    pub(crate) fn new(config: FrontendSpec) -> Self {
         let mut planner = RealFftPlanner::<f32>::new();
-        let r2c = planner.plan_fft_forward(config.n_fft);
+        let r2c = planner.plan_fft_forward(config.n_fft());
         Self {
-            config: config.clone(),
+            config,
             mel_filterbank: MelFilterbank::new(&create_mel_filterbank(
-                config.n_fft,
-                config.feature_size,
-                config.sample_rate,
+                config.n_fft(),
+                config.feature_size(),
+                config.sample_rate(),
             )),
-            window: hann_window(config.win_length),
+            window: hann_window(config.win_length()),
             stft_workspace: RefCell::new(StftWorkspace::new(&r2c)),
             r2c,
         }
@@ -112,7 +112,7 @@ impl ParakeetFeatureExtractor {
 
         let mut workspace = self.stft_workspace.borrow_mut();
         let num_frames = self.power_spectrum(&mut workspace, audio)?;
-        let freq_bins = self.config.n_fft / 2 + 1;
+        let freq_bins = self.config.n_fft() / 2 + 1;
         let mut features = Array2::<f32>::zeros((num_frames, self.mel_filterbank.mels()));
         let rows = workspace
             .power
@@ -135,22 +135,26 @@ impl ParakeetFeatureExtractor {
         workspace: &mut StftWorkspace,
         audio: &[f32],
     ) -> Result<usize, TranscriptionError> {
-        apply_preemphasis_into(audio, self.config.preemphasis, &mut workspace.preemphasized);
+        apply_preemphasis_into(
+            audio,
+            self.config.preemphasis(),
+            &mut workspace.preemphasized,
+        );
 
-        let pad_amount = self.config.n_fft / 2;
+        let pad_amount = self.config.n_fft() / 2;
         workspace.prepare_padded_audio(pad_amount);
 
         // NeMo counts `len / hop` valid frames; the STFT's extra trailing frame is
         // padding that NeMo masks out and leaves out of normalization. One frame
         // is kept for audio shorter than a hop so the encoder has an input
-        let num_frames = (audio.len() / self.config.hop_length).max(1);
-        let freq_bins = self.config.n_fft / 2 + 1;
+        let num_frames = (audio.len() / self.config.hop_length()).max(1);
+        let freq_bins = self.config.n_fft() / 2 + 1;
         workspace.power.clear();
         workspace.power.reserve(num_frames * freq_bins);
 
         // reuse the FFT plan and temporary buffers across chunk extractions
         for frame_idx in 0..num_frames {
-            let start = frame_idx * self.config.hop_length;
+            let start = frame_idx * self.config.hop_length();
             workspace.process_frame(&self.r2c, &self.window, start)?;
             let StftWorkspace { output, power, .. } = &mut *workspace;
             power.extend(output[..freq_bins].iter().map(Complex::norm_sqr));
@@ -163,7 +167,7 @@ impl ParakeetFeatureExtractor {
     fn stft(&self, audio: &[f32]) -> Result<Array2<f32>, TranscriptionError> {
         let mut workspace = self.stft_workspace.borrow_mut();
         let num_frames = self.power_spectrum(&mut workspace, audio)?;
-        let freq_bins = self.config.n_fft / 2 + 1;
+        let freq_bins = self.config.n_fft() / 2 + 1;
         let power = Array2::from_shape_vec((num_frames, freq_bins), workspace.power.clone())
             .expect("the power spectrum holds frames * bins values");
         Ok(power.reversed_axes())
@@ -391,9 +395,8 @@ fn normalize_columns(features: &mut Array2<f32>) {
 mod tests {
     use approx::assert_abs_diff_eq;
 
-    use super::{
-        Array2, MelFilterbank, ParakeetFeatureExtractor, TranscriptionConfig, create_mel_filterbank,
-    };
+    use super::{Array2, MelFilterbank, ParakeetFeatureExtractor, create_mel_filterbank};
+    use crate::deployment::ParakeetDeployment;
 
     fn sine_wave(frequency_hz: f32, sample_rate: usize, num_samples: usize) -> Vec<f32> {
         (0..num_samples)
@@ -407,7 +410,7 @@ mod tests {
     #[test]
     fn stft_concentrates_power_at_the_expected_bin() {
         let sample_rate = 16_000;
-        let extractor = ParakeetFeatureExtractor::new(&TranscriptionConfig::default());
+        let extractor = ParakeetFeatureExtractor::new(ParakeetDeployment::v2().frontend());
         let spectrum = extractor
             .stft(&sine_wave(1000.0, sample_rate, sample_rate))
             .unwrap();
@@ -431,8 +434,9 @@ mod tests {
 
     #[test]
     fn sparse_filterbank_matches_the_dense_product() {
-        let config = TranscriptionConfig::default();
-        let dense = create_mel_filterbank(config.n_fft, config.feature_size, config.sample_rate);
+        let config = ParakeetDeployment::v2().frontend();
+        let dense =
+            create_mel_filterbank(config.n_fft(), config.feature_size(), config.sample_rate());
         let filterbank = MelFilterbank::new(&dense);
         // non-negative like a power spectrum and different in every bin, with frames
         // spread over several orders of magnitude so rounding differs between them
@@ -463,7 +467,7 @@ mod tests {
 
     #[test]
     fn feature_extraction_produces_expected_shape() {
-        let extractor = ParakeetFeatureExtractor::new(&TranscriptionConfig::default());
+        let extractor = ParakeetFeatureExtractor::new(ParakeetDeployment::v2().frontend());
         let audio = sine_wave(440.0, 16_000, 16_000);
         let features = extractor.extract(&audio).unwrap();
         assert_eq!(features.shape()[1], 128);
@@ -472,7 +476,7 @@ mod tests {
 
     #[test]
     fn features_are_column_normalized() {
-        let extractor = ParakeetFeatureExtractor::new(&TranscriptionConfig::default());
+        let extractor = ParakeetFeatureExtractor::new(ParakeetDeployment::v2().frontend());
         let audio = sine_wave(440.0, 16_000, 16_000);
         let features = extractor.extract(&audio).unwrap();
         let column = features.column(0);
@@ -490,9 +494,7 @@ mod tests {
         let mel = reference.f32("mel");
         let mel_len = reference.i64("mel_len")[0] as usize;
 
-        let extractor = ParakeetFeatureExtractor::new(&TranscriptionConfig::from_deployment(
-            &deployment(version),
-        ));
+        let extractor = ParakeetFeatureExtractor::new(deployment(version).frontend());
         let samples: Vec<f32> = audio.iter().take(audio_len).copied().collect();
         let features = extractor.extract(&samples).unwrap();
 

@@ -101,7 +101,7 @@ impl LongFormConfig {
             mode: LongFormMode::default(),
             worker_count: 4,
             batch_size: 1,
-            transcription: TranscriptionConfig::from_deployment(deployment),
+            transcription: TranscriptionConfig::default(),
             #[cfg(feature = "vad")]
             vad: VadConfig::default(),
             #[cfg(feature = "vad")]
@@ -137,7 +137,7 @@ impl LongFormConfig {
                 "long-form batch_size must be positive".to_owned(),
             ));
         }
-        self.transcription.validate_for(deployment)?;
+        deployment.select_language(self.transcription.language)?;
         self.overlap.validate_for(deployment)?;
 
         #[cfg(feature = "vad")]
@@ -262,7 +262,7 @@ impl LongFormTranscriptionPipeline {
             control,
             preprocessor,
         };
-        if audio.len() <= config.transcription.max_audio_samples {
+        if audio.len() <= self.inner.chunk_spec().max_samples() {
             control.check_plan(1)?;
             return self.run_single_task(request);
         }
@@ -278,15 +278,7 @@ impl LongFormTranscriptionPipeline {
         let control = TranscriptionControl::internal_unbounded();
         let config = &self.default_config;
         config.validate_for(self.inner.deployment())?;
-        if audio.is_empty() {
-            return Err(TranscriptionError::EmptyAudio);
-        }
-        if audio.len() > config.transcription.max_audio_samples {
-            return Err(TranscriptionError::AudioTooLong {
-                max_seconds: config.transcription.max_duration_seconds(),
-                actual_seconds: audio.len() as f64 / config.transcription.sample_rate as f64,
-            });
-        }
+        self.inner.chunk_spec().check(audio)?;
         validate_finite_samples(audio, 0)?;
         control.check_plan(1).map_err(TranscriptionError::from)?;
         self.run_single_task(RunRequest {
@@ -735,7 +727,7 @@ mod tests {
             "the native defaults must select the batched path"
         );
         assert!(
-            LONG_AUDIO_SAMPLES > config.transcription.max_audio_samples,
+            LONG_AUDIO_SAMPLES > bundle.deployment().hard_sample_max(),
             "the audio must exceed the single-input limit"
         );
 
@@ -1183,7 +1175,7 @@ mod tests {
     fn gpu_vad_runs_the_preprocessor_once_per_planned_speech_window() {
         let (pipeline, base) = native_vad_pipeline();
         let (audio, gap_midpoints) = sparse_speech();
-        assert!(audio.len() > base.transcription.max_audio_samples);
+        assert!(audio.len() > pipeline.base_pipeline().deployment().hard_sample_max());
 
         for path in [
             ExecutionPath::Serial,

@@ -91,12 +91,12 @@ fn gpu_queue_at_batch_one_matches_the_pipeline() {
         .iter()
         .map(|(_, audio)| pipeline.run(audio).expect("run"))
         .collect();
-    let config = pipeline.config().clone();
-    let too_long = vec![0.0; config.max_audio_samples + 1];
+    let too_long = vec![0.0; pipeline.deployment().hard_sample_max() + 1];
     let queue = QueueConfig {
         capacity: 2,
         max_batch: 1,
     };
+    let config = *pipeline.config();
     let (sender, mut receiver) = pipeline
         .into_queued_with_config(config, queue)
         .expect("queue");
@@ -174,7 +174,7 @@ fn gpu_batched_queue_transcribes_like_the_pipeline() {
         .iter()
         .map(|(_, audio)| pipeline.run(audio).expect("run"))
         .collect();
-    let config = pipeline.config().clone();
+    let config = *pipeline.config();
     let queue = QueueConfig {
         max_batch: 8,
         ..QueueConfig::default()

@@ -1,7 +1,6 @@
 #[cfg(target_os = "macos")]
 use crate::backend::HostLoop;
 use crate::backend::{ChunkDecode, DecodePolicy, EncoderChunk};
-use crate::config::TranscriptionConfig;
 use crate::deployment::ParakeetDeployment;
 use crate::error::TranscriptionError;
 use crate::language::LanguageSelection;
@@ -20,12 +19,10 @@ impl ParakeetModel {
     pub(crate) fn from_bundle(
         bundle: &ModelBundle,
         vocab: &Vocabulary,
-        config: &TranscriptionConfig,
     ) -> Result<Self, TranscriptionError> {
         let deployment = bundle.deployment().clone();
-        config.validate_for(&deployment)?;
         Ok(Self {
-            inner: ParakeetModelInner::from_bundle(bundle, config)?,
+            inner: ParakeetModelInner::from_bundle(bundle)?,
             vocabulary: vocab.clone(),
             deployment,
         })
@@ -78,34 +75,34 @@ enum ParakeetModelInner {
 }
 
 impl ParakeetModelInner {
-    fn from_bundle(
-        bundle: &ModelBundle,
-        config: &TranscriptionConfig,
-    ) -> Result<Self, TranscriptionError> {
+    fn from_bundle(bundle: &ModelBundle) -> Result<Self, TranscriptionError> {
         match bundle.runtime() {
             RuntimeBundle::CoreMl(layout) => {
                 #[cfg(target_os = "macos")]
                 {
-                    let dims = bundle.deployment().decoder_dimensions();
+                    let deployment = bundle.deployment();
+                    let dims = deployment.decoder_dimensions();
+                    let features = deployment.frontend().feature_size();
                     // the Core ML encoder takes a fixed-width input sized for the
                     // longest single chunk, which the host loop pads every chunk to
-                    let target_frames = config.max_feature_frames();
+                    let target_frames =
+                        deployment.hard_sample_max() / deployment.frontend().hop_length() + 1;
                     Ok(Self::SplitCoreMl {
                         model: Box::new(crate::coreml::ParakeetSplitCoreMlModel::new(
                             layout.encoder_dir(),
                             layout.decoder_dir(),
                             layout.joint_decision_dir(),
-                            bundle.deployment().model_io(),
+                            deployment.model_io(),
                             dims,
-                            config.feature_size,
+                            features,
                             target_frames,
                         )?),
-                        host: HostLoop::new(dims, config.feature_size, target_frames),
+                        host: HostLoop::new(dims, features, target_frames),
                     })
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
-                    let _ = (layout, config);
+                    let _ = layout;
                     Err(TranscriptionError::UnsupportedPlatform)
                 }
             }
