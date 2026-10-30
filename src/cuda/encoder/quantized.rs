@@ -393,7 +393,7 @@ mod tests {
     use crate::cuda::test_support::weights;
     use crate::deployment::{ParakeetDeployment, ParakeetVersion};
     use crate::error::TranscriptionError;
-    use crate::test_support::NemoReference;
+    use crate::test_support::{NemoReference, deployment};
 
     impl CudaEncoder {
         /// Device bytes of the Conformer layers' linear weights and their scales
@@ -693,12 +693,11 @@ mod tests {
         let runtime = CudaRuntime::open(0, Options::default()).expect("CUDA runtime");
         runtime.prepare(Library::Cublas).expect("cuBLAS");
         for version in [ParakeetVersion::V2, ParakeetVersion::V3] {
-            let deployment = match version {
-                ParakeetVersion::V2 => ParakeetDeployment::v2(),
-                ParakeetVersion::V3 => ParakeetDeployment::v3(),
-            };
             let file = weights(version);
-            let spec = file.parakeet_spec(&deployment).expect("spec").encoder;
+            let spec = file
+                .parakeet_spec(&deployment(version))
+                .expect("spec")
+                .encoder;
             let inputs: Vec<_> = ["b1", "b8", "long-full"]
                 .into_iter()
                 .map(|set| (set, NemoInput::open(version, set)))

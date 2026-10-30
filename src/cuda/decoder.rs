@@ -835,19 +835,12 @@ mod tests {
     use crate::deployment::{ParakeetDeployment, ParakeetVersion};
     use crate::language::{LanguageSelection, ParakeetLanguage};
     use crate::models::ModelBundle;
-    use crate::test_support::NemoReference;
+    use crate::test_support::{NemoReference, deployment};
 
     /// Steps per host check of the frame cursors
     const STEPS_PER_CHECK: usize = 16;
 
     const SETS: [&str; 3] = ["b1", "b8", "long-full"];
-
-    fn deployment(version: ParakeetVersion) -> ParakeetDeployment {
-        match version {
-            ParakeetVersion::V2 => ParakeetDeployment::v2(),
-            ParakeetVersion::V3 => ParakeetDeployment::v3(),
-        }
-    }
 
     fn runtime() -> CudaRuntime {
         let runtime = CudaRuntime::open(0, Options::default()).expect("CUDA runtime");

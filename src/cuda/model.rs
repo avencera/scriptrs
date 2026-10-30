@@ -383,7 +383,7 @@ mod tests {
     use crate::language::{LanguageSelection, ParakeetLanguage};
     use crate::models::{ModelBundle, Precision};
     use crate::pipeline::TranscriptionPipeline;
-    use crate::test_support::NemoReference;
+    use crate::test_support::{NemoReference, deployment};
     use crate::types::TranscriptionResult;
 
     /// Runs each b8 utterance alone under a cache budget of two of the largest
@@ -599,12 +599,9 @@ mod tests {
             .into_iter()
             .flat_map(|version| [(version, Precision::Fp32), (version, Precision::Fp16)])
         {
-            let deployment = match version {
-                ParakeetVersion::V2 => ParakeetDeployment::v2(),
-                ParakeetVersion::V3 => ParakeetDeployment::v3(),
-            };
-            let pipeline = TranscriptionPipeline::from_bundle(native_bundle(deployment, precision))
-                .expect("pipeline");
+            let pipeline =
+                TranscriptionPipeline::from_bundle(native_bundle(deployment(version), precision))
+                    .expect("pipeline");
 
             for set in ["b1", "b8"] {
                 let reference = NemoReference::open(version, set);

@@ -1517,7 +1517,7 @@ mod tests {
     use crate::cuda::kernels::CudaRuntime;
     use crate::cuda::test_support::{compare, weights};
     use crate::deployment::{ParakeetDeployment, ParakeetVersion};
-    use crate::test_support::NemoReference;
+    use crate::test_support::{NemoReference, deployment};
 
     #[test]
     #[should_panic(expected = "row 0 frame 1")]
@@ -1562,12 +1562,8 @@ mod tests {
         runtime.prepare(Library::Cublas).expect("cuBLAS");
         let mut worst = 0f64;
         for version in [ParakeetVersion::V2, ParakeetVersion::V3] {
-            let deployment = match version {
-                ParakeetVersion::V2 => ParakeetDeployment::v2(),
-                ParakeetVersion::V3 => ParakeetDeployment::v3(),
-            };
             let file = weights(version);
-            let spec = file.parakeet_spec(&deployment).expect("spec");
+            let spec = file.parakeet_spec(&deployment(version)).expect("spec");
             let encoder = CudaEncoder::load(
                 &runtime,
                 &file,
@@ -1666,12 +1662,8 @@ mod tests {
         runtime.prepare(Library::Cublas).expect("cuBLAS");
         let mut worst = [0f64; 2];
         for version in [ParakeetVersion::V2, ParakeetVersion::V3] {
-            let deployment = match version {
-                ParakeetVersion::V2 => ParakeetDeployment::v2(),
-                ParakeetVersion::V3 => ParakeetDeployment::v3(),
-            };
             let file = weights(version);
-            let spec = file.parakeet_spec(&deployment).expect("spec");
+            let spec = file.parakeet_spec(&deployment(version)).expect("spec");
             let load =
                 |math| CudaEncoder::load(&runtime, &file, spec.encoder, math).expect("encoder");
             let fp32 = load(EncoderMath::Single(Math::Fp32));
