@@ -43,28 +43,28 @@ The base crate exposes a single-chunk `TranscriptionPipeline`. Fast long-audio c
 
 ```toml
 [dependencies]
-scriptrs = "0.3"
+scriptrs = "0.4"
 ```
 
 For native CUDA on Linux:
 
 ```toml
 [dependencies]
-scriptrs = { version = "0.3", features = ["cuda"] }
+scriptrs = { version = "0.4", features = ["cuda"] }
 ```
 
 For fast long-form transcription:
 
 ```toml
 [dependencies]
-scriptrs = { version = "0.3", features = ["long-form"] }
+scriptrs = { version = "0.4", features = ["long-form"] }
 ```
 
 For VAD-backed long-form transcription:
 
 ```toml
 [dependencies]
-scriptrs = { version = "0.3", features = ["vad"] }
+scriptrs = { version = "0.4", features = ["vad"] }
 ```
 
 ## Model downloads
