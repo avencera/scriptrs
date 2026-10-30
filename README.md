@@ -240,8 +240,9 @@ film music, effects, ambience and low-level noise. VAD runs use the default 0.5
 speech threshold and pad each speech region by 0.2 s on both sides, including both
 sides of a split inside a region longer than the model window. Silero is slow to
 react to a soft first word, such as the "a" in "a cold", and 0.1 s of padding cut
-it off. 0.2 s lowered WER on every set; larger padding cost AMI headset accuracy. The speed columns were measured with 0.1 s
-padding; in the padding sweep, 0.2 s was no slower.
+it off. 0.2 s lowered WER on every set; larger padding cost AMI headset accuracy.
+The speed columns were measured with 0.1 s padding; in the padding sweep, 0.2 s
+was no slower.
 
 By default the encoder layers' linear weights are stored in FP16, which has TF32's
 10-bit mantissa, and their matrix multiplies run on FP16 tensor cores with FP32
