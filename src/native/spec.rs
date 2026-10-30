@@ -283,6 +283,11 @@ impl StreamingSpec {
                     ))
                 })?;
             let (left, lookahead) = (pair.0 as usize, pair.1 as usize);
+            let chunk = lookahead.checked_add(1).ok_or_else(|| {
+                invalid(format!(
+                    "att_context_size lookahead {lookahead} is too large"
+                ))
+            })?;
             if *left_context.get_or_insert(left) != left {
                 return Err(invalid(
                     "att_context_size entries disagree on the left context".to_owned(),
@@ -290,10 +295,9 @@ impl StreamingSpec {
             }
             // chunked_limited attention sees whole chunks of `lookahead + 1` frames
             // to its left, so the cache is a whole number of chunks
-            if left % (lookahead + 1) != 0 {
+            if left % chunk != 0 {
                 return Err(invalid(format!(
-                    "left context {left} is not a whole number of {}-frame chunks",
-                    lookahead + 1
+                    "left context {left} is not a whole number of {chunk}-frame chunks"
                 )));
             }
             lookaheads.push(lookahead);
@@ -454,6 +458,12 @@ fn transducer(
             predictor.vocab_size
         )));
     }
+    let max_symbols = decoding.usize("max_symbols")?;
+    // the decoder gives each frame `max_symbols` output slots, so zero leaves no
+    // room for a token
+    if max_symbols == 0 {
+        return Err(invalid("decoding max_symbols is 0".to_owned()));
+    }
     let extra = joint_config.usize("num_extra_outputs")?;
     if extra != durations.len() {
         return Err(invalid(format!(
@@ -470,7 +480,7 @@ fn transducer(
         },
         encoder_hidden,
         durations,
-        max_symbols: decoding.usize("max_symbols")?,
+        max_symbols,
     })
 }
 
@@ -799,7 +809,9 @@ mod tests {
             ("encoder", "att_context_size", json!([[56, 4]])),
             ("encoder", "att_context_size", json!([[-1, -1]])),
             ("encoder", "att_context_size", json!([])),
+            ("encoder", "att_context_size", json!([[70, u64::MAX]])),
             ("decoding", "model_type", json!("tdt")),
+            ("decoding", "max_symbols", json!(0)),
             ("decoding", "durations", json!([0, 1])),
             ("prompt", "dictionary", json!({ "en-US": 128 })),
         ];

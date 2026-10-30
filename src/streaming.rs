@@ -300,8 +300,14 @@ impl std::fmt::Debug for Stream {
 }
 
 impl Stream {
-    /// Appends mono 16 kHz audio
+    /// Appends mono 16 kHz audio; a [failed](Self::is_failed) stream takes no more
     pub fn push(&mut self, audio: &[f32]) -> Result<(), TranscriptionError> {
+        if self.failed {
+            // nothing drains a failed stream's mel, so it would only grow
+            return Err(TranscriptionError::InvalidConfiguration(
+                "audio pushed to a failed stream".to_owned(),
+            ));
+        }
         if let Some(index) = audio.iter().position(|sample| !sample.is_finite()) {
             return Err(TranscriptionError::InvalidAudioSample {
                 index: self.received + index,
