@@ -16,7 +16,8 @@ categories = ["multimedia::audio"]
 
 [features]
 default = ["online"]
-online = ["dep:hf-hub", "hf-hub/ureq", "hf-hub/native-tls"]
+# downloads over rustls (ureq's default), so nothing links against the system OpenSSL
+online = ["dep:hf-hub", "hf-hub/ureq"]
 long-form = []
 vad = ["long-form"]
 # CUDA backend on native weights (ModelBundle::from_native_dir)
