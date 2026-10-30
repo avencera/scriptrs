@@ -229,15 +229,19 @@ accuracy and speed on dense or far-field speech:
 
 | Set | Overlap WER | VAD WER | Overlap speed | VAD speed |
 |---|---:|---:|---:|---:|
-| Sparse speech, 24 % speech (4.2 h) | 14.8 % | **3.1 %** | 3430x | **3990x** |
-| Earnings-21 earnings calls | **8.2 %** | 8.6 % | **3630x** | 2030x |
-| AMI meetings, headset mix | 21.5 % | **21.2 %** | **3480x** | 1800x |
-| AMI meetings, far-field microphone | **23.2 %** | 26.6 % | **3480x** | 1790x |
-| CHiME-6 dinner parties | **44.0 %** | 54.8 % | **3490x** | 1970x |
+| Sparse speech, 24 % speech (4.2 h) | 14.8 % | **2.3 %** | 3430x | **3990x** |
+| Earnings-21 earnings calls | **8.2 %** | 8.4 % | **3630x** | 2030x |
+| AMI meetings, headset mix | 21.5 % | **21.1 %** | **3480x** | 1800x |
+| AMI meetings, far-field microphone | **23.2 %** | 26.0 % | **3480x** | 1790x |
+| CHiME-6 dinner parties | **44.0 %** | 54.0 % | **3490x** | 1970x |
 
 The sparse set is LibriSpeech test-clean utterances separated by 15 to 75 s of
 film music, effects, ambience and low-level noise. VAD runs use the default 0.5
-speech threshold.
+speech threshold and pad each speech region by 0.2 s on both sides, including both
+sides of a split inside a region longer than the model window. Silero is slow to
+react to a soft first word, such as the "a" in "a cold", and 0.1 s of padding cut
+it off. 0.2 s lowered WER on every set; larger padding cost AMI headset accuracy. The speed columns were measured with 0.1 s
+padding; in the padding sweep, 0.2 s was no slower.
 
 By default the encoder layers' linear weights are stored in FP16, which has TF32's
 10-bit mantissa, and their matrix multiplies run on FP16 tensor cores with FP32
