@@ -458,7 +458,7 @@ fn block_operand(
     width: usize,
     block: usize,
 ) -> Result<ScaleLayout, Error> {
-    if width == 0 || width % (4 * block) != 0 || len % width != 0 {
+    if width == 0 || !width.is_multiple_of(4 * block) || !len.is_multiple_of(width) {
         return Err(Error::BufferLength {
             context,
             expected: width.max(1) * len.div_ceil(width.max(1)),
