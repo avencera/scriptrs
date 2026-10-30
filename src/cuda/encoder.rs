@@ -78,13 +78,18 @@ fn causal_subsampled(len: usize) -> usize {
     len / 2 + 1
 }
 
-/// Features left after the three stride-2 convolutions
-fn subsampled_features(spec: EncoderSpec) -> usize {
-    let stage = if spec.causal {
+/// One stride-2 subsampling stage of `spec`'s encoder: causal or symmetric
+fn subsampling_stage(spec: EncoderSpec) -> fn(usize) -> usize {
+    if spec.causal {
         causal_subsampled
     } else {
         subsampled
-    };
+    }
+}
+
+/// Features left after the three stride-2 convolutions
+fn subsampled_features(spec: EncoderSpec) -> usize {
+    let stage = subsampling_stage(spec);
     stage(stage(stage(spec.features)))
 }
 
@@ -179,13 +184,19 @@ struct Layer {
     norm_out: Norm,
 }
 
+/// A subsampling convolution's or projection's weight and bias
+struct Affine {
+    weight: DeviceTensor,
+    bias: DeviceTensor,
+}
+
 struct Subsampling {
-    conv_in: (DeviceTensor, DeviceTensor),
-    depthwise1: (DeviceTensor, DeviceTensor),
-    pointwise1: (DeviceTensor, DeviceTensor),
-    depthwise2: (DeviceTensor, DeviceTensor),
-    pointwise2: (DeviceTensor, DeviceTensor),
-    out: (DeviceTensor, DeviceTensor),
+    conv_in: Affine,
+    depthwise1: Affine,
+    pointwise1: Affine,
+    depthwise2: Affine,
+    pointwise2: Affine,
+    out: Affine,
 }
 
 /// Encoder weights on the GPU and the kernels that run them
@@ -495,20 +506,20 @@ impl CudaEncoder {
         let channels = spec.subsampling_channels;
         let flat = channels * subsampled_features(spec);
         let pair = |name: &str, shape: &[usize]| -> Result<_, TranscriptionError> {
-            Ok((
-                upload(
+            Ok(Affine {
+                weight: upload(
                     runtime,
                     file,
                     &format!("encoder.pre_encode.{name}.weight"),
                     shape,
                 )?,
-                upload(
+                bias: upload(
                     runtime,
                     file,
                     &format!("encoder.pre_encode.{name}.bias"),
                     &shape[..1],
                 )?,
-            ))
+            })
         };
         let subsampling = Subsampling {
             conv_in: pair("conv.0", &[channels, 1, 3, 3])?,
@@ -757,9 +768,11 @@ impl CudaEncoder {
         Ok(Some(bits))
     }
 
-    /// Input and subsampled feature maps: `[0]` is the mel, `[3]` the last stage
+    /// Input and subsampled feature maps for `batch` inputs of `mel_frames`, through
+    /// the offline or the causal subsampling: `[0]` is the mel, `[3]` the last stage
     fn feature_maps(&self, batch: usize, mel_frames: usize) -> [FeatureMap; 4] {
         let channels = self.spec.subsampling_channels;
+        let stage = subsampling_stage(self.spec);
         let mel = FeatureMap {
             batch,
             channels: 1,
@@ -769,8 +782,8 @@ impl CudaEncoder {
         let next = |map: FeatureMap| FeatureMap {
             batch,
             channels,
-            frames: subsampled(map.frames),
-            features: subsampled(map.features),
+            frames: stage(map.frames),
+            features: stage(map.features),
         };
         let first = next(mel);
         let second = next(first);
@@ -848,7 +861,6 @@ impl CudaEncoder {
         let sub = &self.subsampling;
         let maps = self.feature_maps(ws.batch, ws.mel_frames);
         let [mel_map, first, second, third] = maps;
-        let channels = self.spec.subsampling_channels;
         let [large, small] = &mut ws.maps;
 
         kernels.subsample_conv_in(
@@ -856,8 +868,8 @@ impl CudaEncoder {
             &ws.mel.slice(..),
             &ws.lens[0].slice(..),
             &ws.lens[1].slice(..),
-            &sub.conv_in.0.data().slice(..),
-            &sub.conv_in.1.data().slice(..),
+            &sub.conv_in.weight.data().slice(..),
+            &sub.conv_in.bias.data().slice(..),
             &mut large.slice_mut(..),
             mel_map,
             first,
@@ -866,8 +878,8 @@ impl CudaEncoder {
             stream,
             &large.slice(..),
             &ws.lens[2].slice(..),
-            &sub.depthwise1.0.data().slice(..),
-            &sub.depthwise1.1.data().slice(..),
+            &sub.depthwise1.weight.data().slice(..),
+            &sub.depthwise1.bias.data().slice(..),
             &mut small.slice_mut(..),
             first,
             second,
@@ -877,8 +889,8 @@ impl CudaEncoder {
             stream,
             &large.slice(..second.len()),
             &ws.lens[3].slice(..),
-            &sub.depthwise2.0.data().slice(..),
-            &sub.depthwise2.1.data().slice(..),
+            &sub.depthwise2.weight.data().slice(..),
+            &sub.depthwise2.bias.data().slice(..),
             &mut small.slice_mut(..third.len()),
             second,
             third,
@@ -891,21 +903,36 @@ impl CudaEncoder {
             third,
         )?;
 
-        let rows = ws.batch * ws.frames;
-        let (weight, bias) = &sub.out;
-        kernels.fill_rows(stream, &bias.data().slice(..), &mut ws.act.x.slice_mut(..))?;
+        self.project_subsampled(runtime, &ws.flat, &mut ws.act, third.features)
+    }
+
+    /// `pre_encode.out`: projects `flat`, the last subsampling stage's `[rows,
+    /// channels * features]`, into the residual stream
+    fn project_subsampled(
+        &self,
+        runtime: &CudaRuntime,
+        flat: &CudaSlice<f32>,
+        act: &mut Activations,
+        features: usize,
+    ) -> Result<(), TranscriptionError> {
+        let out = &self.subsampling.out;
+        self.kernels.fill_rows(
+            runtime.stream(),
+            &out.bias.data().slice(..),
+            &mut act.x.slice_mut(..),
+        )?;
         runtime.sgemm(
             linear(
-                rows,
+                act.rows,
                 self.spec.d_model,
-                channels * third.features,
+                self.spec.subsampling_channels * features,
                 1.0,
                 1.0,
                 self.math.single(),
             ),
-            &ws.flat,
-            weight.data(),
-            &mut ws.act.x,
+            flat,
+            out.weight.data(),
+            &mut act.x,
         )?;
         Ok(())
     }
@@ -915,17 +942,17 @@ impl CudaEncoder {
     fn pointwise(
         &self,
         runtime: &CudaRuntime,
-        (weight, bias): &(DeviceTensor, DeviceTensor),
+        conv: &Affine,
         input: &CudaSlice<f32>,
         output: &mut CudaSlice<f32>,
         map: FeatureMap,
         lens: &CudaSlice<u32>,
     ) -> Result<(), TranscriptionError> {
-        self.pointwise_gemm(runtime, weight, input, output, map)?;
+        self.pointwise_gemm(runtime, &conv.weight, input, output, map)?;
         self.kernels.subsample_bias_relu(
             runtime.stream(),
             &mut output.slice_mut(..map.len()),
-            &bias.data().slice(..),
+            &conv.bias.data().slice(..),
             &lens.slice(..),
             map,
         )?;

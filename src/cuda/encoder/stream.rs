@@ -20,7 +20,7 @@ use super::{
     Activations, Attention, ConvModule, CudaEncoder, NORM_EPS, causal_subsampled, gemm_input,
     gemm_output, linear, merged_in, normed_in, position_rows,
 };
-use crate::cuda::kernels::{CudaRuntime, FeatureMap, StreamGeometry, StreamRows};
+use crate::cuda::kernels::{CudaRuntime, StreamGeometry, StreamRows};
 use crate::cuda::{Direction, HostStaging, zeros};
 use crate::error::TranscriptionError;
 use crate::native::spec::ConvNorm;
@@ -172,26 +172,6 @@ impl CudaEncoder {
         }
     }
 
-    /// The causal subsampling's feature maps for `batch` chunk inputs of `mel_frames`
-    fn stream_maps(&self, batch: usize, mel_frames: usize) -> [FeatureMap; 4] {
-        let channels = self.spec.subsampling_channels;
-        let mel = FeatureMap {
-            batch,
-            channels: 1,
-            frames: mel_frames,
-            features: self.spec.features,
-        };
-        let next = |map: FeatureMap| FeatureMap {
-            batch,
-            channels,
-            frames: causal_subsampled(map.frames),
-            features: causal_subsampled(map.features),
-        };
-        let first = next(mel);
-        let second = next(first);
-        [mel, first, second, next(second)]
-    }
-
     /// Allocates the buffers for `batch` chunks of `frames` encoder frames against
     /// `caches`, and projects every layer's relative positions for the window
     pub(crate) fn stream_workspace(
@@ -222,7 +202,7 @@ impl CudaEncoder {
         let d = spec.d_model;
         let geometry = self.geometry(batch, frames, context, caches.slots);
         let mel_frames = chunk_mel(frames);
-        let maps = self.stream_maps(batch, mel_frames);
+        let maps = self.feature_maps(batch, mel_frames);
         let rows = batch * frames;
 
         // positions `context + frames - 1` down to `-(frames - 1)` cover every
@@ -373,8 +353,7 @@ impl CudaEncoder {
         let sub = &self.subsampling;
         let geometry = ws.geometry;
         let [mel_map, first, second, third] =
-            self.stream_maps(geometry.batch, chunk_mel(geometry.frames));
-        let channels = self.spec.subsampling_channels;
+            self.feature_maps(geometry.batch, chunk_mel(geometry.frames));
         let StreamWorkspace {
             mel,
             rows,
@@ -391,8 +370,8 @@ impl CudaEncoder {
             &mel.slice(..),
             &windows(0),
             &windows(1),
-            &sub.conv_in.0.data().slice(..),
-            &sub.conv_in.1.data().slice(..),
+            &sub.conv_in.weight.data().slice(..),
+            &sub.conv_in.bias.data().slice(..),
             &mut large.slice_mut(..),
             mel_map,
             first,
@@ -401,17 +380,17 @@ impl CudaEncoder {
             stream,
             &large.slice(..),
             &windows(2),
-            &sub.depthwise1.0.data().slice(..),
-            &sub.depthwise1.1.data().slice(..),
+            &sub.depthwise1.weight.data().slice(..),
+            &sub.depthwise1.bias.data().slice(..),
             &mut small.slice_mut(..),
             first,
             second,
         )?;
-        self.pointwise_gemm(runtime, &sub.pointwise1.0, small, large, second)?;
+        self.pointwise_gemm(runtime, &sub.pointwise1.weight, small, large, second)?;
         kernels.bias_relu(
             stream,
             &mut large.slice_mut(..second.len()),
-            &sub.pointwise1.1.data().slice(..),
+            &sub.pointwise1.bias.data().slice(..),
             &windows(2),
             second,
         )?;
@@ -419,17 +398,17 @@ impl CudaEncoder {
             stream,
             &large.slice(..second.len()),
             &windows(3),
-            &sub.depthwise2.0.data().slice(..),
-            &sub.depthwise2.1.data().slice(..),
+            &sub.depthwise2.weight.data().slice(..),
+            &sub.depthwise2.bias.data().slice(..),
             &mut small.slice_mut(..third.len()),
             second,
             third,
         )?;
-        self.pointwise_gemm(runtime, &sub.pointwise2.0, small, large, third)?;
+        self.pointwise_gemm(runtime, &sub.pointwise2.weight, small, large, third)?;
         kernels.bias_relu(
             stream,
             &mut large.slice_mut(..third.len()),
-            &sub.pointwise2.1.data().slice(..),
+            &sub.pointwise2.bias.data().slice(..),
             &windows(3),
             third,
         )?;
@@ -442,23 +421,7 @@ impl CudaEncoder {
             DROP,
         )?;
 
-        let (weight, bias) = &sub.out;
-        self.kernels
-            .fill_rows(stream, &bias.data().slice(..), &mut act.x.slice_mut(..))?;
-        runtime.sgemm(
-            linear(
-                act.rows,
-                self.spec.d_model,
-                channels * third.features,
-                1.0,
-                1.0,
-                self.math.single(),
-            ),
-            flat,
-            weight.data(),
-            &mut act.x,
-        )?;
-        Ok(())
+        self.project_subsampled(runtime, flat, act, third.features)
     }
 
     /// One Conformer layer on the chunks, as [`Self::enqueue_layer`] with the cached
