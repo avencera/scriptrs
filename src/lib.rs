@@ -33,6 +33,8 @@
 //! With the default `online` feature, [`TranscriptionPipeline::from_pretrained`]
 //! and [`LongFormTranscriptionPipeline::from_pretrained`] download the runtime
 //! bundle from a pinned snapshot of `avencera/scriptrs-models` on Hugging Face.
+//! With `cuda`, `ModelBundle::from_pretrained_native` downloads native weights
+//! from the pinned model repositories, such as `avencera/parakeet-tdt-0.6b-v3-cuda`.
 //!
 //! If you already manage models yourself, use [`TranscriptionPipeline::from_dir`]
 //! or [`LongFormTranscriptionPipeline::from_dir`] with a local bundle layout:
