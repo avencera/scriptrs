@@ -72,7 +72,8 @@ pub enum Precision {
     Fp8,
     /// [`Precision::Fp8`] with one scale for each weight
     Fp8PerTensor,
-    /// [`Precision::Fp8`] with one dynamic activation scale per encoder frame
+    /// [`Precision::Fp8`] with one dynamic activation scale per encoder frame, which
+    /// cuBLASLt runs only on Hopper (sm_90); loading fails on other GPUs
     Fp8PerToken,
     /// MXFP8: E4M3 weights and activations in blocks of 32 with power-of-two scales,
     /// through cuBLASLt's block-scaled products on Blackwell

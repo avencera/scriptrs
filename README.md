@@ -255,12 +255,38 @@ either precision, so the queued FP16 and TF32 transcripts differ slightly.
 Lower precisions quantize the same linear weights when the model loads.
 `Precision::Fp8` stores FP8 E4M3 weights with a scale per output channel and
 quantizes each activation with one scale per product, and `Precision::Fp8PerTensor`
-and `Precision::Fp8PerToken` change those scales; the FP8 modes need an Ada or newer
-GPU. `Precision::Mxfp8` and `Precision::Nvfp4` use Blackwell's block-scaled tensor
-cores. `Precision::Int8Weights`, `Precision::Int4Weights` and
+uses one scale per weight instead; both need an Ada or newer GPU.
+`Precision::Fp8PerToken` scales each encoder frame's activations separately, which
+cuBLASLt runs only on Hopper, so it fails to load on other GPUs. `Precision::Mxfp8`
+and `Precision::Nvfp4` use Blackwell's block-scaled tensor cores.
+`Precision::Int8Weights`, `Precision::Int8Weights128`, `Precision::Int4Weights` and
 `Precision::Int4Weights64` keep only the weights small and run FP16 products on any
-GPU. To skip quantizing at load and download less, write the weights in a
-precision's own file:
+GPU.
+
+On an RTX 5090 with Parakeet v3, measured against FP16 on the same day (speed in x
+real time, then WER; weight file in MB):
+
+| | File | LibriSpeech, one at a time | LibriSpeech, queue of 16 | Earnings-21 | FLEURS | MLS |
+|---|---:|---|---|---|---|---|
+| FP16 (default) | 1300 | 1529x, 1.925 % | 4775x, 1.925 % | 3663x, 8.240 % | 1925x, 4.568 % | 1940x, 6.250 % |
+| FP8 | 698 | 1362x, 1.916 % | 4568x, 1.946 % | 3611x, 8.213 % | 1782x, 4.554 % | 1828x, 6.266 % |
+| FP8 per tensor | 697 | 1429x, 1.939 % | 4876x, 1.948 % | 3993x, 8.220 % | 1877x, 4.562 % | 1919x, 6.279 % |
+| MXFP8 | 715 | 963x, 1.967 % | 4387x, 1.961 % | 3627x, 8.203 % | 1377x, 4.513 % | 1478x, 6.298 % |
+| NVFP4 | 432 | 1187x, 2.005 % | 5562x, 1.948 % | 4617x, 8.256 % | 1639x, 4.821 % | 1729x, 6.643 % |
+| INT8 weights | 698 | 1080x, 1.952 % | 4333x, 1.952 % | 3562x, 8.283 % | 1456x, 4.565 % | 1516x, 6.251 % |
+| INT8 weights, groups of 128 | 715 | 1148x, 1.931 % | 4422x, 1.931 % | 3584x, 8.264 % | 1523x, 4.569 % | 1583x, 6.284 % |
+| INT4 weights, groups of 128 | 413 | 1140x, 2.039 % | 4426x, 2.039 % | 3578x, 8.600 % | 1510x, 5.056 % | 1568x, 6.809 % |
+| INT4 weights, groups of 64 | 432 | 1139x, 2.023 % | 4427x, 2.022 % | 3581x, 8.607 % | 1517x, 4.897 % | 1572x, 6.571 % |
+
+FP8, FP8 per tensor and INT8 weights in groups of 128 stay within 0.02 points of
+FP16 on LibriSpeech and 0.05 points on the other sets. None of the lower precisions
+is faster one utterance at a time, where each product also runs a kernel that
+quantizes its activations or dequantizes its weights. NVFP4 is the fastest in batches, but loses
+about 0.25 points on FLEURS and 0.4 on MLS. The INT8 and INT4 rows come from a run
+the day before, whose FP16 speeds were within 1 % of these.
+
+To skip quantizing at load and download less, write the weights in a precision's
+own file:
 
 ```sh
 cargo run --release --features cuda --example quantize_native -- models/parakeet-v3/model.safetensors fp8
