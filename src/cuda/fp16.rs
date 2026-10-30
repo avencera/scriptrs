@@ -2,8 +2,9 @@
 //!
 //! cudakit's [`Sgemm`](cudakit::Sgemm) takes FP32 operands only, so the FP16 products
 //! call `cublasGemmEx` on cudakit's shared handle. Operands are FP16 bit patterns in
-//! `u16` buffers, which the encoder kernels write; the output and the accumulation
-//! stay FP32, so a residual add through `beta = 1` keeps full precision
+//! `u16` buffers, which the encoder kernels write. The accumulation stays FP32, and so
+//! does the output of every product except the feed-forward's first linear, so a
+//! residual add through `beta = 1` keeps full precision
 
 use std::ffi::{CStr, c_void};
 
@@ -11,7 +12,7 @@ use cudakit::cudarc::cublas::result::gemm_ex;
 use cudakit::cudarc::cublas::sys::{
     cublasComputeType_t, cublasGemmAlgo_t, cublasOperation_t, cudaDataType,
 };
-use cudakit::cudarc::driver::{DevicePtr, DevicePtrMut};
+use cudakit::cudarc::driver::{DevicePtr, DevicePtrMut, DeviceRepr};
 use cudakit::{Error, Math, Sgemm, check_len, to_c_int};
 
 use crate::cuda::kernels::CudaRuntime;
@@ -19,12 +20,26 @@ use crate::cuda::kernels::CudaRuntime;
 /// cuBLAS entry points the FP16 products call beyond cudakit's own
 pub(crate) const CUBLAS_SYMBOLS: &[&CStr] = &[c"cublasGemmEx"];
 
+/// Element type of an FP16 product's output: `f32`, or `u16` for FP16 bits
+pub(crate) trait LinearOutput: DeviceRepr {
+    const DATA_TYPE: cudaDataType;
+}
+
+impl LinearOutput for f32 {
+    const DATA_TYPE: cudaDataType = cudaDataType::CUDA_R_32F;
+}
+
+impl LinearOutput for u16 {
+    const DATA_TYPE: cudaDataType = cudaDataType::CUDA_R_16F;
+}
+
 /// Runs `spec`, a [`linear`](crate::cuda::linear) product `c = alpha * a · wᵀ + beta *
-/// c`, with `a` and `w` in FP16 and `c` in FP32, on the runtime's stream
+/// c`, with `a` and `w` in FP16 and `c` in FP32 or FP16, on the runtime's stream
 ///
 /// `spec.math` does not apply: 16-bit operands with FP32 compute run on tensor cores
-/// in any math mode
-pub(crate) fn linear_fp16<A, W, C>(
+/// in any math mode. The accumulation is FP32 either way; an FP16 `c` is rounded
+/// once at the end, so with `beta = 1` it would also round the sum it adds to
+pub(crate) fn linear_fp16<A, W, C, T>(
     runtime: &CudaRuntime,
     spec: Sgemm,
     a: &A,
@@ -34,7 +49,8 @@ pub(crate) fn linear_fp16<A, W, C>(
 where
     A: DevicePtr<u16>,
     W: DevicePtr<u16>,
-    C: DevicePtrMut<f32>,
+    C: DevicePtrMut<T>,
+    T: LinearOutput,
 {
     let context = "fp16 linear";
     if spec.a_transposed || !spec.b_transposed {
@@ -81,7 +97,7 @@ where
             inputs,
             (&raw const spec.beta).cast::<c_void>(),
             c_ptr as *mut c_void,
-            cudaDataType::CUDA_R_32F,
+            T::DATA_TYPE,
             out,
             cublasComputeType_t::CUBLAS_COMPUTE_32F,
             cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,

@@ -75,6 +75,13 @@ pub(crate) type CudaRuntime = Runtime<KernelModule>;
 /// Threads per block for the one-thread-per-element kernels
 const ELEMENT_THREADS: u32 = 256;
 
+/// Channels, frames and threads of one conv-glue block, and the widest depthwise
+/// kernel its tile holds: the kernels' `CONV_*` constants
+const CONV_CHANNELS: usize = 32;
+const CONV_FRAMES: usize = 16;
+const CONV_THREADS: u32 = 256;
+const CONV_MAX_KERNEL: usize = 31;
+
 /// Threads per block for the row kernels (LayerNorm, softmax)
 const ROW_THREADS: u32 = 256;
 
@@ -281,7 +288,7 @@ pub(crate) struct EncoderKernels {
     layer_norm_pair: CudaFunction,
     layer_norm_pair_f16: CudaFunction,
     silu: CudaFunction,
-    silu_f16: CudaFunction,
+    silu_h16: CudaFunction,
     to_f16: CudaFunction,
     split_qkv: CudaFunction,
     split_heads: CudaFunction,
@@ -306,7 +313,7 @@ impl EncoderKernels {
             layer_norm_pair: module.function("encoder_layer_norm_pair")?,
             layer_norm_pair_f16: module.function("encoder_layer_norm_pair_f16")?,
             silu: module.function("encoder_silu")?,
-            silu_f16: module.function("encoder_silu_f16")?,
+            silu_h16: module.function("encoder_silu_h16")?,
             to_f16: module.function("encoder_to_f16")?,
             split_qkv: module.function("encoder_split_qkv")?,
             split_heads: module.function("encoder_split_heads")?,
@@ -429,14 +436,19 @@ impl EncoderKernels {
         Ok(())
     }
 
-    /// `out = x * sigmoid(x)` rounded to FP16
-    pub(crate) fn silu_f16(
+    /// `x = x * sigmoid(x)` in place on FP16 bits, computed in FP32
+    pub(crate) fn silu_h16(
         &self,
         stream: &CudaStream,
-        x: &CudaView<'_, f32>,
-        out: &mut CudaViewMut<'_, u16>,
+        x: &mut CudaViewMut<'_, u16>,
     ) -> Result<(), Error> {
-        self.elementwise_f16(stream, &self.silu_f16, "silu", x, out)
+        let config = elements(x.len())?;
+        let length = len_mut(x);
+        let mut launch = stream.launch_builder(&self.silu_h16);
+        launch.arg(x).arg(&length);
+        // SAFETY: matches `encoder_silu_h16`; the kernel bounds-checks its index
+        unsafe { launch.launch(config) }?;
+        Ok(())
     }
 
     /// `out = x` rounded to FP16
@@ -446,26 +458,13 @@ impl EncoderKernels {
         x: &CudaView<'_, f32>,
         out: &mut CudaViewMut<'_, u16>,
     ) -> Result<(), Error> {
-        self.elementwise_f16(stream, &self.to_f16, "to fp16", x, out)
-    }
-
-    /// Launches `function`, which maps each element of `x` to the same element of
-    /// `out` as `(x, out)`
-    fn elementwise_f16(
-        &self,
-        stream: &CudaStream,
-        function: &CudaFunction,
-        context: &'static str,
-        x: &CudaView<'_, f32>,
-        out: &mut CudaViewMut<'_, u16>,
-    ) -> Result<(), Error> {
-        check_len(context, x.len(), out.len())?;
+        check_len("to fp16", x.len(), out.len())?;
         let config = elements(x.len())?;
         let lens = [len(x), len_mut(out)];
-        let mut launch = stream.launch_builder(function);
+        let mut launch = stream.launch_builder(&self.to_f16);
         launch.arg(x).arg(&lens[0]).arg(out).arg(&lens[1]);
-        // SAFETY: matches `encoder_silu_f16` and `encoder_to_f16`; `x` holds every
-        // index of `out`, and the kernel bounds-checks its index against `out`
+        // SAFETY: matches `encoder_to_f16`; `x` holds every index of `out`, and the
+        // kernel bounds-checks its index against `out`
         unsafe { launch.launch(config) }?;
         Ok(())
     }
@@ -651,7 +650,8 @@ impl EncoderKernels {
         Ok(())
     }
 
-    /// GLU, pad mask, depthwise convolution, folded BatchNorm and SiLU
+    /// GLU, pad mask, depthwise convolution, folded BatchNorm and SiLU over the
+    /// first pointwise convolution's `[rows, 2 * channels]`
     #[allow(
         clippy::too_many_arguments,
         reason = "launchers mirror their kernel's parameter list so each launch reads against it"
@@ -685,7 +685,23 @@ impl EncoderKernels {
         check_len("batch norm scale", channels, scale.len())?;
         check_len("batch norm shift", channels, shift.len())?;
         check_len("conv module output", n, out.len())?;
-        let config = elements(n)?;
+        if kernel_size % 2 == 0 || kernel_size > CONV_MAX_KERNEL {
+            return Err(Error::Unsupported {
+                context: "conv module",
+                reason: format!(
+                    "depthwise kernel of {kernel_size} taps; the tile holds odd widths up to {CONV_MAX_KERNEL}"
+                ),
+            });
+        }
+        let config = LaunchConfig {
+            grid_dim: (
+                u32_of("conv channel tiles", channels.div_ceil(CONV_CHANNELS))?,
+                u32_of("conv frame tiles", frames.div_ceil(CONV_FRAMES))?,
+                u32_of("batch", batch)?,
+            ),
+            block_dim: (CONV_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let lens = [
             len(pw1),
             len(lens_frames),
@@ -695,7 +711,6 @@ impl EncoderKernels {
             out.len() as u64,
         ];
         let dims = [
-            u32_of("batch", batch)?,
             u32_of("frames", frames)?,
             u32_of("channels", channels)?,
             u32_of("kernel size", kernel_size)?,
@@ -710,13 +725,10 @@ impl EncoderKernels {
             .arg(&lens[2]);
         launch.arg(scale).arg(&lens[3]).arg(shift).arg(&lens[4]);
         out.push(&mut launch, &lens[5]);
-        launch
-            .arg(&dims[0])
-            .arg(&dims[1])
-            .arg(&dims[2])
-            .arg(&dims[3]);
-        // SAFETY: matches `encoder_conv_glue` and its `_f16` twin; indexing is checked
-        // in the kernel
+        launch.arg(&dims[0]).arg(&dims[1]).arg(&dims[2]);
+        // SAFETY: matches `encoder_conv_glue` and its `_f16` twin; one block per tile
+        // of the grid above writes only valid frames and channels of `out`, sized
+        // above, and the tile holds the checked kernel width
         unsafe { launch.launch(config) }?;
         Ok(())
     }

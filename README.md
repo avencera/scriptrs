@@ -8,8 +8,8 @@ Fast [NVIDIA Parakeet TDT](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) s
 - Long-form transcription of hour-long recordings, with optional VAD
 - Token-level timestamps and confidences
 
-On an RTX 5090, the CUDA backend transcribes LibriSpeech test-clean at 1534x real
-time one utterance at a time, 3.1x as fast as NVIDIA NeMo and 6.1x as fast as
+On an RTX 5090, the CUDA backend transcribes LibriSpeech test-clean at 1551x real
+time one utterance at a time, 3.2x as fast as NVIDIA NeMo and 6.1x as fast as
 parakeet-rs, at the same word error rate. Batched, it is 1.5x as fast as NeMo at
 batch 8 and about even at batch 32 (4928x against 5242x). On 31.6 h of
 multilingual speech the default FP16 mode scores the same WER as the FP32 mode,
@@ -166,13 +166,13 @@ time:
 
 | | Speed (x real time) | vs NeMo | WER |
 |---|---|---|---|
-| scriptrs | 1534x | 3.1x | 1.93 % |
+| scriptrs | 1551x | 3.2x | 1.93 % |
 | NVIDIA NeMo | 490x | 1x | 1.93 % |
 | parakeet-rs 0.4.3 (ONNX Runtime) | 253x | 0.52x | 1.93 % |
 
 Through the [queue](#many-short-inputs), which prepares the next inputs on the CPU
-while the GPU runs, the same set runs at 1761x one at a time with identical
-transcripts, and at 4770x in batches of up to 16 (the default). Batching changes 2
+while the GPU runs, the same set runs at 1782x one at a time with identical
+transcripts, and at 4896x in batches of up to 16 (the default). Batching changes 3
 of the 2620 transcripts by one word or punctuation mark, and WER stays 1.93 %.
 
 NeMo gains more from batching, because large batches are dominated by the
@@ -256,17 +256,18 @@ On an RTX 5090 with Parakeet v3 (speed in x real time, then WER):
 
 | | FP16 (default) | TF32 | FP32 |
 |---|---|---|---|
-| LibriSpeech test-clean, one utterance at a time | 1534x, 1.93 % | 1179x, 1.93 % | — |
-| LibriSpeech test-clean, queue in batches of 16 | 4767x, 1.93 % | 3364x, 1.92 % | — |
-| Earnings-21, long-form | 3633x, 8.24 % | 2633x, 8.24 % | — |
+| LibriSpeech test-clean, one utterance at a time | 1551x, 1.93 % | 1183x, 1.93 % | — |
+| LibriSpeech test-clean, queue in batches of 16 | 4896x, 1.93 % | 3391x, 1.92 % | — |
+| Earnings-21, long-form | 3830x, 8.24 % | 2680x, 8.24 % | — |
 | FLEURS de, es, fr, it, nl, pt (15.8 h) | 1839x, 4.57 % | 1450x, 4.57 % | 966x, 4.57 % |
 | MLS es, fr, it, pt (15.8 h) | 1921x, 6.25 % | 1524x, 6.26 % | 996x, 6.26 % |
 
 FLEURS and MLS run one utterance at a time with automatic language selection and
 are scored with Whisper's basic normalizer. On each of their ten language sets,
 FP16 is within one word error of TF32. On LibriSpeech one utterance at a time,
-FP16 gives the same transcripts as TF32. Batching changes a few transcripts in
-either precision, so the queued FP16 and TF32 transcripts differ slightly.
+FP16 and TF32 differ in 2 of the 2620 transcripts, by one word each. Batching
+changes a few transcripts in either precision, so the queued FP16 and TF32
+transcripts differ slightly.
 
 ## Usage
 

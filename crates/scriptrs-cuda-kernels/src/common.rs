@@ -59,3 +59,10 @@ pub fn sigmoid(x: f32) -> f32 {
 pub fn to_f16(value: f32) -> u16 {
     (value as f16).to_bits()
 }
+
+/// FP16 bits widened to `f32`, exactly
+#[cfg(feature = "encoder")]
+#[inline(always)]
+pub fn from_f16(bits: u16) -> f32 {
+    f16::from_bits(bits) as f32
+}

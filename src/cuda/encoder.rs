@@ -9,7 +9,8 @@
 //! [`EncoderMath::Fp16`] stores the Conformer layers' linear weights in FP16 and has
 //! the kernels before each of those GEMMs write an FP16 copy of their output, so the
 //! GEMMs read half the bytes and run at the FP16 tensor-core rate. The residual
-//! stream, the GEMM outputs and their accumulation stay FP32
+//! stream and the GEMM accumulation stay FP32, and so do the GEMM outputs except the
+//! feed-forward's first linear, which writes FP16 for its SiLU to run in place
 
 use cudakit::cudarc::driver::{CudaSlice, CudaView, DevicePtrMut};
 use cudakit::{DeviceTensor, Math, Sgemm, SgemmBatched};
@@ -59,8 +60,9 @@ fn subsampled_features(spec: EncoderSpec) -> usize {
 pub(crate) enum EncoderMath {
     /// Every GEMM on FP32 operands in this cuBLAS math
     Single(Math),
-    /// The Conformer layers' linear layers on FP16 operands with FP32 output and
-    /// accumulation. The attention score and mix products and the subsampling module
+    /// The Conformer layers' linear layers on FP16 operands with FP32 accumulation and
+    /// FP32 output, except the feed-forward's first linear, whose output is FP16.
+    /// The attention score and mix products and the subsampling module
     /// keep FP32 operands in TF32: they are a few percent of the work, and their
     /// operands would need conversions of their own
     Fp16,
@@ -193,7 +195,9 @@ struct Activations {
     x: CudaSlice<f32>,
     normed: CudaSlice<f32>,
     /// `[rows, max(ff_hidden, 2 * d_model)]`: the feed-forward hidden layer or the
-    /// conv module's first pointwise output
+    /// conv module's first pointwise output. Under [`EncoderMath::Fp16`] the
+    /// feed-forward uses [`Fp16Inputs::hidden`] instead, so this holds only
+    /// `[rows, 2 * d_model]`
     hidden: CudaSlice<f32>,
     qkv: CudaSlice<f32>,
     /// `[rows, d_model]` attention context or conv module output
@@ -221,6 +225,10 @@ impl Activations {
     ) -> Result<Self, TranscriptionError> {
         let stream = runtime.stream();
         let d = spec.d_model;
+        let hidden_width = match math {
+            EncoderMath::Single(_) => spec.ff_hidden.max(2 * d),
+            EncoderMath::Fp16 => 2 * d,
+        };
         let fp16 = match math {
             EncoderMath::Single(_) => None,
             EncoderMath::Fp16 => Some(Fp16Inputs {
@@ -233,7 +241,7 @@ impl Activations {
             rows,
             x: zeros(stream, rows * d)?,
             normed: zeros(stream, rows * d)?,
-            hidden: zeros(stream, rows * spec.ff_hidden.max(2 * d))?,
+            hidden: zeros(stream, rows * hidden_width)?,
             qkv: zeros(stream, rows * 3 * d)?,
             merged: zeros(stream, rows * d)?,
             fp16,
@@ -886,29 +894,36 @@ impl CudaEncoder {
         let (d, hidden) = (self.spec.d_model, self.spec.ff_hidden);
         let math = self.math.single();
         let rows = act.rows;
-        self.linear(
-            runtime,
-            linear(rows, hidden, d, 1.0, 0.0, math),
-            normed_in(self.math, &act.normed, act.fp16.as_ref())?,
-            &weights.linear1,
-            &mut act.hidden.slice_mut(..rows * hidden),
-        )?;
         let stream = runtime.stream();
-        match act.fp16.as_mut() {
-            Some(fp16) => self.kernels.silu_f16(
-                stream,
-                &act.hidden.slice(..rows * hidden),
-                &mut fp16.hidden.slice_mut(..),
-            )?,
-            None => self
-                .kernels
-                .silu(stream, &mut act.hidden.slice_mut(..rows * hidden))?,
-        }
-        let activated = gemm_input(
-            self.math,
-            act.hidden.slice(..rows * hidden),
-            act.fp16.as_ref().map(|fp16| fp16.hidden.slice(..)),
-        )?;
+        let activated = match (act.fp16.as_mut(), &weights.linear1) {
+            // the FP16 linear writes FP16 and SiLU runs in place on it, so the
+            // `[rows, ff_hidden]` activation is never stored in FP32
+            (Some(fp16), Linear::Fp16(w)) => {
+                linear_fp16(
+                    runtime,
+                    linear(rows, hidden, d, 1.0, 0.0, math),
+                    &fp16.normed,
+                    w,
+                    &mut fp16.hidden,
+                )?;
+                self.kernels
+                    .silu_h16(stream, &mut fp16.hidden.slice_mut(..))?;
+                Operand::Fp16(fp16.hidden.slice(..))
+            }
+            (None, _) => {
+                self.linear(
+                    runtime,
+                    linear(rows, hidden, d, 1.0, 0.0, math),
+                    gemm_input(self.math, act.normed.slice(..), None)?,
+                    &weights.linear1,
+                    &mut act.hidden.slice_mut(..rows * hidden),
+                )?;
+                self.kernels
+                    .silu(stream, &mut act.hidden.slice_mut(..rows * hidden))?;
+                gemm_input(self.math, act.hidden.slice(..rows * hidden), None)?
+            }
+            (Some(_), _) => return Err(mixed_precision()),
+        };
         // NeMo scales the feed-forward residual by 0.5 (`fc_factor`)
         self.linear(
             runtime,

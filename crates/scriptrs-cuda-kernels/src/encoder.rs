@@ -9,7 +9,7 @@
 
 use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
 
-use crate::common::{MAX_WARPS, add, block_reduce, sigmoid, to_f16};
+use crate::common::{MAX_WARPS, add, block_reduce, from_f16, sigmoid, to_f16};
 
 pub mod stream;
 
@@ -264,13 +264,14 @@ pub fn encoder_silu(mut x: DisjointSlice<f32>) {
     }
 }
 
-/// SiLU of `x` into `out`, rounded to FP16, one thread per element
+/// SiLU of FP16 `x` in place, computed in FP32, one thread per element: the FP16
+/// first linear of a feed-forward module writes FP16 directly, so its activation
+/// never round-trips through FP32 memory
 #[kernel]
-pub fn encoder_silu_f16(x: &[f32], mut out: DisjointSlice<u16>) {
+pub fn encoder_silu_h16(mut x: DisjointSlice<u16>) {
     let idx = thread::index_1d();
-    let i = idx.get();
-    if let Some(slot) = out.get_mut(idx) {
-        let value = x[i];
+    if let Some(slot) = x.get_mut(idx) {
+        let value = from_f16(*slot);
         *slot = to_f16(value * sigmoid(value));
     }
 }
@@ -499,39 +500,90 @@ pub fn encoder_rel_pos_softmax(
     }
 }
 
-/// Output element `i` of the conv module between its two pointwise convolutions, for
-/// the conv-glue kernels
+/// Channels per conv-glue block, one warp across them so rows load coalesced
+pub const CONV_CHANNELS: usize = 32;
+
+/// Output frames per conv-glue block
+pub const CONV_FRAMES: usize = 16;
+
+/// Widest depthwise kernel the conv-glue tile holds
+pub const CONV_MAX_KERNEL: usize = 31;
+
+/// Threads per conv-glue block
+const CONV_THREADS: usize = 256;
+
+/// The conv module between its two pointwise convolutions for one tile of
+/// [`CONV_FRAMES`] frames and [`CONV_CHANNELS`] channels, through `store(index,
+/// value)`
+///
+/// GLU depends only on its own frame, so the block computes it once per frame of
+/// the tile and its halo into shared memory, and each output then sums its taps
+/// from there. The taps add in the same order as a direct sum, and a masked tap adds
+/// an exact zero, so the result does not depend on the tiling
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-fn conv_glue_value(
-    pw1: &[f32],
+fn conv_glue_tile(
+    pw1: impl Fn(usize) -> f32,
     lens: &[u32],
     weight: &[f32],
     scale: &[f32],
     shift: &[f32],
-    i: usize,
     frames: usize,
     channels: usize,
     kernel_size: usize,
-) -> f32 {
-    let (row, c) = (i / channels, i % channels);
-    let (b, t) = (row / frames, row % frames);
-    let len = lens[b] as usize;
+    mut store: impl FnMut(usize, f32),
+) {
+    static mut TILE: SharedArray<f32, { (CONV_FRAMES + CONV_MAX_KERNEL - 1) * CONV_CHANNELS }> =
+        SharedArray::UNINIT;
+    // SAFETY: a raw pointer to the block's shared array; the loops below index it
+    // below `(CONV_FRAMES + kernel_size - 1) * CONV_CHANNELS`, and the host keeps
+    // `kernel_size <= CONV_MAX_KERNEL`
+    let tile = unsafe { SharedArray::as_raw_mut_ptr(&raw mut TILE) };
+    let c0 = thread::blockIdx_x() as usize * CONV_CHANNELS;
+    let t0 = thread::blockIdx_y() as usize * CONV_FRAMES;
+    let b = thread::blockIdx_z() as usize;
+    let tid = thread::threadIdx_x() as usize;
+    let len = (lens[b] as usize).min(frames);
     let half = kernel_size / 2;
-    let mut acc = 0.0f32;
-    let mut tap = 0;
-    while tap < kernel_size {
-        // frames before 0 or at or past the length are zero after the mask
-        if t + tap >= half && t + tap - half < len {
-            let source = (b * frames + t + tap - half) * 2 * channels + c;
-            let glu = pw1[source] * sigmoid(pw1[source + channels]);
-            acc += weight[c * kernel_size + tap] * glu;
-        }
-        tap += 1;
-    }
 
-    let normed = acc * scale[c] + shift[c];
-    normed * sigmoid(normed)
+    // GLU of frames t0 - half .. t0 + CONV_FRAMES + half, zero outside [0, len) as
+    // NeMo's `masked_fill` and the convolution's zero padding
+    let span = (CONV_FRAMES + kernel_size - 1) * CONV_CHANNELS;
+    let mut j = tid;
+    while j < span {
+        let (r, cc) = (j / CONV_CHANNELS, j % CONV_CHANNELS);
+        let c = c0 + cc;
+        let mut glu = 0.0f32;
+        if t0 + r >= half && t0 + r - half < len && c < channels {
+            let row = b * frames + t0 + r - half;
+            let source = row * 2 * channels + c;
+            glu = pw1(source) * sigmoid(pw1(source + channels));
+        }
+        // SAFETY: `j < span`, inside the tile as above
+        unsafe { *tile.add(j) = glu };
+        j += CONV_THREADS;
+    }
+    thread::sync_threads();
+
+    let cc = tid % CONV_CHANNELS;
+    let c = c0 + cc;
+    let mut r = tid / CONV_CHANNELS;
+    while r < CONV_FRAMES {
+        let t = t0 + r;
+        if t < frames && c < channels {
+            let mut acc = 0.0f32;
+            let mut tap = 0;
+            while tap < kernel_size {
+                // SAFETY: `r + tap < CONV_FRAMES + kernel_size - 1`, inside the tile
+                let glu = unsafe { *tile.add((r + tap) * CONV_CHANNELS + cc) };
+                acc += weight[c * kernel_size + tap] * glu;
+                tap += 1;
+            }
+            let normed = acc * scale[c] + shift[c];
+            store((b * frames + t) * channels + c, normed * sigmoid(normed));
+        }
+        r += CONV_THREADS / CONV_CHANNELS;
+    }
 }
 
 /// The conv module between its two pointwise convolutions: GLU, the pad mask, the
@@ -540,10 +592,12 @@ fn conv_glue_value(
 /// `pw1` is `[batch * frames, 2 * channels]` from the first pointwise convolution.
 /// GLU gives `a * sigmoid(g)` from its two halves, and frames at or past `lens[b]`
 /// become 0 before the depthwise convolution, as NeMo's `masked_fill`. The depthwise
-/// convolution has `kernel_size` taps (odd, centered, zero padded) and no bias;
-/// `scale` and `shift` are the eval-mode BatchNorm folded per channel. Every output
-/// frame is written, including padded ones, which NeMo does not mask either. One
-/// thread per output element of `[batch * frames, channels]`
+/// convolution has `kernel_size` taps (odd, centered, zero padded, at most
+/// [`CONV_MAX_KERNEL`]) and no bias; `scale` and `shift` are the eval-mode BatchNorm
+/// folded per channel. Every output frame is written, including padded ones, which
+/// NeMo does not mask either. One block of 256 threads per tile of [`CONV_FRAMES`]
+/// frames by [`CONV_CHANNELS`] channels, on a grid of (channel tiles, frame tiles,
+/// batch)
 #[kernel]
 pub fn encoder_conv_glue(
     pw1: &[f32],
@@ -552,33 +606,23 @@ pub fn encoder_conv_glue(
     scale: &[f32],
     shift: &[f32],
     mut out: DisjointSlice<f32>,
-    batch: u32,
     frames: u32,
     channels: u32,
     kernel_size: u32,
 ) {
-    let (batch, frames, channels, kernel_size) =
-        (batch as usize, frames as usize, channels as usize, kernel_size as usize);
-    let idx = thread::index_1d();
-    let i = idx.get();
-    if i >= batch * frames * channels {
-        return;
-    }
-
-    let value = conv_glue_value(
-        pw1,
+    conv_glue_tile(
+        |i| pw1[i],
         lens,
         weight,
         scale,
         shift,
-        i,
-        frames,
-        channels,
-        kernel_size,
+        frames as usize,
+        channels as usize,
+        kernel_size as usize,
+        // SAFETY: the tile writes only indexes of valid frames and channels, inside
+        // `[batch * frames, channels]`, which the host checks `out` holds
+        |i, value| unsafe { *out.get_unchecked_mut(i) = value },
     );
-    if let Some(slot) = out.get_mut(idx) {
-        *slot = value;
-    }
 }
 
 /// [`encoder_conv_glue`] with its output rounded to FP16
@@ -590,33 +634,22 @@ pub fn encoder_conv_glue_f16(
     scale: &[f32],
     shift: &[f32],
     mut out: DisjointSlice<u16>,
-    batch: u32,
     frames: u32,
     channels: u32,
     kernel_size: u32,
 ) {
-    let (batch, frames, channels, kernel_size) =
-        (batch as usize, frames as usize, channels as usize, kernel_size as usize);
-    let idx = thread::index_1d();
-    let i = idx.get();
-    if i >= batch * frames * channels {
-        return;
-    }
-
-    let value = conv_glue_value(
-        pw1,
+    conv_glue_tile(
+        |i| pw1[i],
         lens,
         weight,
         scale,
         shift,
-        i,
-        frames,
-        channels,
-        kernel_size,
+        frames as usize,
+        channels as usize,
+        kernel_size as usize,
+        // SAFETY: as in `encoder_conv_glue`
+        |i, value| unsafe { *out.get_unchecked_mut(i) = to_f16(value) },
     );
-    if let Some(slot) = out.get_mut(idx) {
-        *slot = to_f16(value);
-    }
 }
 
 /// Fills every row of `out` (`[rows, width]`) with `bias`, so a following GEMM with
