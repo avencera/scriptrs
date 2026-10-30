@@ -200,8 +200,8 @@ impl OverlapChunkConfig {
     ///
     /// Tokens are placed on the timeline by whole frames, so a window starting
     /// mid-frame would land every token up to a frame early. The first window
-    /// starts at `range.start` rounded down to a frame instead, which for a VAD
-    /// region reaches under 80 ms further into its leading padding
+    /// starts at `range.start` rounded down to a frame instead, so the model hears
+    /// under 80 ms before the range; `push_overlap_task` drops that frame's tokens
     pub(crate) fn plan(&self, range: SampleRange) -> Vec<SampleRange> {
         let mut chunks = Vec::new();
         let mut start = range.start / SAMPLES_PER_ENCODER_FRAME * SAMPLES_PER_ENCODER_FRAME;
@@ -457,7 +457,7 @@ pub(super) fn build_fast_execution_plan(
         .overlap
         .plan(full_audio)
         .into_iter()
-        .map(|chunk| push_overlap_task(&mut tasks, chunk, config))
+        .map(|chunk| push_overlap_task(&mut tasks, chunk, full_audio, config))
         .collect();
     let regions = vec![RegionTask {
         task_indices,
@@ -529,7 +529,7 @@ pub(super) fn build_region_plan(
             .overlap
             .plan(region)
             .into_iter()
-            .map(|chunk| push_overlap_task(tasks, chunk, config))
+            .map(|chunk| push_overlap_task(tasks, chunk, region, config))
             .collect(),
         kind: RegionTaskKind::Overlap,
     }
@@ -547,18 +547,29 @@ fn push_segment_task(tasks: &mut Vec<ChunkTask>, segment: SampleRange) -> usize 
     task_idx
 }
 
+/// Adds the task for overlap window `chunk` of `range`
+///
+/// A region keeps only the tokens that start inside it, so the window's own audio
+/// starts no earlier than the first frame boundary inside the range. The frame
+/// the first window reaches back into is dropped as context: a token starting
+/// there belongs to the previous region, which already kept it, or to the silence
+/// before this one
 fn push_overlap_task(
     tasks: &mut Vec<ChunkTask>,
     chunk: SampleRange,
+    range: SampleRange,
     config: &LongFormConfig,
 ) -> usize {
     let task_idx = tasks.len();
+    let own_start = chunk
+        .start
+        .max(range.start.next_multiple_of(SAMPLES_PER_ENCODER_FRAME));
     let context_start = chunk.start.saturating_sub(config.overlap.context_samples);
     tasks.push(ChunkTask {
         audio_start: context_start,
         audio_end: chunk.end,
-        global_sample_offset: chunk.start,
-        context_samples: chunk.start - context_start,
+        global_sample_offset: own_start,
+        context_samples: own_start - context_start,
     });
     task_idx
 }

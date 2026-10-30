@@ -452,7 +452,7 @@ fn load_mono_16khz_audio() -> Vec<f32> {
 }
 ```
 
-`LongFormConfig` defaults to the fast overlap-chunking path with `4` workers, each loading its own model. On native CUDA bundles, windows instead run `batch_size` at a time (16 by default) through the pipeline's one model, and the workers prepare windows on the CPU ahead of it; Core ML bundles ignore `batch_size`. `LongFormConfig::for_bundle(&bundle)` gives a bundle's defaults to start from when you change one setting. Audio up to `config.overlap.max_model_samples` (`LongFormConfig::single_window_samples`) runs as one window, and longer audio is split into windows of that size, in both modes; VAD mode scans only the longer audio for speech. You can tune the worker count when you want less or more parallelism:
+`LongFormConfig` defaults to the fast overlap-chunking path with `4` workers, each loading its own model. On native CUDA bundles, windows instead run `batch_size` at a time (16 by default) through the pipeline's one model, and the workers prepare windows on the CPU ahead of it; Core ML bundles ignore `batch_size`. `LongFormConfig::for_bundle(&bundle)` gives a bundle's defaults to start from when you change one setting. Audio up to `config.overlap.max_model_samples` (`LongFormConfig::single_window_samples`) runs as one window, and longer audio is split into windows of that size, in both modes; VAD mode scans only the longer audio for speech. `config.overlap.context_samples`, the audio each window hears before its own, must be a whole number of encoder frames (1280 samples). You can tune the worker count when you want less or more parallelism:
 
 ```rust
 use scriptrs::{LongFormConfig, LongFormTranscriptionPipeline};

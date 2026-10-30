@@ -452,11 +452,7 @@ impl LongFormTranscriptionPipeline {
         task_indices: &[usize],
         raw_tasks: &mut [Option<RawTranscription>],
     ) -> Result<Vec<TimedToken>, TranscriptionError> {
-        let mut windows = Vec::with_capacity(task_indices.len());
-        for task_idx in task_indices {
-            windows.push(take_raw_task(raw_tasks, *task_idx)?);
-        }
-        let merged = merge_overlapping_windows(windows);
+        let merged = merge_overlap_region(task_indices, raw_tasks)?;
         Ok(self
             .inner
             .decode_raw(&merged, duration_seconds(audio_len))
@@ -488,6 +484,18 @@ fn identity_error(
         PreprocessedTranscriptionError::Transcription(error) => error,
         PreprocessedTranscriptionError::Preprocessing(error) => match error {},
     }
+}
+
+/// Merges the windows of one overlap region into one transcription
+fn merge_overlap_region(
+    task_indices: &[usize],
+    raw_tasks: &mut [Option<RawTranscription>],
+) -> Result<RawTranscription, TranscriptionError> {
+    let mut windows = Vec::with_capacity(task_indices.len());
+    for task_idx in task_indices {
+        windows.push(take_raw_task(raw_tasks, *task_idx)?);
+    }
+    Ok(merge_overlapping_windows(windows))
 }
 
 fn take_raw_task(
@@ -563,14 +571,24 @@ mod tests {
     #[cfg(feature = "cuda")]
     use super::LongFormTranscriptionPipeline;
     #[cfg(all(feature = "cuda", feature = "vad"))]
-    use super::planner::{SampleRange, build_region_plan};
-    use super::{LongFormConfig, LongFormMode, WindowPreprocessor, build_fast_execution_plan};
+    use super::SileroVad;
     #[cfg(all(feature = "cuda", feature = "vad"))]
-    use super::{SileroVad, detect_speech_regions};
+    use super::planner::build_region_plan;
+    #[cfg(feature = "vad")]
+    use super::planner::{RegionTaskKind, SampleRange, build_vad_execution_plan};
+    use super::{LongFormConfig, LongFormMode, WindowPreprocessor, build_fast_execution_plan};
+    #[cfg(feature = "vad")]
+    use super::{detect_speech_regions, merge_overlap_region};
     #[cfg(all(feature = "cuda", feature = "vad"))]
     use crate::constants::SAMPLE_RATE;
+    #[cfg(feature = "vad")]
+    use crate::constants::{SAMPLES_PER_ENCODER_FRAME, VAD_WINDOW_SAMPLES};
     #[cfg(feature = "cuda")]
     use crate::cuda::test_support::nemo_parity_bundle;
+    #[cfg(feature = "vad")]
+    use crate::decode::RawTranscription;
+    #[cfg(feature = "vad")]
+    use crate::decode::test_support::raw_from_columns;
     use crate::deployment::ParakeetDeployment;
     #[cfg(feature = "cuda")]
     use crate::error::TranscriptionError;
@@ -689,6 +707,67 @@ mod tests {
                 .iter()
                 .all(|task| task.audio_end - task.audio_start <= window)
         );
+    }
+
+    /// Adjacent VAD regions under a frame apart each keep only the tokens that
+    /// start inside them, so the frame both hear is transcribed once
+    #[cfg(feature = "vad")]
+    #[test]
+    fn adjacent_vad_regions_emit_a_shared_frame_once() {
+        let mut config = LongFormConfig::default();
+        config.overlap.max_model_samples = 48_000;
+        config.segmentation.speech_padding = 0.01;
+        config.segmentation.min_silence_duration = 0.02;
+        config.segmentation.min_silence_at_max_speech = 10.0;
+
+        let mut probabilities = vec![0.0; 8];
+        probabilities.extend(std::iter::repeat_n(0.9, 300));
+        probabilities.extend(std::iter::repeat_n(0.0, 2));
+        probabilities.extend(std::iter::repeat_n(0.9, 300));
+        let audio_len = probabilities.len() * VAD_WINDOW_SAMPLES;
+        let regions = detect_speech_regions(&probabilities, audio_len, &config.segmentation);
+        assert_eq!(
+            regions,
+            vec![
+                SampleRange {
+                    start: 3_936,
+                    end: 157_856,
+                },
+                SampleRange {
+                    start: 158_560,
+                    end: 312_320,
+                },
+            ]
+        );
+        let plan = build_vad_execution_plan(&regions, &probabilities, &config);
+
+        // one token on every frame a window hears, named by its recording frame
+        let mut raw_tasks: Vec<Option<RawTranscription>> = plan
+            .tasks
+            .iter()
+            .map(|task| {
+                let first = task.audio_start / SAMPLES_PER_ENCODER_FRAME;
+                let frames =
+                    (task.audio_end - task.audio_start).div_ceil(SAMPLES_PER_ENCODER_FRAME);
+                let ids: Vec<u32> = (first..first + frames).map(|frame| frame as u32).collect();
+                let window_frames: Vec<usize> = (0..frames).collect();
+                let mut raw =
+                    raw_from_columns(&ids, &window_frames, &vec![1; frames], &vec![0.9; frames]);
+                raw.place_on_timeline(task.context_samples, task.global_sample_offset);
+                Some(raw)
+            })
+            .collect();
+        let mut ids = Vec::new();
+        for region in &plan.regions {
+            assert!(matches!(region.kind, RegionTaskKind::Overlap));
+            let merged = merge_overlap_region(&region.task_indices, &mut raw_tasks)
+                .expect("every window has a transcription");
+            ids.extend(merged.ids());
+        }
+
+        // frame 3 starts in the silence before the first region and frame 123
+        // inside the first region, so the second region drops it
+        assert_eq!(ids, (4..=243).collect::<Vec<u32>>());
     }
 
     /// Silence past the native single-input limit, so it takes the long-form path
