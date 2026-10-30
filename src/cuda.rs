@@ -22,7 +22,7 @@ use cudakit::cudarc::driver::{
 };
 use cudakit::{DeviceTensor, Error, Math, Sgemm};
 
-use crate::cuda::encoder::{EncoderMath, Quantization};
+use crate::cuda::encoder::{EncoderMath, KeepFp16, Quantization};
 use crate::cuda::kernels::CudaRuntime;
 use crate::cuda::quant::Scheme;
 use crate::error::TranscriptionError;
@@ -147,14 +147,18 @@ impl<T> Drop for HostStaging<T> {
     }
 }
 
-/// The encoder GEMM precision of a model precision
-pub(crate) fn math(precision: Precision) -> EncoderMath {
-    match (precision, scheme(precision)) {
-        (_, Some(scheme)) => EncoderMath::Quantized(Quantization::all(scheme)),
+/// The encoder GEMM precision of a model precision, with the layers the experimental
+/// `SCRIPTRS_CUDA_KEEP_FP16` variable keeps at FP16 (see [`KeepFp16::from_env`])
+pub(crate) fn math(precision: Precision) -> Result<EncoderMath, TranscriptionError> {
+    Ok(match (precision, scheme(precision)) {
+        (_, Some(scheme)) => EncoderMath::Quantized(Quantization {
+            keep: KeepFp16::from_env()?,
+            ..Quantization::all(scheme)
+        }),
         (Precision::Fp32, None) => EncoderMath::Single(Math::Fp32),
         (Precision::Tf32, None) => EncoderMath::Single(Math::Tf32),
         (_, None) => EncoderMath::Fp16,
-    }
+    })
 }
 
 /// The scheme a quantized precision stores its linear weights in, `None` for the
@@ -167,7 +171,8 @@ pub(crate) fn scheme(precision: Precision) -> Option<Scheme> {
         Precision::Fp8PerToken => Some(Scheme::Fp8Token),
         Precision::Mxfp8 => Some(Scheme::Mxfp8),
         Precision::Nvfp4 => Some(Scheme::Nvfp4),
-        Precision::Int8Weights => Some(Scheme::Int8Weights),
+        Precision::Int8Weights => Some(Scheme::Int8Weights { group: None }),
+        Precision::Int8Weights128 => Some(Scheme::Int8Weights { group: Some(128) }),
         Precision::Int4Weights => Some(Scheme::Int4Weights { group: 128 }),
         Precision::Int4Weights64 => Some(Scheme::Int4Weights { group: 64 }),
     }

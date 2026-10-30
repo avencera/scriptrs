@@ -84,6 +84,9 @@ pub enum Precision {
     /// INT8 weights with a scale per output channel, dequantized to FP16 before each
     /// [`Precision::Fp16`] product: a quarter of FP32's weight memory on any GPU
     Int8Weights,
+    /// [`Precision::Int8Weights`] with a scale per 128 inputs instead of per output
+    /// channel, which bounds the error an outlier weight spreads over its row
+    Int8Weights128,
     /// INT4 weights with a scale per 128 inputs, dequantized to FP16 before each
     /// [`Precision::Fp16`] product: about an eighth of FP32's weight memory
     Int4Weights,
@@ -107,6 +110,7 @@ impl Precision {
             Self::Mxfp8 => Some("mxfp8"),
             Self::Nvfp4 => Some("nvfp4"),
             Self::Int8Weights => Some("int8-weights"),
+            Self::Int8Weights128 => Some("int8-weights128"),
             Self::Int4Weights => Some("int4-weights"),
             Self::Int4Weights64 => Some("int4-weights64"),
         }

@@ -51,9 +51,9 @@ pub(crate) enum Scheme {
     /// NVFP4: E2M1 in blocks of 16 with E4M3 scales and a tensor scale, for both
     /// operands
     Nvfp4,
-    /// INT8 weights with a scale per output channel, dequantized to FP16 for an FP16
-    /// product
-    Int8Weights,
+    /// INT8 weights with a scale per `group` inputs, or per output channel without a
+    /// group, dequantized to FP16 for an FP16 product
+    Int8Weights { group: Option<usize> },
     /// INT4 weights with a scale per `group` inputs, dequantized to FP16 for an FP16
     /// product
     Int4Weights { group: usize },
@@ -87,8 +87,8 @@ impl Scheme {
                     global,
                 }
             }
-            Self::Int8Weights => {
-                let (values, scales) = int8_rows(weight, inputs);
+            Self::Int8Weights { group } => {
+                let (values, scales) = int8_rows(weight, group.unwrap_or(inputs));
                 QuantizedWeight::Int8 { values, scales }
             }
             Self::Int4Weights { group } => {
@@ -104,7 +104,7 @@ impl Scheme {
 
     /// Whether the product reads FP16 activations and a dequantized FP16 weight
     pub(crate) fn weight_only(self) -> bool {
-        matches!(self, Self::Int8Weights | Self::Int4Weights { .. })
+        matches!(self, Self::Int8Weights { .. } | Self::Int4Weights { .. })
     }
 
     /// The name of the scheme in a quantized weight file's metadata
@@ -115,7 +115,8 @@ impl Scheme {
             Self::Fp8Token => "fp8-token".to_owned(),
             Self::Mxfp8 => "mxfp8".to_owned(),
             Self::Nvfp4 => "nvfp4".to_owned(),
-            Self::Int8Weights => "int8-weights".to_owned(),
+            Self::Int8Weights { group: None } => "int8-weights".to_owned(),
+            Self::Int8Weights { group: Some(group) } => format!("int8-weights-g{group}"),
             Self::Int4Weights { group } => format!("int4-weights-g{group}"),
         }
     }
@@ -128,9 +129,14 @@ impl Scheme {
             "fp8-token" => Self::Fp8Token,
             "mxfp8" => Self::Mxfp8,
             "nvfp4" => Self::Nvfp4,
-            "int8-weights" => Self::Int8Weights,
-            _ => Self::Int4Weights {
-                group: name.strip_prefix("int4-weights-g")?.parse().ok()?,
+            "int8-weights" => Self::Int8Weights { group: None },
+            _ => match name.strip_prefix("int8-weights-g") {
+                Some(group) => Self::Int8Weights {
+                    group: Some(group.parse().ok()?),
+                },
+                None => Self::Int4Weights {
+                    group: name.strip_prefix("int4-weights-g")?.parse().ok()?,
+                },
             },
         })
     }
@@ -603,7 +609,8 @@ impl QuantKernels {
         Ok(())
     }
 
-    /// FP16 of an INT8 weight with a scale per row of `width`
+    /// FP16 of an INT8 weight with a scale per `width` elements: an output channel or
+    /// a group of inputs
     pub(crate) fn dequant_i8(
         &self,
         stream: &CudaStream,
@@ -769,9 +776,12 @@ pub(crate) mod test_support {
                         })
                         .collect()
                 }
-                Self::Int8 { values, scales } => (0..n)
-                    .map(|i| f32::from(values[i] as i8) * scales[i / inputs])
-                    .collect(),
+                Self::Int8 { values, scales } => {
+                    let group = n / scales.len();
+                    (0..n)
+                        .map(|i| f32::from(values[i] as i8) * scales[i / group])
+                        .collect()
+                }
                 Self::Int4 {
                     values,
                     scales,
@@ -916,7 +926,8 @@ mod tests {
             (Scheme::Mxfp8, 0.04),
             (Scheme::Nvfp4, 0.15),
             // uniform INT8 rows lose more than FP8 to the rows holding an outlier
-            (Scheme::Int8Weights, 0.06),
+            (Scheme::Int8Weights { group: None }, 0.06),
+            (Scheme::Int8Weights { group: Some(128) }, 0.03),
             (Scheme::Int4Weights { group: 64 }, 0.15),
             (Scheme::Int4Weights { group: 128 }, 0.25),
         ];

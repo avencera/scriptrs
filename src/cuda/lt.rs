@@ -268,8 +268,16 @@ impl LtGemm {
 
     /// Whether this GPU and cuBLASLt run `format` products with FP32 output, judged by
     /// whether the heuristic offers an algorithm for a typical encoder shape
-    pub(crate) fn supports(&self, format: LtFormat) -> bool {
-        let built = self.descriptors(format, 128, 1024, 1024, format == LtFormat::Nvfp4);
+    pub(crate) fn supports(&self, runtime: &CudaRuntime, format: LtFormat) -> bool {
+        // any aligned device address stands in for the scales, which the heuristic
+        // checks for but never reads
+        let (scales, _sync) = self.workspace.device_ptr(runtime.stream());
+        let built = self.descriptors(
+            format,
+            (128, 1024, 1024),
+            (scales, scales),
+            format == LtFormat::Nvfp4,
+        );
         built.is_ok_and(|plan| self.candidates(&plan).is_ok_and(|found| !found.is_empty()))
     }
 
@@ -327,13 +335,15 @@ impl LtGemm {
         }
         let (workspace, _workspace_sync) = self.workspace.device_ptr(stream);
         let (betas, _betas_sync) = self.betas.device_ptr(stream);
-        let (alpha, beta): (*const c_void, *const c_void) = match product.alpha {
+        // borrow the scalars from `product`, which outlives the call: a by-value
+        // binding would die with its match arm and leave cuBLASLt a dangling alpha
+        let (alpha, beta): (*const c_void, *const c_void) = match &product.alpha {
             Alpha::Host(alpha) => (
-                std::ptr::from_ref(&alpha).cast(),
+                std::ptr::from_ref(alpha).cast(),
                 std::ptr::from_ref(&product.beta).cast(),
             ),
             Alpha::Device(alpha) => (
-                alpha as *const c_void,
+                *alpha as *const c_void,
                 (betas + if product.beta == 0.0 { 0 } else { 4 }) as *const c_void,
             ),
         };
@@ -362,13 +372,16 @@ impl LtGemm {
         .map_err(lt_error("cublasLt matmul"))
     }
 
-    /// The descriptors of a product, with the heuristic's first algorithm unset
+    /// The descriptors of a product of `(rows, out, inputs)` with the weight and
+    /// activation scales at `scales`, with the heuristic's first algorithm unset
+    ///
+    /// cuBLASLt offers no block-scaled algorithm for a descriptor without scale
+    /// pointers, so they are set before the heuristic runs; each launch sets its own
     fn descriptors(
         &self,
         format: LtFormat,
-        rows: usize,
-        out: usize,
-        inputs: usize,
+        (rows, out, inputs): (usize, usize, usize),
+        (w_scale, a_scale): (u64, u64),
         device_alpha: bool,
     ) -> Result<Plan, Error> {
         let desc = lt::create_matmul_desc(
@@ -393,6 +406,8 @@ impl LtGemm {
             set(desc, DESC_TRANSB, &OP_N)?;
             set(desc, DESC_A_SCALE_MODE, &format.scale_mode())?;
             set(desc, DESC_B_SCALE_MODE, &format.scale_mode())?;
+            set(desc, DESC_A_SCALE_POINTER, &w_scale)?;
+            set(desc, DESC_B_SCALE_POINTER, &a_scale)?;
             if device_alpha {
                 set(desc, DESC_POINTER_MODE, &POINTER_MODE_DEVICE)?;
             }
@@ -449,9 +464,8 @@ impl LtGemm {
         let device_alpha = matches!(product.alpha, Alpha::Device(_));
         let mut plan = self.descriptors(
             product.format,
-            product.rows,
-            product.out,
-            product.inputs,
+            (product.rows, product.out, product.inputs),
+            (product.w_scale, product.a_scale),
             device_alpha,
         )?;
         let candidates = self.candidates(&plan)?;
@@ -505,10 +519,153 @@ impl LtGemm {
 
 #[cfg(test)]
 mod tests {
+    use cudakit::cudarc::cublaslt::result as lt;
+    use cudakit::cudarc::cublaslt::sys;
+    use cudakit::cudarc::driver::DevicePtr;
+    use cudakit::{Library, Options};
+
+    use super::{
+        CANDIDATES, DESC_A_SCALE_MODE, DESC_A_SCALE_POINTER, DESC_B_SCALE_MODE,
+        DESC_B_SCALE_POINTER, DESC_POINTER_MODE, DESC_TRANSA, DESC_TRANSB, LtFormat, LtGemm, OP_N,
+        OP_T, POINTER_MODE_DEVICE, R_32F, WORKSPACE_BYTES, layout, set,
+    };
+    use crate::cuda::kernels::CudaRuntime;
+
+    // `cudaDataType` FP16 and BF16 outputs, from `library_types.h`
+    const R_16F: u32 = 2;
+    const R_16BF: u32 = 14;
+
     /// Loads the raw entry points, which needs the library but no GPU
     #[test]
     #[ignore = "needs libcublasLt; `just gpu-parity` runs it"]
     fn gpu_raw_entry_points_load() {
         super::raw().expect("cuBLASLt entry points");
+    }
+
+    /// Prints how many algorithms the heuristic offers each format for each output
+    /// type, alpha pointer mode and scale-pointer setting, which tells a format this
+    /// GPU lacks from a descriptor cuBLASLt rejects
+    #[test]
+    #[ignore = "needs a CUDA GPU; prints cuBLASLt support for the quantized formats"]
+    fn gpu_lt_heuristic_probe() {
+        let runtime = CudaRuntime::open(0, Options::default()).expect("CUDA runtime");
+        runtime.prepare(Library::Cublas).expect("cuBLAS");
+        let gemm = LtGemm::new(&runtime).expect("cuBLASLt");
+        let (scales, _sync) = gemm.workspace.device_ptr(runtime.stream());
+        let formats = [
+            LtFormat::Fp8,
+            LtFormat::Fp8OuterVector,
+            LtFormat::Mxfp8,
+            LtFormat::Nvfp4,
+        ];
+        for format in formats {
+            println!("{format:?}: supports {}", gemm.supports(&runtime, format));
+            for (out_name, out_type) in [("f32", R_32F), ("f16", R_16F), ("bf16", R_16BF)] {
+                for device_alpha in [false, true] {
+                    for with_scales in [false, true] {
+                        for (rows, out, inputs) in
+                            [(128, 1024, 1024), (1, 1024, 1024), (301, 4096, 1024)]
+                        {
+                            let found = probe(
+                                &gemm,
+                                format,
+                                out_type,
+                                device_alpha,
+                                with_scales.then_some(scales),
+                                (rows, out, inputs),
+                            );
+                            println!(
+                                "{format:?} out {out_name} device alpha {device_alpha} scales \
+                                 {with_scales} {rows}x{out}x{inputs}: {found}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The heuristic's answer for one descriptor: an algorithm count or an error
+    fn probe(
+        gemm: &LtGemm,
+        format: LtFormat,
+        out_type: u32,
+        device_alpha: bool,
+        scales: Option<u64>,
+        (rows, out, inputs): (usize, usize, usize),
+    ) -> String {
+        let desc = lt::create_matmul_desc(
+            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            sys::cudaDataType::CUDA_R_32F,
+        )
+        .expect("descriptor");
+        let w = layout(format.data_type(), inputs, out).expect("w layout");
+        let a = layout(format.data_type(), inputs, rows).expect("a layout");
+        let c = layout(out_type, out, rows).expect("c layout");
+        // SAFETY: the descriptor is live and each attribute takes the value's type
+        let attributes = unsafe {
+            set(desc, DESC_TRANSA, &OP_T)
+                .and_then(|()| set(desc, DESC_TRANSB, &OP_N))
+                .and_then(|()| set(desc, DESC_A_SCALE_MODE, &format.scale_mode()))
+                .and_then(|()| set(desc, DESC_B_SCALE_MODE, &format.scale_mode()))
+                .and_then(|()| match scales {
+                    Some(scales) => set(desc, DESC_A_SCALE_POINTER, &scales)
+                        .and_then(|()| set(desc, DESC_B_SCALE_POINTER, &scales)),
+                    None => Ok(()),
+                })
+                .and_then(|()| match device_alpha {
+                    true => set(desc, DESC_POINTER_MODE, &POINTER_MODE_DEVICE),
+                    false => Ok(()),
+                })
+        };
+        let answer = match attributes {
+            Err(error) => format!("attribute error {error}"),
+            Ok(()) => {
+                let pref = lt::create_matmul_pref().expect("preference");
+                let workspace_bytes = WORKSPACE_BYTES;
+                let mut results: [sys::cublasLtMatmulHeuristicResult_t; CANDIDATES] =
+                    // SAFETY: a plain C struct for which all-zero bits are valid
+                    unsafe { std::mem::zeroed() };
+                let mut found = 0;
+                // SAFETY: every descriptor is live, and `results` holds `CANDIDATES`
+                let status = unsafe {
+                    lt::set_matmul_pref_attribute(
+                        pref,
+                        sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                        (&raw const workspace_bytes).cast(),
+                        size_of::<usize>(),
+                    )
+                    .and_then(|()| {
+                        sys::cublasLtMatmulAlgoGetHeuristic(
+                            gemm.handle,
+                            desc,
+                            w,
+                            a,
+                            c,
+                            c,
+                            pref,
+                            CANDIDATES as i32,
+                            results.as_mut_ptr(),
+                            &raw mut found,
+                        )
+                        .result()
+                    })
+                };
+                // SAFETY: the preference is unused past this point
+                let _ = unsafe { lt::destroy_matmul_pref(pref) };
+                match status {
+                    Ok(()) => format!("{found} algorithms"),
+                    Err(error) => format!("{error:?}"),
+                }
+            }
+        };
+        // SAFETY: the descriptors are unused past this point
+        unsafe {
+            let _ = lt::destroy_matrix_layout(w);
+            let _ = lt::destroy_matrix_layout(a);
+            let _ = lt::destroy_matrix_layout(c);
+            let _ = lt::destroy_matmul_desc(desc);
+        }
+        answer
     }
 }

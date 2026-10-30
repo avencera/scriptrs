@@ -139,9 +139,9 @@ pub(crate) fn read_linear<'a>(
             scales: blocks(NV_BLOCK)?,
             global: file.tensor(&format!("{weight}_scale_2"), &[1])?[0],
         },
-        Scheme::Int8Weights => QuantizedWeight::Int8 {
+        Scheme::Int8Weights { group } => QuantizedWeight::Int8 {
             values: bytes(inputs)?,
-            scales: floats(out)?,
+            scales: floats(out * inputs / group.unwrap_or(inputs))?,
         },
         Scheme::Int4Weights { group } => QuantizedWeight::Int4 {
             values: bytes(inputs / 2)?,
@@ -362,6 +362,7 @@ mod tests {
             Precision::Mxfp8,
             Precision::Nvfp4,
             Precision::Int8Weights,
+            Precision::Int8Weights128,
             Precision::Int4Weights,
             Precision::Int4Weights64,
         ] {

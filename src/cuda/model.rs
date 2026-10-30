@@ -194,7 +194,7 @@ impl CudaModel {
         let _exclusive = exclusive_device_work();
         let runtime = CudaRuntime::open(0, Options::default())?;
         runtime.prepare(Library::Cublas)?;
-        let encoder = CudaEncoder::load(&runtime, &file, spec.encoder, math(precision))?;
+        let encoder = CudaEncoder::load(&runtime, &file, spec.encoder, math(precision)?)?;
         let decoder = CudaDecoder::load(&runtime, &file, &spec)?;
         let (free, _) = runtime.stream().context().mem_get_info()?;
         Ok(Self(Arc::new(ExclusiveTeardown(ManuallyDrop::new(

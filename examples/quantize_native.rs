@@ -4,7 +4,7 @@
 //! writes `model-<precision>.safetensors` beside it (or at `--out`), which a native
 //! bundle loaded at that precision reads instead of the FP32 file. `<precision>` is
 //! one of `fp16`, `fp8`, `fp8-tensor`, `fp8-token`, `mxfp8`, `nvfp4`, `int8-weights`,
-//! `int4-weights` and `int4-weights64`
+//! `int8-weights128`, `int4-weights` and `int4-weights64`
 //!
 //! ```sh
 //! cargo run --release --features cuda --example quantize_native -- \
@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use eyre::{Result, bail, eyre};
 use scriptrs::{Precision, write_native_weights};
 
-const PRECISIONS: [Precision; 9] = [
+const PRECISIONS: [Precision; 10] = [
     Precision::Fp16,
     Precision::Fp8,
     Precision::Fp8PerTensor,
@@ -25,6 +25,7 @@ const PRECISIONS: [Precision; 9] = [
     Precision::Mxfp8,
     Precision::Nvfp4,
     Precision::Int8Weights,
+    Precision::Int8Weights128,
     Precision::Int4Weights,
     Precision::Int4Weights64,
 ];

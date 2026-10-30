@@ -106,6 +106,55 @@ impl KeepFp16 {
         kinds: 0,
     };
 
+    /// The layers the experimental `SCRIPTRS_CUDA_KEEP_FP16` variable names, for
+    /// measuring mixed recipes against weights quantized at load: comma-separated
+    /// layer indices, `first-last` ranges and kinds (`ff-up`, `ff-down`, `qkv`, `pos`,
+    /// `out`, `pw1`, `pw2`), as in `12-18,ff-up`
+    pub(crate) fn from_env() -> Result<Self, TranscriptionError> {
+        let Ok(value) = std::env::var("SCRIPTRS_CUDA_KEEP_FP16") else {
+            return Ok(Self::NONE);
+        };
+        let invalid = |token: &str| {
+            TranscriptionError::InvalidConfiguration(format!(
+                "SCRIPTRS_CUDA_KEEP_FP16 names no layer or kind `{token}`"
+            ))
+        };
+        let layer = |token: &str| match token.parse::<u32>() {
+            Ok(layer) if layer < 64 => Ok(layer),
+            _ => Err(invalid(token)),
+        };
+        let mut keep = Self::NONE;
+        for token in value
+            .split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            let kind = match token {
+                "ff-up" => Some(LinearKind::FeedForwardUp),
+                "ff-down" => Some(LinearKind::FeedForwardDown),
+                "qkv" => Some(LinearKind::Qkv),
+                "pos" => Some(LinearKind::Position),
+                "out" => Some(LinearKind::AttentionOut),
+                "pw1" => Some(LinearKind::Pointwise1),
+                "pw2" => Some(LinearKind::Pointwise2),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                keep.kinds |= 1 << kind as u8;
+                continue;
+            }
+
+            let (first, last) = match token.split_once('-') {
+                Some((first, last)) => (layer(first)?, layer(last)?),
+                None => (layer(token)?, layer(token)?),
+            };
+            for layer in first..=last {
+                keep.layers |= 1 << layer;
+            }
+        }
+        Ok(keep)
+    }
+
     fn keeps(self, layer: usize, kind: LinearKind) -> bool {
         (layer < 64 && self.layers >> layer & 1 == 1) || self.kinds >> kind as u8 & 1 == 1
     }
@@ -1287,13 +1336,15 @@ impl QuantState {
         } else {
             let lt = LtGemm::new(runtime)?;
             let scale_after = match scheme {
-                Scheme::Fp8Tensor => lt.supports(LtFormat::Fp8).then_some(false),
-                Scheme::Fp8Channel if lt.supports(LtFormat::Fp8OuterVector) => Some(false),
-                Scheme::Fp8Channel => lt.supports(LtFormat::Fp8).then_some(true),
-                Scheme::Fp8Token => lt.supports(LtFormat::Fp8OuterVector).then_some(false),
-                Scheme::Mxfp8 => lt.supports(LtFormat::Mxfp8).then_some(false),
-                Scheme::Nvfp4 => lt.supports(LtFormat::Nvfp4).then_some(false),
-                Scheme::Int8Weights | Scheme::Int4Weights { .. } => Some(false),
+                Scheme::Fp8Tensor => lt.supports(runtime, LtFormat::Fp8).then_some(false),
+                Scheme::Fp8Channel if lt.supports(runtime, LtFormat::Fp8OuterVector) => Some(false),
+                Scheme::Fp8Channel => lt.supports(runtime, LtFormat::Fp8).then_some(true),
+                Scheme::Fp8Token => lt
+                    .supports(runtime, LtFormat::Fp8OuterVector)
+                    .then_some(false),
+                Scheme::Mxfp8 => lt.supports(runtime, LtFormat::Mxfp8).then_some(false),
+                Scheme::Nvfp4 => lt.supports(runtime, LtFormat::Nvfp4).then_some(false),
+                Scheme::Int8Weights { .. } | Scheme::Int4Weights { .. } => Some(false),
             }
             .ok_or_else(|| unsupported(Self::format(scheme, false)))?;
             (Some(lt), scale_after)
@@ -1320,7 +1371,9 @@ impl QuantState {
             Scheme::Fp8Tensor => LtFormat::Fp8,
             Scheme::Fp8Channel | Scheme::Fp8Token => LtFormat::Fp8OuterVector,
             Scheme::Mxfp8 => LtFormat::Mxfp8,
-            Scheme::Nvfp4 | Scheme::Int8Weights | Scheme::Int4Weights { .. } => LtFormat::Nvfp4,
+            Scheme::Nvfp4 | Scheme::Int8Weights { .. } | Scheme::Int4Weights { .. } => {
+                LtFormat::Nvfp4
+            }
         }
     }
 
@@ -1416,7 +1469,7 @@ impl QuantState {
                     &w.values.slice(..),
                     &scales.slice(..),
                     &mut weight,
-                    w.inputs,
+                    w.out * w.inputs / scales.len(),
                 )?,
             }
             linear_fp16(runtime, spec, a, &weight, c)?;
@@ -1487,7 +1540,9 @@ impl QuantState {
                 let (alpha_ptr, _alpha_sync) = quant.alpha.device_ptr(stream);
                 alpha = Alpha::Device(alpha_ptr);
             }
-            Scheme::Int8Weights | Scheme::Int4Weights { .. } => return Err(mixed_precision()),
+            Scheme::Int8Weights { .. } | Scheme::Int4Weights { .. } => {
+                return Err(mixed_precision());
+            }
         }
 
         let format = Self::format(w.scheme, self.scale_after);
@@ -1662,13 +1717,17 @@ mod tests {
     }
 
     /// Every quantization scheme, as the quantized precisions name them
-    const SCHEMES: [(&str, Scheme); 8] = [
+    const SCHEMES: [(&str, Scheme); 9] = [
         ("FP8", Scheme::Fp8Channel),
         ("FP8 per tensor", Scheme::Fp8Tensor),
         ("FP8 per token", Scheme::Fp8Token),
         ("MXFP8", Scheme::Mxfp8),
         ("NVFP4", Scheme::Nvfp4),
-        ("INT8 weights", Scheme::Int8Weights),
+        ("INT8 weights", Scheme::Int8Weights { group: None }),
+        (
+            "INT8 weights g128",
+            Scheme::Int8Weights { group: Some(128) },
+        ),
         ("INT4 weights g128", Scheme::Int4Weights { group: 128 }),
         ("INT4 weights g64", Scheme::Int4Weights { group: 64 }),
     ];
@@ -1779,7 +1838,9 @@ mod tests {
                 .dequantize(rows, width);
                 (values, restored)
             }
-            Scheme::Int8Weights | Scheme::Int4Weights { .. } => (Vec::new(), values.to_vec()),
+            Scheme::Int8Weights { .. } | Scheme::Int4Weights { .. } => {
+                (Vec::new(), values.to_vec())
+            }
         }
     }
 

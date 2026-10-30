@@ -313,6 +313,7 @@ fn precision_name(precision: Precision) -> &'static str {
         Precision::Mxfp8 => "mxfp8",
         Precision::Nvfp4 => "nvfp4",
         Precision::Int8Weights => "int8-weights",
+        Precision::Int8Weights128 => "int8-weights128",
         Precision::Int4Weights => "int4-weights",
         Precision::Int4Weights64 => "int4-weights64",
     }
@@ -366,6 +367,7 @@ fn parse_args() -> Result<Args> {
             "--mxfp8" => precision = Precision::Mxfp8,
             "--nvfp4" => precision = Precision::Nvfp4,
             "--int8-weights" => precision = Precision::Int8Weights,
+            "--int8-weights128" => precision = Precision::Int8Weights128,
             "--int4-weights" => precision = Precision::Int4Weights,
             "--int4-weights64" => precision = Precision::Int4Weights64,
             "--vad" if cfg!(feature = "vad") => vad = true,
