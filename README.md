@@ -273,13 +273,12 @@ FP16 gives the same transcripts as TF32. Batching changes a few transcripts in
 either precision, so the queued FP16 and TF32 transcripts differ slightly.
 
 The `low-precision` feature adds FP8, INT8 and NVFP4 modes for offline
-transcription (streaming rejects them), and FP16, FP8, INT8 and NVFP4 weight files
-at about half the download size or less. They are for limited cases, and most users
-should not need them: all three are slower than FP16 one utterance at a time. FP8
-and INT8 keep FP16's WER at about half the download, and NVFP4 trades some accuracy
-for throughput in large batches on Blackwell GPUs; see
-[`Precision`](https://docs.rs/scriptrs/latest/scriptrs/enum.Precision.html) for when
-each fits, GPU requirements and measurements.
+transcription, and the weight files that store them. Most users should leave it
+off. None of the three is faster than FP16 one utterance at a time, and they save
+little GPU memory: 0.4 to 0.7 GB of FP16's peak of about 7 GB on an RTX 5090. FP8
+and INT8 only halve the download at FP16's WER, and NVFP4 is faster only in large
+batches on Blackwell GPUs, at a WER cost. The `Precision` docs give the GPU
+requirements and measurements.
 
 ## Usage
 

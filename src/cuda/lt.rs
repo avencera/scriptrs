@@ -179,8 +179,29 @@ unsafe fn set<T>(desc: sys::cublasLtMatmulDesc_t, attribute: u32, value: &T) -> 
     status("cublasLt descriptor", code)
 }
 
+/// A matmul descriptor, destroyed on drop so an early return can't leak it
+struct Desc(sys::cublasLtMatmulDesc_t);
+
+impl Drop for Desc {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor is owned here, and no queued product reads it after
+        // its launch returned
+        let _ = unsafe { lt::destroy_matmul_desc(self.0) };
+    }
+}
+
+/// A matrix layout, destroyed on drop so an early return can't leak it
+struct Layout(sys::cublasLtMatrixLayout_t);
+
+impl Drop for Layout {
+    fn drop(&mut self) {
+        // SAFETY: as for `Desc`
+        let _ = unsafe { lt::destroy_matrix_layout(self.0) };
+    }
+}
+
 /// A column-major layout of `rows` by `cols` elements of `data_type`
-fn layout(data_type: u32, rows: usize, cols: usize) -> Result<sys::cublasLtMatrixLayout_t, Error> {
+fn layout(data_type: u32, rows: usize, cols: usize) -> Result<Layout, Error> {
     let raw = raw()?;
     let mut layout = std::ptr::null_mut();
     // SAFETY: `layout` is a valid out-pointer
@@ -194,29 +215,16 @@ fn layout(data_type: u32, rows: usize, cols: usize) -> Result<sys::cublasLtMatri
         )
     };
     status("cublasLt layout", code)?;
-    Ok(layout)
+    Ok(Layout(layout))
 }
 
 /// The descriptors of one product shape and the algorithm chosen for it
 struct Plan {
-    desc: sys::cublasLtMatmulDesc_t,
-    w: sys::cublasLtMatrixLayout_t,
-    a: sys::cublasLtMatrixLayout_t,
-    c: sys::cublasLtMatrixLayout_t,
+    desc: Desc,
+    w: Layout,
+    a: Layout,
+    c: Layout,
     algo: sys::cublasLtMatmulAlgo_t,
-}
-
-impl Drop for Plan {
-    fn drop(&mut self) {
-        // SAFETY: the plan owns its descriptors, and no queued product reads them
-        // after its launch returned
-        unsafe {
-            let _ = lt::destroy_matrix_layout(self.w);
-            let _ = lt::destroy_matrix_layout(self.a);
-            let _ = lt::destroy_matrix_layout(self.c);
-            let _ = lt::destroy_matmul_desc(self.desc);
-        }
-    }
 }
 
 /// Plan key: format, rows, out, inputs and whether alpha is on the device
@@ -250,12 +258,15 @@ impl Drop for LtGemm {
 impl LtGemm {
     pub(crate) fn new(runtime: &CudaRuntime) -> Result<Self, Error> {
         raw()?;
-        let handle = lt::create_handle().map_err(lt_error("cublasLt create"))?;
         let stream = runtime.stream();
+        let workspace = stream.alloc_zeros::<u8>(WORKSPACE_BYTES)?;
+        let betas = stream.clone_htod(&[0.0f32, 1.0])?;
+        // created last: `Drop` only frees it once `Self` exists
+        let handle = lt::create_handle().map_err(lt_error("cublasLt create"))?;
         Ok(Self {
             handle,
-            workspace: stream.alloc_zeros::<u8>(WORKSPACE_BYTES)?,
-            betas: stream.clone_htod(&[0.0f32, 1.0])?,
+            workspace,
+            betas,
             plans: Mutex::new(HashMap::new()),
         })
     }
@@ -324,8 +335,8 @@ impl LtGemm {
         let stream = runtime.stream();
         // SAFETY: the descriptor is live; the attributes take device pointers
         unsafe {
-            set(plan.desc, DESC_A_SCALE_POINTER, &product.w_scale)?;
-            set(plan.desc, DESC_B_SCALE_POINTER, &product.a_scale)?;
+            set(plan.desc.0, DESC_A_SCALE_POINTER, &product.w_scale)?;
+            set(plan.desc.0, DESC_B_SCALE_POINTER, &product.a_scale)?;
         }
         let (workspace, _workspace_sync) = self.workspace.device_ptr(stream);
         let (betas, _betas_sync) = self.betas.device_ptr(stream);
@@ -346,17 +357,17 @@ impl LtGemm {
         unsafe {
             lt::matmul(
                 self.handle,
-                plan.desc,
+                plan.desc.0,
                 alpha,
                 beta,
                 product.w as *const c_void,
-                plan.w,
+                plan.w.0,
                 product.a as *const c_void,
-                plan.a,
+                plan.a.0,
                 product.c as *const c_void,
-                plan.c,
+                plan.c.0,
                 product.c as *mut c_void,
-                plan.c,
+                plan.c.0,
                 &raw const plan.algo,
                 workspace as *mut c_void,
                 WORKSPACE_BYTES,
@@ -378,11 +389,13 @@ impl LtGemm {
         (w_scale, a_scale): (u64, u64),
         device_alpha: bool,
     ) -> Result<Plan, Error> {
-        let desc = lt::create_matmul_desc(
-            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            sys::cudaDataType::CUDA_R_32F,
-        )
-        .map_err(lt_error("cublasLt descriptor"))?;
+        let desc = Desc(
+            lt::create_matmul_desc(
+                sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                sys::cudaDataType::CUDA_R_32F,
+            )
+            .map_err(lt_error("cublasLt descriptor"))?,
+        );
         let data_type = format.data_type();
         // column-major `cᵀ [out, rows] = w(T) · aᵀ`, as in the FP16 products: the
         // row-major `[out, inputs]` weight read column-major is `wᵀ`, hence `T`
@@ -396,16 +409,16 @@ impl LtGemm {
         };
         // SAFETY: the descriptor is live and each attribute takes a 32-bit enum
         unsafe {
-            set(desc, DESC_TRANSA, &OP_T)?;
-            set(desc, DESC_TRANSB, &OP_N)?;
+            set(plan.desc.0, DESC_TRANSA, &OP_T)?;
+            set(plan.desc.0, DESC_TRANSB, &OP_N)?;
             if let Some(mode) = format.scale_mode() {
-                set(desc, DESC_A_SCALE_MODE, &mode)?;
-                set(desc, DESC_B_SCALE_MODE, &mode)?;
+                set(plan.desc.0, DESC_A_SCALE_MODE, &mode)?;
+                set(plan.desc.0, DESC_B_SCALE_MODE, &mode)?;
             }
-            set(desc, DESC_A_SCALE_POINTER, &w_scale)?;
-            set(desc, DESC_B_SCALE_POINTER, &a_scale)?;
+            set(plan.desc.0, DESC_A_SCALE_POINTER, &w_scale)?;
+            set(plan.desc.0, DESC_B_SCALE_POINTER, &a_scale)?;
             if device_alpha {
-                set(desc, DESC_POINTER_MODE, &POINTER_MODE_DEVICE)?;
+                set(plan.desc.0, DESC_POINTER_MODE, &POINTER_MODE_DEVICE)?;
             }
         }
         Ok(plan)
@@ -431,11 +444,11 @@ impl LtGemm {
             .and_then(|()| {
                 sys::cublasLtMatmulAlgoGetHeuristic(
                     self.handle,
-                    plan.desc,
-                    plan.w,
-                    plan.a,
-                    plan.c,
-                    plan.c,
+                    plan.desc.0,
+                    plan.w.0,
+                    plan.a.0,
+                    plan.c.0,
+                    plan.c.0,
                     pref,
                     CANDIDATES as i32,
                     results.as_mut_ptr(),

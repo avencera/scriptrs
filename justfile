@@ -33,6 +33,11 @@ check:
 gpu-parity *args:
     cargo test --release --features cuda,long-form,vad,low-precision --lib --test queued gpu_ -- --ignored --nocapture --test-threads 1 {{args}}
 
+# write every precision's weight file from the exported FP32 weights (~3 GB under
+# /shared/models/scriptrs-native) and check each decodes as load-time quantization
+weight-files:
+    cargo test --release --features cuda,low-precision --lib written_weights_match_load_time_quantization -- --ignored --nocapture
+
 # rebuild src/cuda/ptx/<area>.sm75.ptx from crates/scriptrs-cuda-kernels with the
 # cuda-oxide nightly; a hand-built stand-in until cudakit-build owns the toolchain
 cuda-kernels area="encoder":

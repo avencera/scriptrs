@@ -38,6 +38,9 @@ fn main() -> Result<()> {
         (None, _) => input.with_file_name(format!("model-{name}.safetensors")),
         _ => return Err(eyre!("expected `--out <path>`")),
     };
+    if let Some(extra) = args.next() {
+        bail!("unexpected argument `{extra}`");
+    }
 
     write_native_weights(&input, &output, precision)?;
     println!("{}", output.display());

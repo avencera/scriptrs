@@ -62,14 +62,16 @@ pub(crate) enum RuntimeBundle {
 /// NeMo's FP32 output token for token. They are slower and no more accurate
 ///
 /// `Precision::Fp8`, `Precision::Int8` and `Precision::Nvfp4` (`low-precision`
-/// feature) are for limited cases, and most users should not need them. All three
-/// are slower than FP16 one utterance at a time:
+/// feature) are not recommended, and most users should leave the feature off. They
+/// are not faster: all three are slower than FP16 one utterance at a time. Nor do
+/// they save much GPU memory, since most of a running model's memory is not its
+/// weights: on an RTX 5090 with Parakeet v3 they cut FP16's peak of about 7 GB by
+/// only 0.4 to 0.7 GB. Reach for one only when one of these outweighs the speed:
 ///
-/// - FP8 and INT8 keep FP16's WER with about half the download and slightly less
-///   GPU memory. Consider them only when download size or memory matters more than
-///   speed
-/// - NVFP4 loses some accuracy in exchange for more throughput in large batches on
-///   Blackwell GPUs. Consider it only for high-volume batch work that can accept
+/// - FP8 and INT8 keep FP16's WER at about half the download (around 700 MB against
+///   1300 MB), for deployments where download or disk size is the constraint
+/// - NVFP4 is faster than FP16 in large batches and on long-form audio on Blackwell
+///   GPUs, at a measurable WER loss; it suits high-volume batch work that can accept
 ///   that loss
 ///
 /// The three apply to offline transcription only: a streaming model fails to load
@@ -111,8 +113,9 @@ pub enum Precision {
     /// pt). It runs about 7 % slower than FP16 one utterance at a time and 2 % faster
     /// in batches of 16, and its weight file is 697 MB against FP16's 1300 MB
     ///
-    /// cuBLASLt's algorithm for each product shape is chosen by timing when the model
-    /// loads, so a few transcripts can differ between processes
+    /// cuBLASLt's algorithm for each product shape is chosen by timing the first time
+    /// that shape runs, so the first transcription of each new size waits for the
+    /// timing, and a few transcripts can differ between processes
     #[cfg(feature = "low-precision")]
     Fp8,
     /// For limited cases only: half the download of [`Precision::Fp16`] at the same
@@ -144,8 +147,9 @@ pub enum Precision {
     /// FLEURS (4.82 % against 4.57 %) and 0.4 on MLS (6.64 % against 6.25 %). Its
     /// weight file is 432 MB
     ///
-    /// cuBLASLt's algorithm for each product shape is chosen by timing when the model
-    /// loads, so a few transcripts can differ between processes
+    /// cuBLASLt's algorithm for each product shape is chosen by timing the first time
+    /// that shape runs, so the first transcription of each new size waits for the
+    /// timing, and a few transcripts can differ between processes
     #[cfg(feature = "low-precision")]
     Nvfp4,
 }

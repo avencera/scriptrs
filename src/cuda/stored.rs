@@ -318,14 +318,9 @@ pub fn write_native_weights(
     safetensors::serialize_to_file(views, Some(metadata), output)
         .map_err(|error| TranscriptionError::InvalidWeights(error.to_string()))?;
 
-    // safetensors writes through a temporary file, which is created 0600; weight
-    // files are meant to be shared and published
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        std::fs::set_permissions(output, std::fs::Permissions::from_mode(0o644))?;
-    }
+    // safetensors writes through a 0600 temporary file; give the output the source's
+    // mode so a converted file is exactly as shareable as the weights it came from
+    std::fs::set_permissions(output, std::fs::metadata(input)?.permissions())?;
 
     Ok(())
 }
@@ -418,6 +413,11 @@ mod tests {
                         source.tensor(tensor, shape).ok(),
                         "{name} {tensor}"
                     );
+                }
+            }
+            for (tensor, _, _) in source.tensors() {
+                if !super::is_linear(tensor) {
+                    assert!(written.dtype(tensor).is_ok(), "{name} is missing {tensor}");
                 }
             }
         }

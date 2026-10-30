@@ -21,7 +21,8 @@ long-form = []
 vad = ["long-form"]
 # CUDA backend on native weights (ModelBundle::from_native_dir)
 cuda = ["dep:memmap2", "dep:safetensors", "dep:cudakit", "cudakit/libraries"]
-# FP8, INT8 and NVFP4 encoder precisions on CUDA, and the weight files that store them
+# FP8, INT8 and NVFP4 encoder precisions on CUDA, and the weight files that store
+# them; not recommended for most users: slower than FP16 one utterance at a time
 low-precision = ["cuda", "dep:cudarc"]
 
 [dependencies]

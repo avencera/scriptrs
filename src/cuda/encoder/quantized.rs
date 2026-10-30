@@ -390,6 +390,7 @@ mod tests {
     use crate::cuda::quant::{QuantizedWeight, Scheme, f16_bits, f16_value, fp8_tensor, nvfp4};
     use crate::cuda::test_support::weights;
     use crate::deployment::{ParakeetDeployment, ParakeetVersion};
+    use crate::error::TranscriptionError;
     use crate::test_support::NemoReference;
 
     impl CudaEncoder {
@@ -443,6 +444,12 @@ mod tests {
         ("INT8", Scheme::Int8),
         ("NVFP4", Scheme::Nvfp4),
     ];
+
+    /// Whether `error` is only this GPU or cuBLAS lacking a scheme's products, the
+    /// one load failure the tests skip instead of failing
+    fn unsupported_here(error: &TranscriptionError) -> bool {
+        matches!(error, TranscriptionError::InvalidConfiguration(message) if message.contains("does not run"))
+    }
 
     /// One NeMo reference input: the time-major mel, its valid lengths and the
     /// expected encoder output, `[batch, frames, d_model]`
@@ -587,10 +594,11 @@ mod tests {
             let math = EncoderMath::Quantized(scheme);
             let quant = match QuantState::load(&runtime, &file, spec, math) {
                 Ok(quant) => quant.expect("a quantized math"),
-                Err(error) => {
+                Err(error) if unsupported_here(&error) => {
                     println!("{name}: unsupported here: {error}");
                     continue;
                 }
+                Err(error) => panic!("{name}: {error}"),
             };
             for (tensor, out, inputs, alpha, beta) in products {
                 let weight = file.tensor(tensor, &[out, inputs]).expect("weight");
@@ -708,10 +716,11 @@ mod tests {
                 let math = EncoderMath::Quantized(scheme);
                 let encoder = match CudaEncoder::load(&runtime, &file, spec, math) {
                     Ok(encoder) => encoder,
-                    Err(error) => {
+                    Err(error) if unsupported_here(&error) => {
                         println!("{version:?} {name}: unsupported here: {error}");
                         continue;
                     }
+                    Err(error) => panic!("{version:?} {name}: {error}"),
                 };
                 println!(
                     "{version:?} {name} linear weights: {} bytes",
