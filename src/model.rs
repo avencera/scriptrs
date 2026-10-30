@@ -87,6 +87,9 @@ impl ParakeetModelInner {
                 #[cfg(target_os = "macos")]
                 {
                     let dims = bundle.deployment().decoder_dimensions();
+                    // the Core ML encoder takes a fixed-width input sized for the
+                    // longest single chunk, which the host loop pads every chunk to
+                    let target_frames = config.max_feature_frames();
                     Ok(Self::SplitCoreMl {
                         model: Box::new(crate::coreml::ParakeetSplitCoreMlModel::new(
                             layout.encoder_dir(),
@@ -94,10 +97,10 @@ impl ParakeetModelInner {
                             layout.joint_decision_dir(),
                             bundle.deployment().model_io(),
                             dims,
+                            config.feature_size,
+                            target_frames,
                         )?),
-                        // the Core ML encoder takes a fixed-width input sized
-                        // for the longest single chunk
-                        host: HostLoop::new(dims, config.feature_size, config.max_feature_frames()),
+                        host: HostLoop::new(dims, config.feature_size, target_frames),
                     })
                 }
                 #[cfg(not(target_os = "macos"))]

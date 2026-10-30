@@ -30,23 +30,10 @@ pub(super) fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
 
 pub(super) fn multi_array_f32(
     values: &[f32],
-    shape: &[usize],
-    deallocator: &RcBlock<dyn Fn(NonNull<c_void>)>,
-) -> Result<Retained<MLMultiArray>, TranscriptionError> {
-    multi_array(
-        values.as_ptr().cast::<c_void>() as *mut c_void,
-        shape,
-        MLMultiArrayDataType::Float32,
-        deallocator,
-    )
-}
-
-pub(super) fn multi_array_f32_cached(
-    values: &[f32],
     cached: &CachedInputShape,
     deallocator: &RcBlock<dyn Fn(NonNull<c_void>)>,
 ) -> Result<Retained<MLMultiArray>, TranscriptionError> {
-    multi_array_cached(
+    multi_array(
         values.as_ptr().cast::<c_void>() as *mut c_void,
         cached,
         MLMultiArrayDataType::Float32,
@@ -56,23 +43,10 @@ pub(super) fn multi_array_f32_cached(
 
 pub(super) fn multi_array_i32(
     values: &[i32],
-    shape: &[usize],
-    deallocator: &RcBlock<dyn Fn(NonNull<c_void>)>,
-) -> Result<Retained<MLMultiArray>, TranscriptionError> {
-    multi_array(
-        values.as_ptr().cast::<c_void>() as *mut c_void,
-        shape,
-        MLMultiArrayDataType::Int32,
-        deallocator,
-    )
-}
-
-pub(super) fn multi_array_i32_cached(
-    values: &[i32],
     cached: &CachedInputShape,
     deallocator: &RcBlock<dyn Fn(NonNull<c_void>)>,
 ) -> Result<Retained<MLMultiArray>, TranscriptionError> {
-    multi_array_cached(
+    multi_array(
         values.as_ptr().cast::<c_void>() as *mut c_void,
         cached,
         MLMultiArrayDataType::Int32,
@@ -81,34 +55,6 @@ pub(super) fn multi_array_i32_cached(
 }
 
 fn multi_array(
-    ptr: *mut c_void,
-    shape: &[usize],
-    data_type: MLMultiArrayDataType,
-    deallocator: &RcBlock<dyn Fn(NonNull<c_void>)>,
-) -> Result<Retained<MLMultiArray>, TranscriptionError> {
-    let ptr = NonNull::new(ptr).ok_or_else(|| {
-        TranscriptionError::CoreMl("input tensor had a null data pointer".to_owned())
-    })?;
-    let ns_shape = ns_number_array(shape);
-    let ns_strides = ns_number_array(&contiguous_strides(shape));
-
-    #[allow(deprecated)]
-    // SAFETY: the pointer, shape, and contiguous strides all describe the same borrowed
-    // SAFETY: tensor buffer, and CoreML only reads them during the prediction call
-    unsafe {
-        MLMultiArray::initWithDataPointer_shape_dataType_strides_deallocator_error(
-            MLMultiArray::alloc(),
-            ptr,
-            &ns_shape,
-            data_type,
-            &ns_strides,
-            Some(deallocator),
-        )
-    }
-    .map_err(|error| TranscriptionError::CoreMl(format!("failed to create MLMultiArray: {error}")))
-}
-
-fn multi_array_cached(
     ptr: *mut c_void,
     cached: &CachedInputShape,
     data_type: MLMultiArrayDataType,
