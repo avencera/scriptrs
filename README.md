@@ -239,9 +239,13 @@ speech threshold.
 
 By default the encoder layers' linear weights are stored in FP16, which has TF32's
 10-bit mantissa, and their matrix multiplies run on FP16 tensor cores with FP32
-accumulation. `Precision::Tf32` keeps the weights in FP32 and uses TF32 tensor
-cores on Ampere and newer GPUs, or FP32 on older ones. `Precision::Fp32` matches
-NeMo's FP32 decode token for token on any GPU:
+accumulation. Use this default: it is the fastest and scores the same WER as FP32.
+
+`Precision::Tf32` and `Precision::Fp32` are for compatibility, when you need to
+keep matching transcripts you already produced at that precision. `Precision::Tf32`
+keeps the weights in FP32 and uses TF32 tensor cores on Ampere and newer GPUs, or
+FP32 on older ones. `Precision::Fp32` matches NeMo's FP32 decode token for token on
+any GPU:
 
 ```rust,ignore
 use scriptrs::{ModelBundle, ParakeetDeployment, Precision};
@@ -254,7 +258,7 @@ On an RTX 5090 with Parakeet v3 (speed in x real time, then WER):
 
 | | FP16 (default) | TF32 | FP32 |
 |---|---|---|---|
-| LibriSpeech test-clean, one utterance at a time | 1534x, 1.93 % | 1179x, 1.93 % | — |
+| LibriSpeech test-clean, one utterance at a time | 1534x, 1.93 % | 1179x, 1.93 % | 848x, 1.93 % |
 | LibriSpeech test-clean, queue in batches of 16 | 4767x, 1.93 % | 3364x, 1.92 % | — |
 | Earnings-21, long-form | 3633x, 8.24 % | 2633x, 8.24 % | — |
 | FLEURS de, es, fr, it, nl, pt (15.8 h) | 1839x, 4.57 % | 1450x, 4.57 % | 966x, 4.57 % |
@@ -267,10 +271,12 @@ FP16 gives the same transcripts as TF32. Batching changes a few transcripts in
 either precision, so the queued FP16 and TF32 transcripts differ slightly.
 
 The `low-precision` feature adds FP8, INT8 and NVFP4 encoder modes, and FP16, FP8,
-INT8 and NVFP4 weight files at about half the download size or less. FP8 and INT8
-keep FP16's WER, while NVFP4 is faster in batches but less accurate; see
-[`Precision`](https://docs.rs/scriptrs/latest/scriptrs/enum.Precision.html) for GPU
-requirements and measurements.
+INT8 and NVFP4 weight files at about half the download size or less. They are for
+limited cases, and most users should not need them: all three are slower than FP16
+one utterance at a time. FP8 and INT8 keep FP16's WER at about half the download,
+and NVFP4 trades some accuracy for throughput in large batches on Blackwell GPUs;
+see [`Precision`](https://docs.rs/scriptrs/latest/scriptrs/enum.Precision.html) for
+when each fits, GPU requirements and measurements.
 
 ## Usage
 

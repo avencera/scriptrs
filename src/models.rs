@@ -51,20 +51,51 @@ pub(crate) enum RuntimeBundle {
 ///
 /// The residual stream, the matrix multiplies' outputs and their accumulation stay
 /// FP32 at every precision, and decoding always runs in FP32
+///
+/// # Which to use
+///
+/// Use the default, [`Precision::Fp16`]. It is the fastest one utterance at a time
+/// and scores the same WER as FP32
+///
+/// [`Precision::Fp32`] and [`Precision::Tf32`] are for compatibility: use them only
+/// to keep matching transcripts you already produced at that precision, such as
+/// NeMo's FP32 output token for token. They are slower and no more accurate
+///
+/// `Precision::Fp8`, `Precision::Int8` and `Precision::Nvfp4` (`low-precision`
+/// feature) are for limited cases, and most users should not need them. All three
+/// are slower than FP16 one utterance at a time:
+///
+/// - FP8 and INT8 keep FP16's WER with about half the download and slightly less
+///   GPU memory. Consider them only when download size or memory matters more than
+///   speed
+/// - NVFP4 loses some accuracy in exchange for more throughput in large batches on
+///   Blackwell GPUs. Consider it only for high-volume batch work that can accept
+///   that loss
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Precision {
+    /// The default, and the right choice for almost every use
+    ///
     /// FP16 weights and operands for the Conformer layers' linear layers, with FP32
     /// accumulation; the rest of the encoder runs as [`Precision::Tf32`]. FP16 keeps
     /// TF32's 10-bit mantissa, so the weights take half the memory and the multiplies
     /// run at the faster FP16 tensor-core rate. Activations past ±65504 would overflow
     #[default]
     Fp16,
+    /// For compatibility with transcripts already produced in TF32; slower than
+    /// [`Precision::Fp16`] at the same WER
+    ///
     /// TF32 tensor-core multiplies (10-bit mantissa) on Ampere and newer GPUs, with
     /// FP32 weights and operands; cuBLAS runs them as FP32 on older GPUs
     Tf32,
-    /// Full FP32 multiplies, matching NeMo's FP32 decode token for token
+    /// For compatibility: matches NeMo's FP32 decode token for token, so use it only
+    /// when you need that exact output, such as to stay consistent with transcripts
+    /// you already produced in FP32. About half as fast as [`Precision::Fp16`] at the
+    /// same WER
     Fp32,
+    /// For limited cases only: half the download of [`Precision::Fp16`] at the same
+    /// WER, but slower one utterance at a time
+    ///
     /// FP8 E4M3 weights with one scale per weight tensor, and FP8 activations with one
     /// dynamic scale per product, through cuBLASLt with FP32 accumulation and output.
     /// Needs an Ada (sm_89) or newer GPU; loading fails on GPUs whose cuBLASLt runs
@@ -81,6 +112,9 @@ pub enum Precision {
     /// loads, so a few transcripts can differ between processes
     #[cfg(feature = "low-precision")]
     Fp8,
+    /// For limited cases only: half the download of [`Precision::Fp16`] at the same
+    /// WER on GPUs without FP8, but slower than FP16
+    ///
     /// INT8 weights with one scale per 128 inputs, dequantized to FP16 before each
     /// [`Precision::Fp16`] product, so it runs on any GPU FP16 does. Needs the
     /// `low-precision` feature
@@ -92,12 +126,15 @@ pub enum Precision {
     /// time and 7 % in batches of 16; its weight file is 715 MB
     #[cfg(feature = "low-precision")]
     Int8,
+    /// For limited cases only: high-volume batch work on Blackwell GPUs that can
+    /// accept a small WER loss
+    ///
     /// NVFP4: E2M1 weights and activations in blocks of 16 with E4M3 scales and one
     /// scale per tensor, through cuBLASLt's block-scaled products. Needs a Blackwell
     /// GPU (compute capability 10.0 or newer; measured only on sm_120); loading fails
     /// on GPUs whose cuBLASLt runs no NVFP4 products. Needs the `low-precision` feature
     ///
-    /// Faster in batches but lossy. On an RTX 5090 with Parakeet v3 it runs 16 %
+    /// On an RTX 5090 with Parakeet v3 it runs 16 %
     /// faster than [`Precision::Fp16`] in batches of 16 and 26 % faster on long-form
     /// Earnings-21 calls, but 22 % slower one utterance at a time, and WER rises by
     /// about 0.08 points on LibriSpeech test-clean (2.01 % against 1.93 %), 0.25 on
@@ -350,6 +387,7 @@ impl ModelBundle {
 
     /// Set the precision of the CUDA encoder's matrix multiplies, FP16 by default
     ///
+    /// Most users should keep the default; see [`Precision`] for when another fits.
     /// [`Precision::Tf32`] keeps the weights and operands in FP32, out of FP16's
     /// overflow range, and [`Precision::Fp32`] gives up the tensor-core speedup for
     /// output that matches NeMo's FP32 decode exactly. Core ML bundles ignore it
