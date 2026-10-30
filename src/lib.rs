@@ -166,7 +166,7 @@ mod coreml;
 mod long_form;
 
 pub use config::TranscriptionConfig;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "low-precision")]
 pub use cuda::stored::write_native_weights;
 pub use deployment::{
     DecoderDimensions, DecoderIo, EncoderIo, FrontendSpec, JointIo, ModelIo, ModelLayout,

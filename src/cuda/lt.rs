@@ -1,11 +1,11 @@
-//! FP8 and block-scaled encoder linear layers through cuBLASLt
+//! FP8 and NVFP4 encoder linear layers through cuBLASLt
 //!
 //! cuBLAS's `cublasGemmEx` takes no operand scales, so the quantized products of
 //! [`EncoderMath::Quantized`](crate::cuda::encoder::EncoderMath) call cuBLASLt on
 //! a handle of their own. cudakit's cudarc carries the CUDA 12.4 bindings, which
-//! predate the block-scale modes and the FP4 and UE8M0 types, so the descriptor
+//! predate the block-scale modes and the FP4 type, so the descriptor
 //! attributes and matrix layouts go through the raw entry points with the values of
-//! CUDA 13's `cublasLt.h`; the library itself is whatever cudakit loaded.
+//! CUDA 13's `cublasLt.h`; the library itself is whatever cudakit loaded
 //!
 //! Each product shape gets a plan the first time it runs: the heuristic's candidates
 //! are timed into a scratch output and the fastest is kept, as cuBLASLt's first
@@ -46,8 +46,6 @@ const OP_N: i32 = 0;
 const OP_T: i32 = 1;
 const SCALE_SCALAR_32F: i32 = 0;
 const SCALE_VEC16_UE4M3: i32 = 1;
-const SCALE_VEC32_UE8M0: i32 = 2;
-const SCALE_OUTER_VEC_32F: i32 = 3;
 // `cudaDataType`, from `library_types.h`
 const R_32F: u32 = 0;
 const R_8F_E4M3: u32 = 28;
@@ -58,11 +56,6 @@ const R_4F_E2M1: u32 = 33;
 pub(crate) enum LtFormat {
     /// E4M3 with one FP32 scale per operand
     Fp8,
-    /// E4M3 with FP32 outer-vector scales: one per output channel of the weight and
-    /// one per row of the activation
-    Fp8OuterVector,
-    /// E4M3 with a UE8M0 scale per 32 inputs
-    Mxfp8,
     /// E2M1 with an E4M3 scale per 16 inputs
     Nvfp4,
 }
@@ -70,16 +63,14 @@ pub(crate) enum LtFormat {
 impl LtFormat {
     fn data_type(self) -> u32 {
         match self {
+            Self::Fp8 => R_8F_E4M3,
             Self::Nvfp4 => R_4F_E2M1,
-            _ => R_8F_E4M3,
         }
     }
 
     fn scale_mode(self) -> i32 {
         match self {
             Self::Fp8 => SCALE_SCALAR_32F,
-            Self::Fp8OuterVector => SCALE_OUTER_VEC_32F,
-            Self::Mxfp8 => SCALE_VEC32_UE8M0,
             Self::Nvfp4 => SCALE_VEC16_UE4M3,
         }
     }
@@ -375,8 +366,8 @@ impl LtGemm {
     /// The descriptors of a product of `(rows, out, inputs)` with the weight and
     /// activation scales at `scales`, with the heuristic's first algorithm unset
     ///
-    /// cuBLASLt offers no block-scaled algorithm for a descriptor without scale
-    /// pointers, so they are set before the heuristic runs; each launch sets its own
+    /// cuBLASLt offers no NVFP4 algorithm for a descriptor without scale pointers, so
+    /// they are set before the heuristic runs; each launch sets its own
     fn descriptors(
         &self,
         format: LtFormat,
@@ -519,153 +510,10 @@ impl LtGemm {
 
 #[cfg(test)]
 mod tests {
-    use cudakit::cudarc::cublaslt::result as lt;
-    use cudakit::cudarc::cublaslt::sys;
-    use cudakit::cudarc::driver::DevicePtr;
-    use cudakit::{Library, Options};
-
-    use super::{
-        CANDIDATES, DESC_A_SCALE_MODE, DESC_A_SCALE_POINTER, DESC_B_SCALE_MODE,
-        DESC_B_SCALE_POINTER, DESC_POINTER_MODE, DESC_TRANSA, DESC_TRANSB, LtFormat, LtGemm, OP_N,
-        OP_T, POINTER_MODE_DEVICE, R_32F, WORKSPACE_BYTES, layout, set,
-    };
-    use crate::cuda::kernels::CudaRuntime;
-
-    // `cudaDataType` FP16 and BF16 outputs, from `library_types.h`
-    const R_16F: u32 = 2;
-    const R_16BF: u32 = 14;
-
     /// Loads the raw entry points, which needs the library but no GPU
     #[test]
     #[ignore = "needs libcublasLt; `just gpu-parity` runs it"]
     fn gpu_raw_entry_points_load() {
         super::raw().expect("cuBLASLt entry points");
-    }
-
-    /// Prints how many algorithms the heuristic offers each format for each output
-    /// type, alpha pointer mode and scale-pointer setting, which tells a format this
-    /// GPU lacks from a descriptor cuBLASLt rejects
-    #[test]
-    #[ignore = "needs a CUDA GPU; prints cuBLASLt support for the quantized formats"]
-    fn gpu_lt_heuristic_probe() {
-        let runtime = CudaRuntime::open(0, Options::default()).expect("CUDA runtime");
-        runtime.prepare(Library::Cublas).expect("cuBLAS");
-        let gemm = LtGemm::new(&runtime).expect("cuBLASLt");
-        let (scales, _sync) = gemm.workspace.device_ptr(runtime.stream());
-        let formats = [
-            LtFormat::Fp8,
-            LtFormat::Fp8OuterVector,
-            LtFormat::Mxfp8,
-            LtFormat::Nvfp4,
-        ];
-        for format in formats {
-            println!("{format:?}: supports {}", gemm.supports(&runtime, format));
-            for (out_name, out_type) in [("f32", R_32F), ("f16", R_16F), ("bf16", R_16BF)] {
-                for device_alpha in [false, true] {
-                    for with_scales in [false, true] {
-                        for (rows, out, inputs) in
-                            [(128, 1024, 1024), (1, 1024, 1024), (301, 4096, 1024)]
-                        {
-                            let found = probe(
-                                &gemm,
-                                format,
-                                out_type,
-                                device_alpha,
-                                with_scales.then_some(scales),
-                                (rows, out, inputs),
-                            );
-                            println!(
-                                "{format:?} out {out_name} device alpha {device_alpha} scales \
-                                 {with_scales} {rows}x{out}x{inputs}: {found}"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// The heuristic's answer for one descriptor: an algorithm count or an error
-    fn probe(
-        gemm: &LtGemm,
-        format: LtFormat,
-        out_type: u32,
-        device_alpha: bool,
-        scales: Option<u64>,
-        (rows, out, inputs): (usize, usize, usize),
-    ) -> String {
-        let desc = lt::create_matmul_desc(
-            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            sys::cudaDataType::CUDA_R_32F,
-        )
-        .expect("descriptor");
-        let w = layout(format.data_type(), inputs, out).expect("w layout");
-        let a = layout(format.data_type(), inputs, rows).expect("a layout");
-        let c = layout(out_type, out, rows).expect("c layout");
-        // SAFETY: the descriptor is live and each attribute takes the value's type
-        let attributes = unsafe {
-            set(desc, DESC_TRANSA, &OP_T)
-                .and_then(|()| set(desc, DESC_TRANSB, &OP_N))
-                .and_then(|()| set(desc, DESC_A_SCALE_MODE, &format.scale_mode()))
-                .and_then(|()| set(desc, DESC_B_SCALE_MODE, &format.scale_mode()))
-                .and_then(|()| match scales {
-                    Some(scales) => set(desc, DESC_A_SCALE_POINTER, &scales)
-                        .and_then(|()| set(desc, DESC_B_SCALE_POINTER, &scales)),
-                    None => Ok(()),
-                })
-                .and_then(|()| match device_alpha {
-                    true => set(desc, DESC_POINTER_MODE, &POINTER_MODE_DEVICE),
-                    false => Ok(()),
-                })
-        };
-        let answer = match attributes {
-            Err(error) => format!("attribute error {error}"),
-            Ok(()) => {
-                let pref = lt::create_matmul_pref().expect("preference");
-                let workspace_bytes = WORKSPACE_BYTES;
-                let mut results: [sys::cublasLtMatmulHeuristicResult_t; CANDIDATES] =
-                    // SAFETY: a plain C struct for which all-zero bits are valid
-                    unsafe { std::mem::zeroed() };
-                let mut found = 0;
-                // SAFETY: every descriptor is live, and `results` holds `CANDIDATES`
-                let status = unsafe {
-                    lt::set_matmul_pref_attribute(
-                        pref,
-                        sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                        (&raw const workspace_bytes).cast(),
-                        size_of::<usize>(),
-                    )
-                    .and_then(|()| {
-                        sys::cublasLtMatmulAlgoGetHeuristic(
-                            gemm.handle,
-                            desc,
-                            w,
-                            a,
-                            c,
-                            c,
-                            pref,
-                            CANDIDATES as i32,
-                            results.as_mut_ptr(),
-                            &raw mut found,
-                        )
-                        .result()
-                    })
-                };
-                // SAFETY: the preference is unused past this point
-                let _ = unsafe { lt::destroy_matmul_pref(pref) };
-                match status {
-                    Ok(()) => format!("{found} algorithms"),
-                    Err(error) => format!("{error:?}"),
-                }
-            }
-        };
-        // SAFETY: the descriptors are unused past this point
-        unsafe {
-            let _ = lt::destroy_matrix_layout(w);
-            let _ = lt::destroy_matrix_layout(a);
-            let _ = lt::destroy_matrix_layout(c);
-            let _ = lt::destroy_matmul_desc(desc);
-        }
-        answer
     }
 }

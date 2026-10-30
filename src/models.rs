@@ -65,37 +65,46 @@ pub enum Precision {
     Tf32,
     /// Full FP32 multiplies, matching NeMo's FP32 decode token for token
     Fp32,
-    /// FP8 E4M3 weights with a scale per output channel and FP8 activations with one
-    /// dynamic scale per product, through cuBLASLt with FP32 accumulation, on Ada
-    /// (sm_89) and newer; the weights take a quarter of FP32's memory. Loading fails
-    /// on a GPU or cuBLAS without FP8 products
+    /// FP8 E4M3 weights with one scale per weight, and FP8 activations with one
+    /// dynamic scale per product, through cuBLASLt with FP32 accumulation and output.
+    /// Needs an Ada (sm_89) or newer GPU; loading fails on GPUs whose cuBLASLt runs
+    /// no FP8 products. Needs the `low-precision` feature
+    ///
+    /// On an RTX 5090 with Parakeet v3, WER stays within 0.03 points of
+    /// [`Precision::Fp16`] on every set measured: 1.94 % against 1.93 % on LibriSpeech
+    /// test-clean, 8.22 % against 8.24 % on Earnings-21, 4.56 % against 4.57 % on
+    /// FLEURS (de, es, fr, it, nl, pt) and 6.28 % against 6.25 % on MLS (es, fr, it,
+    /// pt). It runs about 7 % slower than FP16 one utterance at a time and 2 % faster
+    /// in batches of 16, and its weight file is 697 MB against FP16's 1300 MB
+    #[cfg(feature = "low-precision")]
     Fp8,
-    /// [`Precision::Fp8`] with one scale for each weight
-    Fp8PerTensor,
-    /// [`Precision::Fp8`] with one dynamic activation scale per encoder frame, which
-    /// cuBLASLt runs only on Hopper (sm_90); loading fails on other GPUs
-    Fp8PerToken,
-    /// MXFP8: E4M3 weights and activations in blocks of 32 with power-of-two scales,
-    /// through cuBLASLt's block-scaled products on Blackwell
-    Mxfp8,
-    /// NVFP4: E2M1 weights and activations in blocks of 16 with E4M3 scales and a
-    /// scale per tensor, through cuBLASLt's block-scaled products on Blackwell; the
-    /// weights take about an eighth of FP32's memory
+    /// INT8 weights with one scale per 128 inputs, dequantized to FP16 before each
+    /// [`Precision::Fp16`] product, so it runs on any GPU FP16 does. Needs the
+    /// `low-precision` feature
+    ///
+    /// On an RTX 5090 with Parakeet v3, WER stays within 0.04 points of FP16 on every
+    /// set measured: 1.93 % against 1.93 % on LibriSpeech test-clean, 8.26 % against
+    /// 8.24 % on Earnings-21, 4.57 % against 4.57 % on FLEURS and 6.28 % against
+    /// 6.25 % on MLS. Dequantizing costs about 25 % of FP16's speed one utterance at a
+    /// time and 7 % in batches of 16; its weight file is 715 MB
+    #[cfg(feature = "low-precision")]
+    Int8,
+    /// NVFP4: E2M1 weights and activations in blocks of 16 with E4M3 scales and one
+    /// scale per tensor, through cuBLASLt's block-scaled products. Needs a Blackwell
+    /// GPU (compute capability 10.0 or newer; measured only on sm_120); loading fails
+    /// on GPUs whose cuBLASLt runs no NVFP4 products. Needs the `low-precision` feature
+    ///
+    /// Faster in batches but lossy. On an RTX 5090 with Parakeet v3 it runs 16 %
+    /// faster than [`Precision::Fp16`] in batches of 16 and 26 % faster on long-form
+    /// Earnings-21 calls, but 22 % slower one utterance at a time, and WER rises by
+    /// about 0.08 points on LibriSpeech test-clean (2.01 % against 1.93 %), 0.25 on
+    /// FLEURS (4.82 % against 4.57 %) and 0.4 on MLS (6.64 % against 6.25 %). Its
+    /// weight file is 432 MB
+    #[cfg(feature = "low-precision")]
     Nvfp4,
-    /// INT8 weights with a scale per output channel, dequantized to FP16 before each
-    /// [`Precision::Fp16`] product: a quarter of FP32's weight memory on any GPU
-    Int8Weights,
-    /// [`Precision::Int8Weights`] with a scale per 128 inputs instead of per output
-    /// channel, which bounds the error an outlier weight spreads over its row
-    Int8Weights128,
-    /// INT4 weights with a scale per 128 inputs, dequantized to FP16 before each
-    /// [`Precision::Fp16`] product: about an eighth of FP32's weight memory
-    Int4Weights,
-    /// [`Precision::Int4Weights`] with a scale per 64 inputs
-    Int4Weights64,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "low-precision")]
 impl Precision {
     /// The `<name>` of the `model-<name>.safetensors` weight file
     /// [`write_native_weights`](crate::write_native_weights) writes for this precision,
@@ -106,14 +115,8 @@ impl Precision {
             Self::Tf32 | Self::Fp32 => None,
             Self::Fp16 => Some("fp16"),
             Self::Fp8 => Some("fp8"),
-            Self::Fp8PerTensor => Some("fp8-tensor"),
-            Self::Fp8PerToken => Some("fp8-token"),
-            Self::Mxfp8 => Some("mxfp8"),
+            Self::Int8 => Some("int8"),
             Self::Nvfp4 => Some("nvfp4"),
-            Self::Int8Weights => Some("int8-weights"),
-            Self::Int8Weights128 => Some("int8-weights128"),
-            Self::Int4Weights => Some("int4-weights"),
-            Self::Int4Weights64 => Some("int4-weights64"),
         }
     }
 }
@@ -145,7 +148,8 @@ impl NativeLayout {
     fn validate_base(&self) -> Result<(), TranscriptionError> {
         // a sibling deployment's weights are caught when the weight file's config is
         // checked against the deployment
-        // a bundle holding only the precision's own weight file needs no FP32 file
+        // with `low-precision`, a bundle holding only the precision's own weight file
+        // needs no FP32 file
         let missing = [self.weights_path(), self.vocab_path.clone()]
             .into_iter()
             .find(|path| !path.exists());
@@ -155,18 +159,25 @@ impl NativeLayout {
         }
     }
 
-    /// The precision's own weight file beside `model.safetensors` when it is present
-    /// (see [`Precision::weights_name`]), otherwise the FP32 file
+    /// The FP32 weight file, or with `low-precision` the precision's own weight file
+    /// beside it when that is present (see `Precision::weights_name`)
     pub(crate) fn weights_path(&self) -> PathBuf {
-        let own = self.precision.weights_name().and_then(|name| {
-            let stem = self.weights_path.file_stem()?.to_str()?;
-            Some(
-                self.weights_path
-                    .with_file_name(format!("{stem}-{name}.safetensors")),
-            )
-        });
-        own.filter(|path| path.exists())
-            .unwrap_or_else(|| self.weights_path.clone())
+        #[cfg(feature = "low-precision")]
+        if let Some(own) = self.own_weights_path() {
+            return own;
+        }
+        self.weights_path.clone()
+    }
+
+    /// `model-<name>.safetensors` beside `model.safetensors`, if it exists
+    #[cfg(feature = "low-precision")]
+    fn own_weights_path(&self) -> Option<PathBuf> {
+        let name = self.precision.weights_name()?;
+        let stem = self.weights_path.file_stem()?.to_str()?;
+        let own = self
+            .weights_path
+            .with_file_name(format!("{stem}-{name}.safetensors"));
+        own.exists().then_some(own)
     }
 
     #[cfg(feature = "vad")]
@@ -335,10 +346,13 @@ impl ModelBundle {
     ///
     /// [`Precision::Tf32`] keeps the weights and operands in FP32, out of FP16's
     /// overflow range, and [`Precision::Fp32`] gives up the tensor-core speedup for
-    /// output that matches NeMo's FP32 decode exactly. The quantized precisions trade
-    /// accuracy for smaller weights and faster products. A native bundle reads the
-    /// precision's own weight file when it is present (see [`Precision::weights_name`]).
-    /// Core ML bundles ignore it
+    /// output that matches NeMo's FP32 decode exactly. Core ML bundles ignore it
+    #[cfg_attr(
+        feature = "low-precision",
+        doc = "",
+        doc = "A native bundle reads the precision's own weight file when it is present \
+               (see [`Precision::weights_name`])"
+    )]
     #[cfg(feature = "cuda")]
     pub fn with_precision(mut self, precision: Precision) -> Self {
         if let RuntimeBundle::Native(layout) = &mut self.runtime {

@@ -11,24 +11,20 @@
 //! GEMMs read half the bytes and run at the FP16 tensor-core rate. The residual
 //! stream, the GEMM outputs and their accumulation stay FP32
 //!
-//! [`EncoderMath::Quantized`] keeps the FP16 activations and quantizes the same
-//! linear layers further (see [`Scheme`]): FP8 and block-scaled formats quantize the
-//! activation on the GPU before a cuBLASLt product, and weight-only formats
-//! dequantize the weight to FP16 before the FP16 product
+//! With the `low-precision` feature, `EncoderMath::Quantized` keeps the FP16
+//! activations and quantizes the same linear layers further (see the `quantized`
+//! module)
 
-use std::sync::Mutex;
+#[cfg(feature = "low-precision")]
+mod quantized;
 
-use cudakit::cudarc::driver::{CudaSlice, CudaView, CudaViewMut, DevicePtr, DevicePtrMut};
+use cudakit::cudarc::driver::{CudaSlice, CudaView, DevicePtrMut};
 use cudakit::{DeviceTensor, Math, Sgemm, SgemmBatched};
 
 use crate::cuda::fp16::linear_fp16;
 use crate::cuda::kernels::{CudaRuntime, EncoderKernels, FeatureMap, GemmOperand, Heads};
-use crate::cuda::lt::{Alpha, LtFormat, LtGemm, LtProduct};
-use crate::cuda::quant::{
-    AMAX_PARTIALS, MX_BLOCK, NV_BLOCK, QuantKernels, QuantizedWeight, ScaleLayout, Scheme,
-    f16_value,
-};
-use crate::cuda::stored::{StoredLinear, file_scheme, linear_shape, read_linear};
+#[cfg(feature = "low-precision")]
+use crate::cuda::quant::Scheme;
 use crate::cuda::{Direction, HostStaging, linear, upload, upload_host, zeros};
 use crate::error::TranscriptionError;
 use crate::native::spec::EncoderSpec;
@@ -53,9 +49,10 @@ pub(crate) enum EncoderMath {
     /// keep FP32 operands in TF32: they are a few percent of the work, and their
     /// operands would need conversions of their own
     Fp16,
-    /// [`Self::Fp16`] with the linear layers quantized further, except those the
-    /// quantization keeps at FP16
-    Quantized(Quantization),
+    /// [`Self::Fp16`] with the linear layers' weights, and for every scheme but INT8
+    /// their activations, quantized in the scheme
+    #[cfg(feature = "low-precision")]
+    Quantized(Scheme),
 }
 
 impl EncoderMath {
@@ -63,7 +60,9 @@ impl EncoderMath {
     fn single(self) -> Math {
         match self {
             Self::Single(math) => math,
-            Self::Fp16 | Self::Quantized(_) => Math::Tf32,
+            Self::Fp16 => Math::Tf32,
+            #[cfg(feature = "low-precision")]
+            Self::Quantized(_) => Math::Tf32,
         }
     }
 
@@ -73,149 +72,13 @@ impl EncoderMath {
     }
 }
 
-/// A [`Scheme`] for the Conformer layers' linear layers, and the layers it leaves at
-/// FP16
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Quantization {
-    pub(crate) scheme: Scheme,
-    pub(crate) keep: KeepFp16,
-}
-
-impl Quantization {
-    /// Every linear layer quantized with `scheme`
-    pub(crate) fn all(scheme: Scheme) -> Self {
-        Self {
-            scheme,
-            keep: KeepFp16::NONE,
-        }
-    }
-}
-
-/// Linear layers left at FP16 under [`EncoderMath::Quantized`]: every linear layer of
-/// the layers in `layers` (bit `i` for layer `i`), and the layers of the kinds in
-/// `kinds` (bit [`LinearKind`] `as u8`) in every layer
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) struct KeepFp16 {
-    pub(crate) layers: u64,
-    pub(crate) kinds: u8,
-}
-
-impl KeepFp16 {
-    pub(crate) const NONE: Self = Self {
-        layers: 0,
-        kinds: 0,
-    };
-
-    /// The layers the experimental `SCRIPTRS_CUDA_KEEP_FP16` variable names, for
-    /// measuring mixed recipes against weights quantized at load: comma-separated
-    /// layer indices, `first-last` ranges and kinds (`ff-up`, `ff-down`, `qkv`, `pos`,
-    /// `out`, `pw1`, `pw2`), as in `12-18,ff-up`
-    pub(crate) fn from_env() -> Result<Self, TranscriptionError> {
-        let Ok(value) = std::env::var("SCRIPTRS_CUDA_KEEP_FP16") else {
-            return Ok(Self::NONE);
-        };
-        let invalid = |token: &str| {
-            TranscriptionError::InvalidConfiguration(format!(
-                "SCRIPTRS_CUDA_KEEP_FP16 names no layer or kind `{token}`"
-            ))
-        };
-        let layer = |token: &str| match token.parse::<u32>() {
-            Ok(layer) if layer < 64 => Ok(layer),
-            _ => Err(invalid(token)),
-        };
-        let mut keep = Self::NONE;
-        for token in value
-            .split(',')
-            .map(str::trim)
-            .filter(|token| !token.is_empty())
-        {
-            let kind = match token {
-                "ff-up" => Some(LinearKind::FeedForwardUp),
-                "ff-down" => Some(LinearKind::FeedForwardDown),
-                "qkv" => Some(LinearKind::Qkv),
-                "pos" => Some(LinearKind::Position),
-                "out" => Some(LinearKind::AttentionOut),
-                "pw1" => Some(LinearKind::Pointwise1),
-                "pw2" => Some(LinearKind::Pointwise2),
-                _ => None,
-            };
-            if let Some(kind) = kind {
-                keep.kinds |= 1 << kind as u8;
-                continue;
-            }
-
-            let (first, last) = match token.split_once('-') {
-                Some((first, last)) => (layer(first)?, layer(last)?),
-                None => (layer(token)?, layer(token)?),
-            };
-            for layer in first..=last {
-                keep.layers |= 1 << layer;
-            }
-        }
-        Ok(keep)
-    }
-
-    fn keeps(self, layer: usize, kind: LinearKind) -> bool {
-        (layer < 64 && self.layers >> layer & 1 == 1) || self.kinds >> kind as u8 & 1 == 1
-    }
-}
-
-/// The linear layers of a Conformer layer
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LinearKind {
-    /// `linear1` of both feed-forward modules
-    FeedForwardUp,
-    /// `linear2` of both feed-forward modules
-    FeedForwardDown,
-    Qkv,
-    Position,
-    AttentionOut,
-    Pointwise1,
-    Pointwise2,
-}
-
 /// A linear layer's `[out, in]` weight, in the precision its GEMM reads
 enum Linear {
     Single(DeviceTensor),
     /// FP16 bits
     Fp16(CudaSlice<u16>),
-    /// Read with FP16 activations, which the product quantizes to match
-    Quantized(QuantLinear),
-}
-
-/// A quantized `[out, inputs]` weight on the device
-struct QuantLinear {
-    scheme: Scheme,
-    out: usize,
-    inputs: usize,
-    values: CudaSlice<u8>,
-    weight: DeviceScales,
-}
-
-/// The scales of a [`QuantLinear`], as its [`QuantizedWeight`] holds them
-enum DeviceScales {
-    /// FP8, INT8 and INT4 scales
-    Float(CudaSlice<f32>),
-    /// MXFP8 block scales
-    Blocks(CudaSlice<u8>),
-    /// NVFP4 block scales and the tensor scale
-    Nvfp4 { blocks: CudaSlice<u8>, global: f32 },
-}
-
-/// What [`EncoderMath::Quantized`] adds to the encoder
-struct QuantState {
-    quantization: Quantization,
-    kernels: QuantKernels,
-    /// cuBLASLt products, for every scheme but the weight-only ones
-    lt: Option<LtGemm>,
-    /// Without cuBLASLt's outer-vector scales, [`Scheme::Fp8Channel`] multiplies with
-    /// a weight scale of 1 into [`QuantInputs::product`] and applies the channel scales
-    /// after
-    scale_after: bool,
-    /// `[1.0]`, the weight scale of those products
-    one: CudaSlice<f32>,
-    /// The dequantized FP16 weight of a weight-only product, sized for the largest
-    dequant: Option<Mutex<CudaSlice<u16>>>,
+    #[cfg(feature = "low-precision")]
+    Quantized(quantized::QuantLinear),
 }
 
 /// The activation a linear layer reads, matching its [`Linear`] weight
@@ -280,7 +143,8 @@ pub(crate) struct CudaEncoder {
     subsampling: Subsampling,
     layers: Vec<Layer>,
     kernels: EncoderKernels,
-    quant: Option<QuantState>,
+    #[cfg(feature = "low-precision")]
+    quant: Option<quantized::QuantState>,
 }
 
 /// Device buffers for one `(batch, mel frames)` input shape
@@ -316,28 +180,26 @@ pub(crate) struct EncoderWorkspace {
     bd: CudaSlice<f32>,
     context: CudaSlice<f32>,
     merged: CudaSlice<f32>,
-    /// FP16 GEMM inputs under [`EncoderMath::Fp16`] and [`EncoderMath::Quantized`]
+    /// FP16 GEMM inputs under [`EncoderMath::Fp16`]
     fp16: Option<Fp16Inputs>,
-    /// Quantized GEMM inputs under [`EncoderMath::Quantized`] for the schemes that
-    /// quantize activations
-    quant: Option<QuantInputs>,
+    quant: QuantScratch,
 }
 
-/// One quantized activation at a time: each product quantizes its input here just
-/// before it runs, on the same stream
-struct QuantInputs {
-    /// E4M3 bits, or E2M1 pairs
-    values: CudaSlice<u8>,
-    /// FP32 activation scales: one, or one per row
-    scales: CudaSlice<f32>,
-    /// Tiled block scales
-    blocks: CudaSlice<u8>,
-    /// [`AMAX_PARTIALS`] partial maxima of the activation
-    partials: CudaSlice<f32>,
-    /// The device alpha of an NVFP4 product
-    alpha: CudaSlice<f32>,
-    /// The unscaled output of an FP8 product whose channel scales apply after
-    product: Option<CudaSlice<f32>>,
+/// The buffers the quantized linear layers quantize their activations into, empty
+/// without the `low-precision` feature
+struct QuantScratch {
+    #[cfg(feature = "low-precision")]
+    inputs: Option<quantized::QuantInputs>,
+}
+
+impl QuantScratch {
+    fn bytes(&self) -> usize {
+        #[cfg(feature = "low-precision")]
+        if let Some(inputs) = &self.inputs {
+            return inputs.bytes();
+        }
+        0
+    }
 }
 
 /// FP16 copies of the activations the FP16 linear layers read
@@ -402,16 +264,8 @@ impl EncoderWorkspace {
                 .map(|buffer| buffer.num_bytes())
                 .sum()
         });
-        let quant = self.quant.as_ref().map_or(0, |quant| {
-            quant.values.num_bytes()
-                + quant.scales.num_bytes()
-                + quant.blocks.num_bytes()
-                + quant.partials.num_bytes()
-                + quant.alpha.num_bytes()
-                + quant.product.as_ref().map_or(0, CudaSlice::num_bytes)
-        });
         lens + fp16
-            + quant
+            + self.quant.bytes()
             + buffers
                 .iter()
                 .map(|buffer| buffer.num_bytes())
@@ -456,24 +310,8 @@ impl CudaEncoder {
             out: pair("out", &[d, flat])?,
         };
 
-        let wanted = match math {
-            EncoderMath::Quantized(quantization) => Some(quantization.scheme),
-            _ => None,
-        };
-        if let Some(stored) = file_scheme(file)?
-            && wanted != Some(stored)
-        {
-            return Err(TranscriptionError::InvalidConfiguration(format!(
-                "the weights are quantized as `{}`, which only the matching precision loads",
-                stored.name()
-            )));
-        }
-        let quant = match math {
-            EncoderMath::Quantized(quantization) => {
-                Some(QuantState::load(runtime, quantization, spec)?)
-            }
-            _ => None,
-        };
+        #[cfg(feature = "low-precision")]
+        let quant = quantized::QuantState::load(runtime, file, spec, math)?;
         let mut layers = Vec::with_capacity(spec.layers);
         for index in 0..spec.layers {
             layers.push(Self::load_layer(
@@ -487,6 +325,7 @@ impl CudaEncoder {
             subsampling,
             layers,
             kernels,
+            #[cfg(feature = "low-precision")]
             quant,
         })
     }
@@ -504,16 +343,15 @@ impl CudaEncoder {
         let tensor = |name: &str, shape: &[usize]| file.tensor(&format!("{prefix}.{name}"), shape);
         let load =
             |name: &str, shape: &[usize]| upload(runtime, file, &format!("{prefix}.{name}"), shape);
-        let linear = |name: &str, kind: LinearKind| {
-            let math = match math {
-                EncoderMath::Quantized(quantization) if quantization.keep.keeps(index, kind) => {
-                    EncoderMath::Fp16
-                }
-                math => math,
-            };
-            let (out, inputs) = linear_shape(spec, kind);
-            let stored = read_linear(file, index, name, out, inputs)?;
-            Linear::from_stored(runtime, kernels, stored, out, inputs, math)
+        #[cfg(not(feature = "low-precision"))]
+        let to_linear = |weight: DeviceTensor| Linear::new(runtime, kernels, weight, math);
+        #[cfg(not(feature = "low-precision"))]
+        let load_linear = |name: &str, shape: &[usize]| to_linear(load(name, shape)?);
+        // the linear weights may be stored FP16 or quantized
+        #[cfg(feature = "low-precision")]
+        let load_linear = |name: &str, shape: &[usize]| {
+            let name = format!("{prefix}.{name}");
+            quantized::load_linear(runtime, kernels, file, &name, shape, math)
         };
         let norm = |name: &str| -> Result<Norm, TranscriptionError> {
             Ok(Norm {
@@ -523,16 +361,26 @@ impl CudaEncoder {
         };
         let feed_forward = |name: &str| -> Result<FeedForward, TranscriptionError> {
             Ok(FeedForward {
-                linear1: linear(&format!("{name}.linear1"), LinearKind::FeedForwardUp)?,
-                linear2: linear(&format!("{name}.linear2"), LinearKind::FeedForwardDown)?,
+                linear1: load_linear(&format!("{name}.linear1.weight"), &[spec.ff_hidden, d])?,
+                linear2: load_linear(&format!("{name}.linear2.weight"), &[d, spec.ff_hidden])?,
             })
         };
 
+        #[cfg(not(feature = "low-precision"))]
+        let mut qkv = Vec::with_capacity(3 * d * d);
+        #[cfg(not(feature = "low-precision"))]
+        for name in ["linear_q", "linear_k", "linear_v"] {
+            qkv.extend_from_slice(tensor(&format!("self_attn.{name}.weight"), &[d, d])?);
+        }
         let head_dim = d / spec.heads;
         let attention = Attention {
-            qkv: linear("self_attn.linear_qkv", LinearKind::Qkv)?,
-            pos: linear("self_attn.linear_pos", LinearKind::Position)?,
-            out: linear("self_attn.linear_out", LinearKind::AttentionOut)?,
+            #[cfg(not(feature = "low-precision"))]
+            qkv: to_linear(DeviceTensor::upload(runtime.stream(), &qkv, &[3 * d, d])?)?,
+            // the reader stacks the three weights of a file that keeps them apart
+            #[cfg(feature = "low-precision")]
+            qkv: load_linear("self_attn.linear_qkv.weight", &[3 * d, d])?,
+            pos: load_linear("self_attn.linear_pos.weight", &[d, d])?,
+            out: load_linear("self_attn.linear_out.weight", &[d, d])?,
             bias_u: load("self_attn.pos_bias_u", &[spec.heads, head_dim])?,
             bias_v: load("self_attn.pos_bias_v", &[spec.heads, head_dim])?,
         };
@@ -553,11 +401,11 @@ impl CudaEncoder {
             shift.push((f64::from(beta[c]) - f64::from(mean[c]) * s) as f32);
         }
         let conv = ConvModule {
-            pointwise1: linear("conv.pointwise_conv1", LinearKind::Pointwise1)?,
+            pointwise1: load_linear("conv.pointwise_conv1.weight", &[2 * d, d, 1])?,
             depthwise: load("conv.depthwise_conv.weight", &[d, 1, spec.conv_kernel])?,
             scale: upload_host(runtime, &scale)?,
             shift: upload_host(runtime, &shift)?,
-            pointwise2: linear("conv.pointwise_conv2", LinearKind::Pointwise2)?,
+            pointwise2: load_linear("conv.pointwise_conv2.weight", &[d, d, 1])?,
         };
 
         Ok(Layer {
@@ -592,7 +440,8 @@ impl CudaEncoder {
         let pos_emb = stream.clone_htod(&relative_positions(frames, d))?;
         let fp16 = match self.math {
             EncoderMath::Single(_) => None,
-            EncoderMath::Fp16 | EncoderMath::Quantized(_) => {
+            // the quantized maths also read FP16 activations
+            _ => {
                 let mut table = zeros(stream, pos_emb.len())?;
                 self.kernels
                     .to_f16(stream, &pos_emb.slice(..), &mut table.slice_mut(..))?;
@@ -640,9 +489,12 @@ impl CudaEncoder {
             context: zeros(stream, rows * d)?,
             merged: zeros(stream, rows * d)?,
             fp16,
-            quant: match &self.quant {
-                Some(quant) => quant.inputs(runtime, spec, rows, positions)?,
-                None => None,
+            quant: QuantScratch {
+                #[cfg(feature = "low-precision")]
+                inputs: match &self.quant {
+                    Some(quant) => quant.inputs(runtime, spec, rows, positions)?,
+                    None => None,
+                },
             },
         })
     }
@@ -941,26 +793,28 @@ impl CudaEncoder {
     }
 
     /// Runs `spec`, a [`linear`] product, on `a` and `weight` in their shared precision;
-    /// a quantized weight quantizes `a` into `quant` first
-    fn linear(
+    /// a quantized product quantizes `a` into `quant` first
+    fn linear<C: DevicePtrMut<f32>>(
         &self,
         runtime: &CudaRuntime,
         spec: Sgemm,
         a: Operand<'_>,
         weight: &Linear,
-        c: &mut CudaViewMut<'_, f32>,
-        quant: Option<&mut QuantInputs>,
+        c: &mut C,
+        #[cfg_attr(not(feature = "low-precision"), allow(unused_variables))]
+        quant: &mut QuantScratch,
     ) -> Result<(), TranscriptionError> {
-        match (a, weight) {
-            (Operand::Single(a), Linear::Single(w)) => {
+        match (a, weight, self.math) {
+            (Operand::Single(a), Linear::Single(w), EncoderMath::Single(_)) => {
                 runtime.sgemm(spec, &a, w.data(), c)?;
             }
-            (Operand::Fp16(a), Linear::Fp16(w)) => {
+            (Operand::Fp16(a), Linear::Fp16(w), EncoderMath::Fp16) => {
                 linear_fp16(runtime, spec, &a, w, c)?;
             }
-            (Operand::Fp16(a), Linear::Quantized(w)) => {
+            #[cfg(feature = "low-precision")]
+            (Operand::Fp16(a), Linear::Quantized(w), EncoderMath::Quantized(_)) => {
                 let state = self.quant.as_ref().ok_or_else(mixed_precision)?;
-                state.linear(runtime, spec, &a, w, c, quant)?;
+                state.linear(runtime, spec, &a, w, c, quant.inputs.as_mut())?;
             }
             _ => return Err(mixed_precision()),
         }
@@ -988,7 +842,7 @@ impl CudaEncoder {
             normed,
             &weights.linear1,
             &mut ws.hidden.slice_mut(..rows * hidden),
-            ws.quant.as_mut(),
+            &mut ws.quant,
         )?;
         let stream = runtime.stream();
         match ws.fp16.as_mut() {
@@ -1011,8 +865,8 @@ impl CudaEncoder {
             linear(rows, d, hidden, 0.5, 1.0, math),
             activated,
             &weights.linear2,
-            &mut ws.x.slice_mut(..),
-            ws.quant.as_mut(),
+            &mut ws.x,
+            &mut ws.quant,
         )?;
         Ok(())
     }
@@ -1048,8 +902,8 @@ impl CudaEncoder {
             linear(rows, 3 * d, d, 1.0, 0.0, math),
             normed,
             &weights.qkv,
-            &mut ws.qkv.slice_mut(..),
-            ws.quant.as_mut(),
+            &mut ws.qkv,
+            &mut ws.quant,
         )?;
         self.kernels.split_qkv(
             stream,
@@ -1071,8 +925,8 @@ impl CudaEncoder {
             linear(positions, d, d, 1.0, 0.0, math),
             table,
             &weights.pos,
-            &mut ws.pos.slice_mut(..),
-            ws.quant.as_mut(),
+            &mut ws.pos,
+            &mut ws.quant,
         )?;
         self.kernels.split_heads(
             stream,
@@ -1140,8 +994,8 @@ impl CudaEncoder {
             linear(rows, d, d, 1.0, 1.0, math),
             merged,
             &weights.out,
-            &mut ws.x.slice_mut(..),
-            ws.quant.as_mut(),
+            &mut ws.x,
+            &mut ws.quant,
         )?;
         Ok(())
     }
@@ -1168,7 +1022,7 @@ impl CudaEncoder {
             normed,
             &weights.pointwise1,
             &mut ws.hidden.slice_mut(..pw1_len),
-            ws.quant.as_mut(),
+            &mut ws.quant,
         )?;
         let glued = self.gemm_output(
             &mut ws.merged,
@@ -1196,417 +1050,29 @@ impl CudaEncoder {
             linear(rows, d, d, 1.0, 1.0, math),
             glued,
             &weights.pointwise2,
-            &mut ws.x.slice_mut(..),
-            ws.quant.as_mut(),
+            &mut ws.x,
+            &mut ws.quant,
         )?;
         Ok(())
     }
 }
 
 impl Linear {
-    /// Uploads the `[out, inputs]` weight `values` for an FP32 or TF32 GEMM, rounds it
-    /// to FP16 on the device for [`EncoderMath::Fp16`] and frees the FP32 copy, or
-    /// quantizes it on the host for [`EncoderMath::Quantized`]
+    /// Keeps `weight` for an FP32 or TF32 GEMM, or rounds it to FP16 on the device for
+    /// [`EncoderMath::Fp16`] and frees the FP32 copy
     fn new(
         runtime: &CudaRuntime,
         kernels: &EncoderKernels,
-        values: &[f32],
-        out: usize,
-        inputs: usize,
+        weight: DeviceTensor,
         math: EncoderMath,
     ) -> Result<Self, TranscriptionError> {
-        let stream = runtime.stream();
-        match math {
-            EncoderMath::Single(_) => Ok(Self::Single(DeviceTensor::upload(
-                stream,
-                values,
-                &[out, inputs],
-            )?)),
-            EncoderMath::Fp16 => {
-                let weight = DeviceTensor::upload(stream, values, &[out, inputs])?;
-                let mut bits = zeros(stream, values.len())?;
-                kernels.to_f16(stream, &weight.data().slice(..), &mut bits.slice_mut(..))?;
-                Ok(Self::Fp16(bits))
-            }
-            EncoderMath::Quantized(quantization) => {
-                let scheme = quantization.scheme;
-                QuantLinear::upload(
-                    runtime,
-                    scheme,
-                    &scheme.weight(values, out, inputs),
-                    out,
-                    inputs,
-                )
-                .map(Self::Quantized)
-            }
-        }
-    }
-
-    /// Uploads a linear weight as its file stores it for a GEMM at `math`: FP32 or FP16
-    /// weights go through [`Linear::new`], except that FP16 weights for an FP16 GEMM
-    /// upload as they are; a quantized weight uploads as it is, and
-    /// [`CudaEncoder::load`] has checked that `math` uses its scheme
-    fn from_stored(
-        runtime: &CudaRuntime,
-        kernels: &EncoderKernels,
-        stored: StoredLinear,
-        out: usize,
-        inputs: usize,
-        math: EncoderMath,
-    ) -> Result<Self, TranscriptionError> {
-        match (stored, math) {
-            (StoredLinear::F32(values), math) => {
-                Self::new(runtime, kernels, &values, out, inputs, math)
-            }
-            (StoredLinear::F16(bits), EncoderMath::Fp16) => {
-                Ok(Self::Fp16(runtime.stream().clone_htod(bits.as_ref())?))
-            }
-            (StoredLinear::F16(bits), math) => {
-                let values: Vec<f32> = bits.iter().map(|bits| f16_value(*bits)).collect();
-                Self::new(runtime, kernels, &values, out, inputs, math)
-            }
-            (StoredLinear::Quantized(weight), EncoderMath::Quantized(quantization)) => {
-                QuantLinear::upload(runtime, quantization.scheme, &weight, out, inputs)
-                    .map(Self::Quantized)
-            }
-            (StoredLinear::Quantized(_), _) => Err(TranscriptionError::InvalidConfiguration(
-                "a quantized linear weight needs its own precision, without FP16 layers".to_owned(),
-            )),
-        }
-    }
-}
-
-impl QuantLinear {
-    fn upload(
-        runtime: &CudaRuntime,
-        scheme: Scheme,
-        weight: &QuantizedWeight,
-        out: usize,
-        inputs: usize,
-    ) -> Result<Self, TranscriptionError> {
-        let stream = runtime.stream();
-        let (values, weight) = match weight {
-            QuantizedWeight::Fp8 { values, scales }
-            | QuantizedWeight::Int8 { values, scales }
-            | QuantizedWeight::Int4 { values, scales, .. } => {
-                (values, DeviceScales::Float(stream.clone_htod(scales)?))
-            }
-            QuantizedWeight::Mxfp8 { values, scales } => {
-                (values, DeviceScales::Blocks(stream.clone_htod(scales)?))
-            }
-            QuantizedWeight::Nvfp4 {
-                values,
-                scales,
-                global,
-            } => (
-                values,
-                DeviceScales::Nvfp4 {
-                    blocks: stream.clone_htod(scales)?,
-                    global: *global,
-                },
-            ),
-        };
-        Ok(Self {
-            scheme,
-            out,
-            inputs,
-            values: stream.clone_htod(values)?,
-            weight,
-        })
-    }
-}
-
-impl QuantState {
-    fn load(
-        runtime: &CudaRuntime,
-        quantization: Quantization,
-        spec: EncoderSpec,
-    ) -> Result<Self, TranscriptionError> {
-        let scheme = quantization.scheme;
-        let stream = runtime.stream();
-        let kernels = QuantKernels::load(runtime)?;
-        let unsupported = |format: LtFormat| {
-            TranscriptionError::InvalidConfiguration(format!(
-                "{scheme:?} needs cuBLASLt {format:?} products, which this GPU or cuBLAS \
-                 does not run"
-            ))
-        };
-        let (lt, scale_after) = if scheme.weight_only() {
-            (None, false)
-        } else {
-            let lt = LtGemm::new(runtime)?;
-            let scale_after = match scheme {
-                Scheme::Fp8Tensor => lt.supports(runtime, LtFormat::Fp8).then_some(false),
-                Scheme::Fp8Channel if lt.supports(runtime, LtFormat::Fp8OuterVector) => Some(false),
-                Scheme::Fp8Channel => lt.supports(runtime, LtFormat::Fp8).then_some(true),
-                Scheme::Fp8Token => lt
-                    .supports(runtime, LtFormat::Fp8OuterVector)
-                    .then_some(false),
-                Scheme::Mxfp8 => lt.supports(runtime, LtFormat::Mxfp8).then_some(false),
-                Scheme::Nvfp4 => lt.supports(runtime, LtFormat::Nvfp4).then_some(false),
-                Scheme::Int8Weights { .. } | Scheme::Int4Weights { .. } => Some(false),
-            }
-            .ok_or_else(|| unsupported(Self::format(scheme, false)))?;
-            (Some(lt), scale_after)
-        };
-        let largest = (spec.ff_hidden * spec.d_model).max(3 * spec.d_model * spec.d_model);
-        let dequant = match scheme.weight_only() {
-            true => Some(Mutex::new(zeros(stream, largest)?)),
-            false => None,
-        };
-        Ok(Self {
-            quantization,
-            kernels,
-            lt,
-            scale_after,
-            one: stream.clone_htod(&[1.0f32])?,
-            dequant,
-        })
-    }
-
-    /// The cuBLASLt format of a scheme's products
-    fn format(scheme: Scheme, scale_after: bool) -> LtFormat {
-        match scheme {
-            Scheme::Fp8Channel if scale_after => LtFormat::Fp8,
-            Scheme::Fp8Tensor => LtFormat::Fp8,
-            Scheme::Fp8Channel | Scheme::Fp8Token => LtFormat::Fp8OuterVector,
-            Scheme::Mxfp8 => LtFormat::Mxfp8,
-            Scheme::Nvfp4 | Scheme::Int8Weights { .. } | Scheme::Int4Weights { .. } => {
-                LtFormat::Nvfp4
-            }
-        }
-    }
-
-    /// The quantized-activation buffers for a workspace of `rows` encoder rows and a
-    /// position table of `positions` rows, or none for a weight-only scheme
-    fn inputs(
-        &self,
-        runtime: &CudaRuntime,
-        spec: EncoderSpec,
-        rows: usize,
-        positions: usize,
-    ) -> Result<Option<QuantInputs>, TranscriptionError> {
-        let scheme = self.quantization.scheme;
-        if scheme.weight_only() {
-            return Ok(None);
+        if !math.fp16() {
+            return Ok(Self::Single(weight));
         }
         let stream = runtime.stream();
-        let (d, hidden) = (spec.d_model, spec.ff_hidden);
-        // every product's activation: the normed or merged rows, the SiLU output and
-        // the relative position table
-        let operands = [(rows, d), (rows, hidden), (positions, d)];
-        let block = match scheme {
-            Scheme::Mxfp8 => MX_BLOCK,
-            _ => NV_BLOCK,
-        };
-        let largest = |size: &dyn Fn(usize, usize) -> usize| {
-            operands
-                .iter()
-                .map(|&(rows, width)| size(rows, width))
-                .max()
-                .unwrap_or(0)
-        };
-        let blocks = match scheme {
-            Scheme::Mxfp8 | Scheme::Nvfp4 => {
-                largest(&|rows, width| ScaleLayout::new(rows, width, block).bytes())
-            }
-            _ => 1,
-        };
-        let product = match self.scale_after {
-            true => Some(zeros(
-                stream,
-                (rows * hidden.max(3 * d)).max(positions * d),
-            )?),
-            false => None,
-        };
-        Ok(Some(QuantInputs {
-            values: zeros(stream, largest(&|rows, width| rows * width))?,
-            scales: zeros(stream, rows.max(positions))?,
-            blocks: zeros(stream, blocks)?,
-            partials: zeros(stream, AMAX_PARTIALS)?,
-            alpha: zeros(stream, 1)?,
-            product,
-        }))
-    }
-
-    /// Runs `spec` on the FP16 activation `a` and the quantized weight `w`
-    fn linear(
-        &self,
-        runtime: &CudaRuntime,
-        spec: Sgemm,
-        a: &CudaView<'_, u16>,
-        w: &QuantLinear,
-        c: &mut CudaViewMut<'_, f32>,
-        quant: Option<&mut QuantInputs>,
-    ) -> Result<(), TranscriptionError> {
-        if (spec.n, spec.k) != (w.out, w.inputs) {
-            return Err(TranscriptionError::InvalidModelOutput(format!(
-                "a {} x {} product reads a {} x {} weight",
-                spec.n, spec.k, w.out, w.inputs
-            )));
-        }
-        let stream = runtime.stream();
-        if let Some(dequant) = &self.dequant {
-            let mut weight = dequant.lock().map_err(|_| {
-                TranscriptionError::InvalidModelOutput(
-                    "the dequantize lock was poisoned".to_owned(),
-                )
-            })?;
-            let mut weight = weight.slice_mut(..w.out * w.inputs);
-            let DeviceScales::Float(scales) = &w.weight else {
-                return Err(mixed_precision());
-            };
-            match w.scheme {
-                Scheme::Int4Weights { group } => self.kernels.dequant_i4(
-                    stream,
-                    &w.values.slice(..),
-                    &scales.slice(..),
-                    &mut weight,
-                    group,
-                )?,
-                _ => self.kernels.dequant_i8(
-                    stream,
-                    &w.values.slice(..),
-                    &scales.slice(..),
-                    &mut weight,
-                    w.out * w.inputs / scales.len(),
-                )?,
-            }
-            linear_fp16(runtime, spec, a, &weight, c)?;
-            return Ok(());
-        }
-
-        let (Some(lt), Some(quant)) = (&self.lt, quant) else {
-            return Err(mixed_precision());
-        };
-        let (rows, width) = (spec.m, spec.k);
-        let n = rows * width;
-        let kernels = &self.kernels;
-        let mut values = quant.values.slice_mut(..n);
-        let mut alpha = Alpha::Host(spec.alpha);
-        let mut beta = spec.beta;
-        // the activation scale a product reads: one, or one per row
-        let mut a_scales = 1;
-        match w.scheme {
-            Scheme::Fp8Tensor | Scheme::Fp8Channel => {
-                kernels.amax(stream, a, &mut quant.partials.slice_mut(..))?;
-                if w.scheme == Scheme::Fp8Channel && !self.scale_after {
-                    a_scales = rows;
-                }
-                kernels.fp8(
-                    stream,
-                    a,
-                    &quant.partials.slice(..),
-                    &mut values,
-                    &mut quant.scales.slice_mut(..a_scales),
-                )?;
-            }
-            Scheme::Fp8Token => {
-                a_scales = rows;
-                kernels.fp8_rows(
-                    stream,
-                    a,
-                    &mut values,
-                    &mut quant.scales.slice_mut(..rows),
-                    width,
-                )?;
-            }
-            Scheme::Mxfp8 => {
-                let layout = ScaleLayout::new(rows, width, MX_BLOCK);
-                kernels.mxfp8(
-                    stream,
-                    a,
-                    &mut values,
-                    &mut quant.blocks.slice_mut(..layout.bytes()),
-                    width,
-                )?;
-            }
-            Scheme::Nvfp4 => {
-                let DeviceScales::Nvfp4 { global, .. } = &w.weight else {
-                    return Err(mixed_precision());
-                };
-                let layout = ScaleLayout::new(rows, width, NV_BLOCK);
-                kernels.amax(stream, a, &mut quant.partials.slice_mut(..))?;
-                kernels.nvfp4(
-                    stream,
-                    a,
-                    &quant.partials.slice(..),
-                    &mut values.slice_mut(..n / 2),
-                    &mut quant.blocks.slice_mut(..layout.bytes()),
-                    &mut quant.alpha.slice_mut(..),
-                    width,
-                    spec.alpha * global,
-                )?;
-                let (alpha_ptr, _alpha_sync) = quant.alpha.device_ptr(stream);
-                alpha = Alpha::Device(alpha_ptr);
-            }
-            Scheme::Int8Weights { .. } | Scheme::Int4Weights { .. } => {
-                return Err(mixed_precision());
-            }
-        }
-
-        let format = Self::format(w.scheme, self.scale_after);
-        let (w_ptr, _w_sync) = w.values.device_ptr(stream);
-        let (w_scale, _w_scale_sync) = match (&w.weight, self.scale_after) {
-            (DeviceScales::Float(_), true) => self.one.device_ptr(stream),
-            (DeviceScales::Float(scales), false) => scales.device_ptr(stream),
-            (DeviceScales::Blocks(blocks) | DeviceScales::Nvfp4 { blocks, .. }, _) => {
-                blocks.device_ptr(stream)
-            }
-        };
-        let (a_ptr, _a_sync) = quant.values.device_ptr(stream);
-        let (a_scale, _a_scale_sync) = match format {
-            LtFormat::Mxfp8 | LtFormat::Nvfp4 => quant.blocks.device_ptr(stream),
-            LtFormat::Fp8 | LtFormat::Fp8OuterVector => quant.scales.device_ptr(stream),
-        };
-        debug_assert!(a_scales <= quant.scales.len());
-        let scaled_after = self.scale_after && w.scheme == Scheme::Fp8Channel;
-        let (c_ptr, _c_sync) = match (scaled_after, quant.product.as_mut()) {
-            (true, Some(product)) => {
-                alpha = Alpha::Host(1.0);
-                beta = 0.0;
-                product.device_ptr_mut(stream)
-            }
-            (true, None) => return Err(mixed_precision()),
-            (false, _) => c.device_ptr_mut(stream),
-        };
-        // SAFETY: the operands were sized and written above for `rows x width`, the
-        // weight holds `out x inputs` in the scheme's format with matching scales, and
-        // `c` holds `rows x out`; all are ordered on the runtime's stream
-        unsafe {
-            lt.run(
-                runtime,
-                LtProduct {
-                    format,
-                    rows,
-                    out: w.out,
-                    inputs: w.inputs,
-                    w: w_ptr,
-                    w_scale,
-                    a: a_ptr,
-                    a_scale,
-                    c: c_ptr,
-                    alpha,
-                    beta,
-                },
-            )
-        }?;
-        drop(_c_sync);
-
-        if scaled_after {
-            let (Some(product), DeviceScales::Float(scales)) = (&quant.product, &w.weight) else {
-                return Err(mixed_precision());
-            };
-            kernels.scale_columns(
-                stream,
-                &product.slice(..rows * w.out),
-                &scales.slice(..),
-                c,
-                spec.alpha,
-                spec.beta,
-            )?;
-        }
-        Ok(())
+        let mut bits = zeros(stream, weight.data().len())?;
+        kernels.to_f16(stream, &weight.data().slice(..), &mut bits.slice_mut(..))?;
+        Ok(Self::Fp16(bits))
     }
 }
 
@@ -1643,468 +1109,11 @@ mod tests {
     use cudakit::{Library, Math, Options};
     use ndarray::{ArrayD, Axis, Ix3};
 
-    use super::{
-        CudaEncoder, DeviceScales, EncoderMath, KeepFp16, Linear, LinearKind, QuantLinear,
-        QuantState, Quantization, relative_positions,
-    };
+    use super::{CudaEncoder, EncoderMath, relative_positions};
     use crate::cuda::kernels::CudaRuntime;
-    use crate::cuda::linear;
-    use crate::cuda::quant::test_support::e4m3_value;
-    use crate::cuda::quant::{
-        QuantizedWeight, Scheme, f16_bits, f16_value, fp8_rows, fp8_tensor, mxfp8, nvfp4,
-    };
     use crate::cuda::test_support::weights;
     use crate::deployment::{ParakeetDeployment, ParakeetVersion};
     use crate::test_support::NemoReference;
-
-    impl LinearKind {
-        const ALL: [Self; 7] = [
-            Self::FeedForwardUp,
-            Self::FeedForwardDown,
-            Self::Qkv,
-            Self::Position,
-            Self::AttentionOut,
-            Self::Pointwise1,
-            Self::Pointwise2,
-        ];
-    }
-
-    impl CudaEncoder {
-        /// Device bytes of the Conformer layers' linear weights and their scales
-        fn linear_bytes(&self) -> usize {
-            self.layers
-                .iter()
-                .flat_map(|layer| {
-                    [
-                        &layer.ff1.linear1,
-                        &layer.ff1.linear2,
-                        &layer.attention.qkv,
-                        &layer.attention.pos,
-                        &layer.attention.out,
-                        &layer.conv.pointwise1,
-                        &layer.conv.pointwise2,
-                        &layer.ff2.linear1,
-                        &layer.ff2.linear2,
-                    ]
-                })
-                .map(Linear::bytes)
-                .sum()
-        }
-    }
-
-    impl Linear {
-        /// Device bytes of the weight and any scales
-        fn bytes(&self) -> usize {
-            match self {
-                Self::Single(weight) => weight.data().num_bytes(),
-                Self::Fp16(bits) => bits.num_bytes(),
-                Self::Quantized(weight) => weight.bytes(),
-            }
-        }
-    }
-
-    impl QuantLinear {
-        /// Device bytes of the weight and its scales
-        fn bytes(&self) -> usize {
-            self.values.num_bytes()
-                + match &self.weight {
-                    DeviceScales::Float(scales) => scales.num_bytes(),
-                    DeviceScales::Blocks(blocks) | DeviceScales::Nvfp4 { blocks, .. } => {
-                        blocks.num_bytes()
-                    }
-                }
-        }
-    }
-
-    /// Every quantization scheme, as the quantized precisions name them
-    const SCHEMES: [(&str, Scheme); 9] = [
-        ("FP8", Scheme::Fp8Channel),
-        ("FP8 per tensor", Scheme::Fp8Tensor),
-        ("FP8 per token", Scheme::Fp8Token),
-        ("MXFP8", Scheme::Mxfp8),
-        ("NVFP4", Scheme::Nvfp4),
-        ("INT8 weights", Scheme::Int8Weights { group: None }),
-        (
-            "INT8 weights g128",
-            Scheme::Int8Weights { group: Some(128) },
-        ),
-        ("INT4 weights g128", Scheme::Int4Weights { group: 128 }),
-        ("INT4 weights g64", Scheme::Int4Weights { group: 64 }),
-    ];
-
-    /// One NeMo reference input: the time-major mel, its valid lengths and the
-    /// expected encoder output, `[batch, frames, d_model]`
-    struct NemoInput {
-        batch: usize,
-        mel_frames: usize,
-        lens: Vec<usize>,
-        time_major: Vec<f32>,
-        expected: ArrayD<f32>,
-    }
-
-    impl NemoInput {
-        fn open(version: ParakeetVersion, set: &str) -> Self {
-            let reference = NemoReference::open(version, set);
-            let mel = reference
-                .f32("mel")
-                .into_dimensionality::<Ix3>()
-                .expect("[batch, features, frames]");
-            let (batch, mel_frames) = (mel.shape()[0], mel.shape()[2]);
-            let lens = reference
-                .i64("mel_len")
-                .iter()
-                .map(|len| *len as usize)
-                .collect();
-            let time_major = mel.permuted_axes([0, 2, 1]).iter().copied().collect();
-            let expected = reference.f32("encoder.out").permuted_axes(vec![0, 2, 1]);
-            Self {
-                batch,
-                mel_frames,
-                lens,
-                time_major,
-                expected: expected.as_standard_layout().into_owned(),
-            }
-        }
-
-        /// The encoder output and its valid frames per row
-        fn encode(&self, runtime: &CudaRuntime, encoder: &CudaEncoder) -> (Vec<f32>, Vec<usize>) {
-            let mut ws = encoder
-                .workspace(runtime, self.batch, self.mel_frames)
-                .expect("workspace");
-            encoder
-                .set_input(runtime, &mut ws, &self.lens, |mel| {
-                    mel.copy_from_slice(&self.time_major)
-                })
-                .expect("input");
-            encoder.enqueue(runtime, &mut ws).expect("encode");
-            let output = runtime.stream().clone_dtoh(ws.output()).expect("download");
-            (output, ws.output_lens().to_vec())
-        }
-    }
-
-    /// Relative L2 distance of `ours` from `theirs` over the valid frames of `[batch,
-    /// frames, width]` outputs
-    fn distance(ours: &[f32], theirs: &[f32], frames: usize, width: usize, lens: &[usize]) -> f64 {
-        let (mut error, mut norm) = (0f64, 0f64);
-        for (b, len) in lens.iter().enumerate() {
-            for t in 0..*len {
-                for c in 0..width {
-                    let at = (b * frames + t) * width + c;
-                    let (a, b) = (f64::from(ours[at]), f64::from(theirs[at]));
-                    assert!(a.is_finite(), "non-finite output {a} at {at}");
-                    error += (a - b) * (a - b);
-                    norm += b * b;
-                }
-            }
-        }
-        (error / norm).sqrt()
-    }
-
-    /// The host quantization of an activation in `scheme`, as the product reads it:
-    /// its bytes and the values they stand for
-    fn quantized_activation(scheme: Scheme, values: &[f32], width: usize) -> (Vec<u8>, Vec<f32>) {
-        let rows = values.len() / width;
-        match scheme {
-            Scheme::Fp8Tensor | Scheme::Fp8Channel => {
-                let (bits, scale) = fp8_tensor(values);
-                let restored = bits.iter().map(|bits| e4m3_value(*bits) * scale).collect();
-                (bits, restored)
-            }
-            Scheme::Fp8Token => {
-                let (bits, scales) = fp8_rows(values, width);
-                let restored = bits
-                    .iter()
-                    .enumerate()
-                    .map(|(i, bits)| e4m3_value(*bits) * scales[i / width])
-                    .collect();
-                (bits, restored)
-            }
-            Scheme::Mxfp8 => {
-                let (values, scales) = mxfp8(values, width);
-                let restored = QuantizedWeight::Mxfp8 {
-                    values: values.clone(),
-                    scales,
-                }
-                .dequantize(rows, width);
-                (values, restored)
-            }
-            Scheme::Nvfp4 => {
-                let (values, scales, global) = nvfp4(values, width);
-                let restored = QuantizedWeight::Nvfp4 {
-                    values: values.clone(),
-                    scales,
-                    global,
-                }
-                .dequantize(rows, width);
-                (values, restored)
-            }
-            Scheme::Int8Weights { .. } | Scheme::Int4Weights { .. } => {
-                (Vec::new(), values.to_vec())
-            }
-        }
-    }
-
-    /// Runs each scheme's product on real v3 weights and random activations at odd
-    /// row counts, and holds it against an FP64 product of the same quantized values
-    /// computed on the host. The GPU's quantized activation must match the host
-    /// quantizer bit for bit, so a misplaced scale, nibble or alpha shows up here
-    /// rather than as fluent but wrong transcripts
-    #[test]
-    #[ignore = "needs a CUDA GPU and the native weights; `just gpu-parity` runs it on gpu0"]
-    fn gpu_quantized_products_match_the_host() {
-        let runtime = CudaRuntime::open(0, Options::default()).expect("CUDA runtime");
-        runtime.prepare(Library::Cublas).expect("cuBLAS");
-        let file = weights(ParakeetVersion::V3);
-        let spec = file
-            .parakeet_spec(&ParakeetDeployment::v3())
-            .expect("spec")
-            .encoder;
-        let d = spec.d_model;
-        let products = [
-            (
-                "encoder.layers.0.feed_forward1.linear2.weight",
-                d,
-                spec.ff_hidden,
-                0.5,
-                1.0,
-            ),
-            (
-                "encoder.layers.5.feed_forward1.linear1.weight",
-                spec.ff_hidden,
-                d,
-                1.0,
-                0.0,
-            ),
-            (
-                "encoder.layers.11.self_attn.linear_out.weight",
-                d,
-                d,
-                1.0,
-                1.0,
-            ),
-        ];
-        let mut state = 0x9e37_79b9_7f4a_7c15u64;
-        let mut random = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            (state >> 40) as f32 / (1u64 << 24) as f32 - 0.5
-        };
-
-        for (name, scheme) in SCHEMES {
-            let quant = match QuantState::load(&runtime, Quantization::all(scheme), spec) {
-                Ok(quant) => quant,
-                Err(error) => {
-                    println!("{name}: unsupported here: {error}");
-                    continue;
-                }
-            };
-            println!(
-                "{name}: per-channel scales after the product: {}",
-                quant.scale_after
-            );
-            for (tensor, out, inputs, alpha, beta) in products {
-                let weight = file.tensor(tensor, &[out, inputs]).expect("weight");
-                let quantized = scheme.weight(weight, out, inputs);
-                let device =
-                    QuantLinear::upload(&runtime, scheme, &quantized, out, inputs).expect("upload");
-                let mut restored = quantized.dequantize(out, inputs);
-                if scheme.weight_only() {
-                    // the dequantize kernel rounds the weight to FP16 for the product
-                    for value in &mut restored {
-                        *value = f16_value(f16_bits(*value));
-                    }
-                }
-
-                for rows in [1, 77, 301] {
-                    let bits: Vec<u16> = (0..rows * inputs)
-                        .map(|i| {
-                            let outlier = if i % 509 == 0 { 20.0 } else { 3.0 };
-                            f16_bits(random() * outlier)
-                        })
-                        .collect();
-                    let values: Vec<f32> = bits.iter().map(|bits| f16_value(*bits)).collect();
-                    let initial: Vec<f32> = (0..rows * out).map(|_| random()).collect();
-                    let (host_bits, activation) = quantized_activation(scheme, &values, inputs);
-
-                    let stream = runtime.stream();
-                    let a = stream.clone_htod(&bits).expect("activation");
-                    let mut c = stream.clone_htod(&initial).expect("output");
-                    let mut inputs_ws = quant
-                        .inputs(&runtime, spec, rows.max(1), rows.max(1))
-                        .expect("quantized inputs");
-                    quant
-                        .linear(
-                            &runtime,
-                            linear(rows, out, inputs, alpha, beta, Math::Tf32),
-                            &a.slice(..),
-                            &device,
-                            &mut c.slice_mut(..),
-                            inputs_ws.as_mut(),
-                        )
-                        .expect("product");
-                    let ours = stream.clone_dtoh(&c).expect("download");
-
-                    if let Some(inputs_ws) = &inputs_ws {
-                        let device_bits = stream.clone_dtoh(&inputs_ws.values).expect("bits");
-                        let differ = host_bits
-                            .iter()
-                            .zip(&device_bits)
-                            .filter(|(host, device)| host != device)
-                            .count();
-                        assert_eq!(
-                            differ,
-                            0,
-                            "{name} {tensor} rows {rows}: {differ} of {} quantized activation bytes differ from the host",
-                            host_bits.len()
-                        );
-                    }
-
-                    let mut expected = vec![0f32; rows * out];
-                    for r in 0..rows {
-                        let a_row = &activation[r * inputs..(r + 1) * inputs];
-                        for o in 0..out {
-                            let w_row = &restored[o * inputs..(o + 1) * inputs];
-                            let dot: f64 = a_row
-                                .iter()
-                                .zip(w_row)
-                                .map(|(a, w)| f64::from(*a) * f64::from(*w))
-                                .sum();
-                            let at = r * out + o;
-                            expected[at] = (f64::from(alpha) * dot
-                                + f64::from(beta) * f64::from(initial[at]))
-                                as f32;
-                        }
-                    }
-                    let error = distance(&ours, &expected, rows, out, &[rows]);
-                    println!("{name} {tensor} rows {rows}: relative error {error:.2e}");
-                    assert!(error < 1e-4, "{name} {tensor} rows {rows}: {error:.2e}");
-                }
-            }
-        }
-    }
-
-    /// Runs each quantized encoder end to end on the NeMo references and prints its
-    /// distance from NeMo FP32 and from the FP16 encoder, with its linear weights'
-    /// device bytes. WER is the accuracy gate; this catches a broken product, which
-    /// lands at order 1
-    #[test]
-    #[ignore = "needs a CUDA GPU and the NeMo references; `just gpu-parity` runs it on gpu0"]
-    fn gpu_quantized_encoders_stay_near_nemo() {
-        let runtime = CudaRuntime::open(0, Options::default()).expect("CUDA runtime");
-        runtime.prepare(Library::Cublas).expect("cuBLAS");
-        for version in [ParakeetVersion::V2, ParakeetVersion::V3] {
-            let deployment = match version {
-                ParakeetVersion::V2 => ParakeetDeployment::v2(),
-                ParakeetVersion::V3 => ParakeetDeployment::v3(),
-            };
-            let file = weights(version);
-            let spec = file.parakeet_spec(&deployment).expect("spec").encoder;
-            let inputs: Vec<_> = ["b1", "b8", "long-full"]
-                .into_iter()
-                .map(|set| (set, NemoInput::open(version, set)))
-                .collect();
-            let fp16 = CudaEncoder::load(&runtime, &file, spec, EncoderMath::Fp16).expect("fp16");
-            let baseline: Vec<_> = inputs
-                .iter()
-                .map(|(_, input)| input.encode(&runtime, &fp16).0)
-                .collect();
-            println!(
-                "{version:?} FP16 linear weights: {} bytes",
-                fp16.linear_bytes()
-            );
-            drop(fp16);
-
-            for (name, scheme) in SCHEMES {
-                let math = EncoderMath::Quantized(Quantization::all(scheme));
-                let encoder = match CudaEncoder::load(&runtime, &file, spec, math) {
-                    Ok(encoder) => encoder,
-                    Err(error) => {
-                        println!("{version:?} {name}: unsupported here: {error}");
-                        continue;
-                    }
-                };
-                println!(
-                    "{version:?} {name} linear weights: {} bytes",
-                    encoder.linear_bytes()
-                );
-                for ((set, input), fp16) in inputs.iter().zip(&baseline) {
-                    let (output, lens) = input.encode(&runtime, &encoder);
-                    let frames = input.expected.shape()[1];
-                    let expected = input.expected.as_slice().expect("contiguous");
-                    let to_nemo = distance(&output, expected, frames, spec.d_model, &lens);
-                    let to_fp16 = distance(&output, fp16, frames, spec.d_model, &lens);
-                    println!(
-                        "{version:?} {set} {name}: rel to NeMo {to_nemo:.2e}, to FP16 {to_fp16:.2e}"
-                    );
-                    assert!(to_nemo < 0.5, "{version:?} {set} {name}: {to_nemo:.2e}");
-                }
-            }
-        }
-    }
-
-    /// For each scheme, quantizes one layer, then one kind of linear layer, at a time
-    /// with the rest at FP16, and prints the v3 encoder output's distance from the
-    /// FP16 encoder's: the most sensitive layers are the ones a mixed recipe keeps at
-    /// FP16
-    #[test]
-    #[ignore = "needs a CUDA GPU and the NeMo references; run on gpu0 when choosing a mixed recipe"]
-    fn gpu_quantization_sensitivity_by_layer() {
-        let runtime = CudaRuntime::open(0, Options::default()).expect("CUDA runtime");
-        runtime.prepare(Library::Cublas).expect("cuBLAS");
-        let file = weights(ParakeetVersion::V3);
-        let spec = file
-            .parakeet_spec(&ParakeetDeployment::v3())
-            .expect("spec")
-            .encoder;
-        let inputs: Vec<_> = ["b8", "long-full"]
-            .into_iter()
-            .map(|set| NemoInput::open(ParakeetVersion::V3, set))
-            .collect();
-        let fp16 = CudaEncoder::load(&runtime, &file, spec, EncoderMath::Fp16).expect("fp16");
-        let baseline: Vec<_> = inputs
-            .iter()
-            .map(|input| input.encode(&runtime, &fp16).0)
-            .collect();
-        drop(fp16);
-        let all_layers = (1u64 << spec.layers) - 1;
-        let all_kinds = (1u8 << LinearKind::ALL.len()) - 1;
-        let measure = |scheme: Scheme, keep: KeepFp16| -> Option<f64> {
-            let math = EncoderMath::Quantized(Quantization { scheme, keep });
-            let encoder = CudaEncoder::load(&runtime, &file, spec, math).ok()?;
-            let mut worst = 0f64;
-            for (input, fp16) in inputs.iter().zip(&baseline) {
-                let (output, lens) = input.encode(&runtime, &encoder);
-                let frames = input.expected.shape()[1];
-                worst = worst.max(distance(&output, fp16, frames, spec.d_model, &lens));
-            }
-            Some(worst)
-        };
-
-        for (name, scheme) in SCHEMES {
-            let Some(full) = measure(scheme, KeepFp16::NONE) else {
-                println!("{name}: unsupported here");
-                continue;
-            };
-            println!("{name} all layers: {full:.3e}");
-            for layer in 0..spec.layers {
-                let keep = KeepFp16 {
-                    layers: all_layers & !(1 << layer),
-                    kinds: 0,
-                };
-                let error = measure(scheme, keep).expect("loaded once");
-                println!("{name} layer {layer:2} only: {error:.3e}");
-            }
-            for (bit, kind) in LinearKind::ALL.iter().enumerate() {
-                let keep = KeepFp16 {
-                    layers: 0,
-                    kinds: all_kinds & !(1 << bit),
-                };
-                let error = measure(scheme, keep).expect("loaded once");
-                println!("{name} {kind:?} only: {error:.3e}");
-            }
-        }
-    }
 
     /// Relative L2 error and max abs difference over the valid frames of `[batch,
     /// frames, d_model]` outputs
@@ -2361,20 +1370,10 @@ mod tests {
             ("FP32", EncoderMath::Single(Math::Fp32)),
             ("TF32", EncoderMath::Single(Math::Tf32)),
             ("FP16", EncoderMath::Fp16),
-        ]
-        .into_iter()
-        .chain(
-            SCHEMES
-                .iter()
-                .map(|(name, scheme)| (*name, EncoderMath::Quantized(Quantization::all(*scheme)))),
-        );
+        ];
 
         for (name, math) in precisions {
-            // a quantized precision this GPU does not run fails to load
-            let Ok(encoder) = CudaEncoder::load(&runtime, &file, spec.encoder, math) else {
-                println!("v3 {name}: unsupported here");
-                continue;
-            };
+            let encoder = CudaEncoder::load(&runtime, &file, spec.encoder, math).expect("encoder");
             for set in ["b1", "b8"] {
                 time_graph(&runtime, &encoder, name, set);
             }
@@ -2383,7 +1382,7 @@ mod tests {
 
     /// Checks one graph replay of `encoder` on the v3 reference `set` against its
     /// eager pass and prints the mean replay time
-    fn time_graph(runtime: &CudaRuntime, encoder: &CudaEncoder, name: &str, set: &str) {
+    pub(super) fn time_graph(runtime: &CudaRuntime, encoder: &CudaEncoder, name: &str, set: &str) {
         const REPLAYS: u32 = 100;
         let reference = NemoReference::open(ParakeetVersion::V3, set);
         let mel = reference

@@ -3,11 +3,10 @@
 //! Reads an FP32 `model.safetensors` from `dev-tools/nemo/export_native.py` and
 //! writes `model-<precision>.safetensors` beside it (or at `--out`), which a native
 //! bundle loaded at that precision reads instead of the FP32 file. `<precision>` is
-//! one of `fp16`, `fp8`, `fp8-tensor`, `fp8-token`, `mxfp8`, `nvfp4`, `int8-weights`,
-//! `int8-weights128`, `int4-weights` and `int4-weights64`
+//! one of `fp16`, `fp8`, `int8` and `nvfp4`
 //!
 //! ```sh
-//! cargo run --release --features cuda --example quantize_native -- \
+//! cargo run --release --features low-precision --example quantize_native -- \
 //!     /shared/models/scriptrs-native/parakeet-v3/model.safetensors fp8
 //! ```
 
@@ -17,17 +16,11 @@ use std::path::PathBuf;
 use eyre::{Result, bail, eyre};
 use scriptrs::{Precision, write_native_weights};
 
-const PRECISIONS: [Precision; 10] = [
+const PRECISIONS: [Precision; 4] = [
     Precision::Fp16,
     Precision::Fp8,
-    Precision::Fp8PerTensor,
-    Precision::Fp8PerToken,
-    Precision::Mxfp8,
+    Precision::Int8,
     Precision::Nvfp4,
-    Precision::Int8Weights,
-    Precision::Int8Weights128,
-    Precision::Int4Weights,
-    Precision::Int4Weights64,
 ];
 
 fn main() -> Result<()> {

@@ -37,6 +37,7 @@ pub(crate) static PROFILE: Profile = Profile {
 pub(crate) enum KernelModule {
     Encoder,
     Decode,
+    #[cfg(feature = "low-precision")]
     Quant,
 }
 
@@ -47,6 +48,7 @@ impl KernelArea for KernelModule {
         match self {
             Self::Encoder => "encoder",
             Self::Decode => "decode",
+            #[cfg(feature = "low-precision")]
             Self::Quant => "quant",
         }
     }
@@ -64,6 +66,7 @@ impl KernelArea for KernelModule {
                 text: include_str!("ptx/decode.sm75.ptx"),
                 cubins: &[],
             })),
+            #[cfg(feature = "low-precision")]
             Self::Quant => AreaPtx::baseline(Some(EmbeddedPtx {
                 text: include_str!("ptx/quant.sm75.ptx"),
                 cubins: &[],
@@ -157,7 +160,7 @@ pub(crate) fn elements(count: usize) -> Result<LaunchConfig, Error> {
     })
 }
 
-pub(crate) fn rows(count: usize) -> Result<LaunchConfig, Error> {
+fn rows(count: usize) -> Result<LaunchConfig, Error> {
     let count = u32_of("row grid", count)?;
     Ok(LaunchConfig {
         grid_dim: (count, 1, 1),

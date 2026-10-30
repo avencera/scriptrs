@@ -9,22 +9,23 @@ use crate::deployment::ParakeetDeployment;
 use crate::error::TranscriptionError;
 use crate::native::spec::ParakeetSpec;
 
-pub(crate) const FORMAT: &str = "scriptrs-native";
+const FORMAT: &str = "scriptrs-native";
 /// Every tensor in FP32, as `dev-tools/nemo/export_native.py` writes it
 pub(crate) const FORMAT_VERSION: &str = "2";
 /// The Conformer layers' linear weights in the format the `linear_weights` metadata
-/// names, as [`crate::write_native_weights`] writes them; every other tensor stays
-/// FP32
+/// names, as `write_native_weights` writes them; every other tensor stays FP32
+#[cfg(feature = "low-precision")]
 pub(crate) const LINEAR_FORMAT_VERSION: &str = "3";
 /// Metadata naming the format of the linear weights in a version 3 file
+#[cfg(feature = "low-precision")]
 pub(crate) const LINEAR_WEIGHTS_KEY: &str = "linear_weights";
 
-/// Memory-mapped native weight file written by `dev-tools/nemo/export_native.py` or
-/// [`crate::write_native_weights`]
+/// Memory-mapped native weight file written by `dev-tools/nemo/export_native.py`
 ///
-/// Tensors keep their NeMo names and are FP32, except the linear weights of a
-/// version 3 file. Engines read them as borrowed slices and apply their own layout
-/// changes when uploading.
+/// Tensors keep their NeMo names and stay fp32. Engines read them as borrowed
+/// slices and apply their own layout changes when uploading. With the
+/// `low-precision` feature it may also be a version 3 file from
+/// `write_native_weights`, whose linear weights are FP16 or quantized
 pub(crate) struct WeightFile {
     mmap: Mmap,
     tensors: HashMap<String, TensorEntry>,
@@ -73,6 +74,14 @@ impl WeightFile {
 
             let mut tensors = HashMap::new();
             for (name, view) in parsed.tensors() {
+                #[cfg(not(feature = "low-precision"))]
+                if view.dtype() != Dtype::F32 {
+                    return Err(invalid(format!(
+                        "tensor `{name}` is {:?}, not f32",
+                        view.dtype()
+                    )));
+                }
+                #[cfg(feature = "low-precision")]
                 if !matches!(view.dtype(), Dtype::F32 | Dtype::F16 | Dtype::U8) {
                     return Err(invalid(format!(
                         "tensor `{name}` is {:?}, not f32, f16 or u8",
@@ -101,6 +110,9 @@ impl WeightFile {
             metadata,
         };
         weights.expect_metadata("format", FORMAT)?;
+        #[cfg(not(feature = "low-precision"))]
+        weights.expect_metadata("format_version", FORMAT_VERSION)?;
+        #[cfg(feature = "low-precision")]
         if weights.metadata("format_version") == Some(LINEAR_FORMAT_VERSION) {
             if weights.linear_weights().is_none() {
                 return Err(invalid(format!(
@@ -117,6 +129,7 @@ impl WeightFile {
 
     /// The format of the Conformer layers' linear weights in a version 3 file, or
     /// `None` for an all-FP32 version 2 file
+    #[cfg(feature = "low-precision")]
     pub(crate) fn linear_weights(&self) -> Option<&str> {
         match self.metadata("format_version") {
             Some(LINEAR_FORMAT_VERSION) => self.metadata(LINEAR_WEIGHTS_KEY),
@@ -125,6 +138,7 @@ impl WeightFile {
     }
 
     /// Every tensor's name, dtype and shape, sorted by name
+    #[cfg(feature = "low-precision")]
     pub(crate) fn tensors(&self) -> Vec<(&str, Dtype, &[usize])> {
         let mut tensors: Vec<_> = self
             .tensors
@@ -136,11 +150,13 @@ impl WeightFile {
     }
 
     /// Every metadata entry
+    #[cfg(feature = "low-precision")]
     pub(crate) fn all_metadata(&self) -> &HashMap<String, String> {
         &self.metadata
     }
 
     /// The dtype of tensor `name`
+    #[cfg(feature = "low-precision")]
     pub(crate) fn dtype(&self, name: &str) -> Result<Dtype, TranscriptionError> {
         self.entry(name).map(|entry| entry.dtype)
     }
@@ -218,6 +234,7 @@ impl WeightFile {
     }
 
     /// Borrow an f16 tensor as its bits after checking its shape
+    #[cfg(feature = "low-precision")]
     pub(crate) fn tensor_f16(
         &self,
         name: &str,
@@ -233,6 +250,7 @@ impl WeightFile {
     }
 
     /// Borrow a u8 tensor after checking its shape
+    #[cfg(feature = "low-precision")]
     pub(crate) fn tensor_u8(
         &self,
         name: &str,

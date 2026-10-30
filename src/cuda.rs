@@ -7,9 +7,12 @@ pub(crate) mod decoder;
 pub(crate) mod encoder;
 pub(crate) mod fp16;
 pub(crate) mod kernels;
+#[cfg(feature = "low-precision")]
 pub(crate) mod lt;
 pub(crate) mod model;
+#[cfg(feature = "low-precision")]
 pub(crate) mod quant;
+#[cfg(feature = "low-precision")]
 pub(crate) mod stored;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -22,8 +25,9 @@ use cudakit::cudarc::driver::{
 };
 use cudakit::{DeviceTensor, Error, Math, Sgemm};
 
-use crate::cuda::encoder::{EncoderMath, KeepFp16, Quantization};
+use crate::cuda::encoder::EncoderMath;
 use crate::cuda::kernels::CudaRuntime;
+#[cfg(feature = "low-precision")]
 use crate::cuda::quant::Scheme;
 use crate::error::TranscriptionError;
 use crate::models::Precision;
@@ -147,34 +151,18 @@ impl<T> Drop for HostStaging<T> {
     }
 }
 
-/// The encoder GEMM precision of a model precision, with the layers the experimental
-/// `SCRIPTRS_CUDA_KEEP_FP16` variable keeps at FP16 (see [`KeepFp16::from_env`])
-pub(crate) fn math(precision: Precision) -> Result<EncoderMath, TranscriptionError> {
-    Ok(match (precision, scheme(precision)) {
-        (_, Some(scheme)) => EncoderMath::Quantized(Quantization {
-            keep: KeepFp16::from_env()?,
-            ..Quantization::all(scheme)
-        }),
-        (Precision::Fp32, None) => EncoderMath::Single(Math::Fp32),
-        (Precision::Tf32, None) => EncoderMath::Single(Math::Tf32),
-        (_, None) => EncoderMath::Fp16,
-    })
-}
-
-/// The scheme a quantized precision stores its linear weights in, `None` for the
-/// float precisions
-pub(crate) fn scheme(precision: Precision) -> Option<Scheme> {
+/// The encoder GEMM precision of a model precision
+pub(crate) fn math(precision: Precision) -> EncoderMath {
     match precision {
-        Precision::Fp32 | Precision::Tf32 | Precision::Fp16 => None,
-        Precision::Fp8 => Some(Scheme::Fp8Channel),
-        Precision::Fp8PerTensor => Some(Scheme::Fp8Tensor),
-        Precision::Fp8PerToken => Some(Scheme::Fp8Token),
-        Precision::Mxfp8 => Some(Scheme::Mxfp8),
-        Precision::Nvfp4 => Some(Scheme::Nvfp4),
-        Precision::Int8Weights => Some(Scheme::Int8Weights { group: None }),
-        Precision::Int8Weights128 => Some(Scheme::Int8Weights { group: Some(128) }),
-        Precision::Int4Weights => Some(Scheme::Int4Weights { group: 128 }),
-        Precision::Int4Weights64 => Some(Scheme::Int4Weights { group: 64 }),
+        Precision::Fp32 => EncoderMath::Single(Math::Fp32),
+        Precision::Tf32 => EncoderMath::Single(Math::Tf32),
+        Precision::Fp16 => EncoderMath::Fp16,
+        #[cfg(feature = "low-precision")]
+        Precision::Fp8 => EncoderMath::Quantized(Scheme::Fp8),
+        #[cfg(feature = "low-precision")]
+        Precision::Int8 => EncoderMath::Quantized(Scheme::Int8),
+        #[cfg(feature = "low-precision")]
+        Precision::Nvfp4 => EncoderMath::Quantized(Scheme::Nvfp4),
     }
 }
 

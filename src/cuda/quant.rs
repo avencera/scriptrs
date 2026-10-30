@@ -6,7 +6,7 @@
 //! activation quantized on the GPU land on the same bits for the same values. Every
 //! format rounds to nearest even and saturates at its largest finite value.
 //!
-//! Block scales use cuBLASLt's tiled layout (see [`ScaleLayout`]); rows of every
+//! NVFP4 block scales use cuBLASLt's tiled layout (see [`ScaleLayout`]); rows of every
 //! linear layer and operand are blocked along the input dimension, which is the
 //! contiguous one in both the PyTorch `[out, in]` weight and the `[rows, in]`
 //! activation. The launchers of the `quant` kernel area live here too
@@ -17,7 +17,7 @@ use cudakit::cudarc::driver::{
 use cudakit::{Error, LoadedKernels, check_len};
 
 use crate::cuda::kernels::{
-    CudaRuntime, ELEMENT_THREADS, KernelModule, elements, len, len_mut, rows, u32_of,
+    CudaRuntime, ELEMENT_THREADS, KernelModule, elements, len, len_mut, u32_of,
 };
 
 /// E4M3: 3 mantissa bits, bias 7
@@ -28,56 +28,38 @@ pub(crate) const E4M3_MAX: f32 = 448.0;
 const E2M1: (u32, i32) = (1, 1);
 /// Largest E2M1 value
 pub(crate) const E2M1_MAX: f32 = 6.0;
-/// MXFP8 values per UE8M0 scale
-pub(crate) const MX_BLOCK: usize = 32;
 /// NVFP4 values per E4M3 scale
 pub(crate) const NV_BLOCK: usize = 16;
+/// INT8 weight values per scale
+pub(crate) const INT8_GROUP: usize = 128;
+/// What every linear layer's input count must be a multiple of: whole INT8 groups and
+/// whole 4-block tiles of NVFP4 scales
+pub(crate) const INPUT_MULTIPLE: usize = INT8_GROUP;
 
 /// How a linear layer's weight and the activation it reads are quantized
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Scheme {
     /// FP8 E4M3 with one scale for the weight and one dynamic scale for the
     /// activation
-    Fp8Tensor,
-    /// FP8 E4M3 with a scale per output channel and one dynamic scale for the
-    /// activation
-    Fp8Channel,
-    /// FP8 E4M3 with a scale per output channel and a dynamic scale per activation
-    /// row
-    Fp8Token,
-    /// MXFP8: E4M3 in blocks of 32 with power-of-two (UE8M0) scales, for both
-    /// operands
-    Mxfp8,
+    Fp8,
     /// NVFP4: E2M1 in blocks of 16 with E4M3 scales and a tensor scale, for both
     /// operands
     Nvfp4,
-    /// INT8 weights with a scale per `group` inputs, or per output channel without a
-    /// group, dequantized to FP16 for an FP16 product
-    Int8Weights { group: Option<usize> },
-    /// INT4 weights with a scale per `group` inputs, dequantized to FP16 for an FP16
-    /// product
-    Int4Weights { group: usize },
+    /// INT8 weights with a scale per [`INT8_GROUP`] inputs, dequantized to FP16 for an
+    /// FP16 product
+    Int8,
 }
 
 impl Scheme {
-    /// Quantizes a row-major `[out, inputs]` weight
+    /// Quantizes a row-major `[out, inputs]` weight, with `inputs` a multiple of
+    /// [`INPUT_MULTIPLE`]
     pub(crate) fn weight(self, weight: &[f32], out: usize, inputs: usize) -> QuantizedWeight {
         assert_eq!(weight.len(), out * inputs, "weight size");
+        assert_eq!(inputs % INPUT_MULTIPLE, 0, "weight inputs");
         match self {
-            Self::Fp8Tensor => {
+            Self::Fp8 => {
                 let (values, scale) = fp8_tensor(weight);
-                QuantizedWeight::Fp8 {
-                    values,
-                    scales: vec![scale],
-                }
-            }
-            Self::Fp8Channel | Self::Fp8Token => {
-                let (values, scales) = fp8_rows(weight, inputs);
-                QuantizedWeight::Fp8 { values, scales }
-            }
-            Self::Mxfp8 => {
-                let (values, scales) = mxfp8(weight, inputs);
-                QuantizedWeight::Mxfp8 { values, scales }
+                QuantizedWeight::Fp8 { values, scale }
             }
             Self::Nvfp4 => {
                 let (values, scales, global) = nvfp4(weight, inputs);
@@ -87,82 +69,48 @@ impl Scheme {
                     global,
                 }
             }
-            Self::Int8Weights { group } => {
-                let (values, scales) = int8_rows(weight, group.unwrap_or(inputs));
+            Self::Int8 => {
+                let (values, scales) = int8_groups(weight, INT8_GROUP);
                 QuantizedWeight::Int8 { values, scales }
-            }
-            Self::Int4Weights { group } => {
-                let (values, scales) = int4_groups(weight, group);
-                QuantizedWeight::Int4 {
-                    values,
-                    scales,
-                    group,
-                }
             }
         }
     }
 
     /// Whether the product reads FP16 activations and a dequantized FP16 weight
     pub(crate) fn weight_only(self) -> bool {
-        matches!(self, Self::Int8Weights { .. } | Self::Int4Weights { .. })
+        self == Self::Int8
     }
 
     /// The name of the scheme in a quantized weight file's metadata
-    pub(crate) fn name(self) -> String {
+    pub(crate) fn name(self) -> &'static str {
         match self {
-            Self::Fp8Tensor => "fp8-tensor".to_owned(),
-            Self::Fp8Channel => "fp8-channel".to_owned(),
-            Self::Fp8Token => "fp8-token".to_owned(),
-            Self::Mxfp8 => "mxfp8".to_owned(),
-            Self::Nvfp4 => "nvfp4".to_owned(),
-            Self::Int8Weights { group: None } => "int8-weights".to_owned(),
-            Self::Int8Weights { group: Some(group) } => format!("int8-weights-g{group}"),
-            Self::Int4Weights { group } => format!("int4-weights-g{group}"),
+            Self::Fp8 => "fp8",
+            Self::Nvfp4 => "nvfp4",
+            Self::Int8 => "int8",
         }
     }
 
     /// The scheme a quantized weight file's metadata names
     pub(crate) fn from_name(name: &str) -> Option<Self> {
-        Some(match name {
-            "fp8-tensor" => Self::Fp8Tensor,
-            "fp8-channel" => Self::Fp8Channel,
-            "fp8-token" => Self::Fp8Token,
-            "mxfp8" => Self::Mxfp8,
-            "nvfp4" => Self::Nvfp4,
-            "int8-weights" => Self::Int8Weights { group: None },
-            _ => match name.strip_prefix("int8-weights-g") {
-                Some(group) => Self::Int8Weights {
-                    group: Some(group.parse().ok()?),
-                },
-                None => Self::Int4Weights {
-                    group: name.strip_prefix("int4-weights-g")?.parse().ok()?,
-                },
-            },
-        })
+        [Self::Fp8, Self::Nvfp4, Self::Int8]
+            .into_iter()
+            .find(|scheme| scheme.name() == name)
     }
 }
 
 /// A quantized `[out, inputs]` weight as it is uploaded
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum QuantizedWeight {
-    /// E4M3 bits and one FP32 scale, or one per output channel
-    Fp8 { values: Vec<u8>, scales: Vec<f32> },
-    /// E4M3 bits and tiled UE8M0 block scales
-    Mxfp8 { values: Vec<u8>, scales: Vec<u8> },
+    /// E4M3 bits and one FP32 scale
+    Fp8 { values: Vec<u8>, scale: f32 },
     /// E2M1 pairs, tiled E4M3 block scales and the tensor scale
     Nvfp4 {
         values: Vec<u8>,
         scales: Vec<u8>,
         global: f32,
     },
-    /// INT8 values and a scale per output channel
+    /// INT8 values and a scale per [`INT8_GROUP`] inputs
     Int8 { values: Vec<u8>, scales: Vec<f32> },
-    /// INT4 pairs, offset by 8, and a scale per group
-    Int4 {
-        values: Vec<u8>,
-        scales: Vec<f32>,
-        group: usize,
-    },
 }
 
 /// cuBLASLt's tiled layout of the `[rows, inputs / block]` block scales of a matrix
@@ -266,45 +214,6 @@ pub(crate) fn fp8_tensor(values: &[f32]) -> (Vec<u8>, f32) {
     )
 }
 
-/// E4M3 bits of `values` with one scale per row of `width`, `amax / 448`
-pub(crate) fn fp8_rows(values: &[f32], width: usize) -> (Vec<u8>, Vec<f32>) {
-    let mut bits = Vec::with_capacity(values.len());
-    let mut scales = Vec::with_capacity(values.len() / width);
-    for row in values.chunks(width) {
-        let (row_bits, scale) = fp8_tensor(row);
-        bits.extend(row_bits);
-        scales.push(scale);
-    }
-    (bits, scales)
-}
-
-/// MXFP8 of rows of `width`: E4M3 bits and tiled UE8M0 scales, each the smallest
-/// power of two that keeps its block of 32 within ±448
-pub(crate) fn mxfp8(values: &[f32], width: usize) -> (Vec<u8>, Vec<u8>) {
-    let rows = values.len() / width;
-    let layout = ScaleLayout::new(rows, width, MX_BLOCK);
-    let mut scales = vec![0u8; layout.bytes()];
-    let mut bits = Vec::with_capacity(values.len());
-    for (b, block) in values.chunks(MX_BLOCK).enumerate() {
-        let amax = amax(block);
-        let ratio = (amax / E4M3_MAX).to_bits();
-        let mut exponent = ((ratio >> 23) & 0xff) as i32 - 127;
-        if ratio & 0x7f_ffff != 0 {
-            exponent += 1;
-        }
-        let exponent = if amax > 0.0 {
-            exponent.clamp(-126, 127)
-        } else {
-            -126
-        };
-        let per_row = width / MX_BLOCK;
-        scales[layout.offset(b / per_row, b % per_row)] = (exponent + 127) as u8;
-        let inverse = pow2(-exponent);
-        bits.extend(block.iter().map(|value| e4m3(value * inverse)));
-    }
-    (bits, scales)
-}
-
 /// NVFP4 of rows of `width`: E2M1 pairs (even element in the low nibble), tiled E4M3
 /// block scales relative to the tensor scale, and the tensor scale `amax / (448 * 6)`
 pub(crate) fn nvfp4(values: &[f32], width: usize) -> (Vec<u8>, Vec<u8>, f32) {
@@ -335,41 +244,20 @@ pub(crate) fn nvfp4(values: &[f32], width: usize) -> (Vec<u8>, Vec<u8>, f32) {
     (bits, scales, global)
 }
 
-/// Symmetric INT8 of rows of `width`, with a scale per row of `amax / 127`
-fn int8_rows(values: &[f32], width: usize) -> (Vec<u8>, Vec<f32>) {
+/// Symmetric INT8 in groups of `group`, with a scale per group of `amax / 127`
+fn int8_groups(values: &[f32], group: usize) -> (Vec<u8>, Vec<f32>) {
     let mut bits = Vec::with_capacity(values.len());
-    let mut scales = Vec::with_capacity(values.len() / width);
-    for row in values.chunks(width) {
-        let amax = amax(row);
+    let mut scales = Vec::with_capacity(values.len() / group);
+    for block in values.chunks(group) {
+        let amax = amax(block);
         let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
         bits.extend(
-            row.iter()
+            block
+                .iter()
                 .map(|value| (value / scale).round_ties_even().clamp(-127.0, 127.0) as i8 as u8),
         );
         scales.push(scale);
     }
-    (bits, scales)
-}
-
-/// Symmetric INT4 in groups of `group`, scale `amax / 7`, stored offset by 8 two to a
-/// byte with the even element in the low nibble
-fn int4_groups(values: &[f32], group: usize) -> (Vec<u8>, Vec<f32>) {
-    let mut nibbles = Vec::with_capacity(values.len());
-    let mut scales = Vec::with_capacity(values.len() / group);
-    for block in values.chunks(group) {
-        let amax = amax(block);
-        let scale = if amax > 0.0 { amax / 7.0 } else { 1.0 };
-        nibbles.extend(
-            block
-                .iter()
-                .map(|value| ((value / scale).round_ties_even().clamp(-8.0, 7.0) as i32 + 8) as u8),
-        );
-        scales.push(scale);
-    }
-    let bits = nibbles
-        .chunks(2)
-        .map(|pair| pair[0] | (pair[1] << 4))
-        .collect();
     (bits, scales)
 }
 
@@ -413,12 +301,8 @@ const _: () = assert!(ELEMENT_THREADS as usize >= AMAX_PARTIALS);
 pub(crate) struct QuantKernels {
     amax: CudaFunction,
     fp8: CudaFunction,
-    fp8_rows: CudaFunction,
-    mxfp8: CudaFunction,
     nvfp4: CudaFunction,
     dequant_i8: CudaFunction,
-    dequant_i4: CudaFunction,
-    scale_columns: CudaFunction,
 }
 
 impl QuantKernels {
@@ -427,12 +311,8 @@ impl QuantKernels {
         Ok(Self {
             amax: module.function("quant_amax")?,
             fp8: module.function("quant_fp8")?,
-            fp8_rows: module.function("quant_fp8_rows")?,
-            mxfp8: module.function("quant_mxfp8")?,
             nvfp4: module.function("quant_nvfp4")?,
             dequant_i8: module.function("quant_dequant_i8")?,
-            dequant_i4: module.function("quant_dequant_i4")?,
-            scale_columns: module.function("quant_scale_columns")?,
         })
     }
 
@@ -458,26 +338,20 @@ impl QuantKernels {
         Ok(())
     }
 
-    /// E4M3 of `x` with one scale from `partials`, written to every slot of `scales`
+    /// E4M3 of `x` with one scale from `partials`, written to `scale`
     pub(crate) fn fp8(
         &self,
         stream: &CudaStream,
         x: &CudaView<'_, u16>,
         partials: &CudaView<'_, f32>,
         out: &mut CudaViewMut<'_, u8>,
-        scales: &mut CudaViewMut<'_, f32>,
+        scale: &mut CudaViewMut<'_, f32>,
     ) -> Result<(), Error> {
         check_len("fp8 partials", AMAX_PARTIALS, partials.len())?;
         check_len("fp8 output", x.len(), out.len())?;
-        if scales.is_empty() || scales.len() > x.len() {
-            return Err(Error::BufferLength {
-                context: "fp8 scales",
-                expected: 1,
-                actual: scales.len(),
-            });
-        }
+        check_len("fp8 scale", 1, scale.len())?;
         let config = elements(x.len())?;
-        let lens = [len(x), len(partials), len_mut(out), len_mut(scales)];
+        let lens = [len(x), len(partials), len_mut(out), len_mut(scale)];
         let mut launch = stream.launch_builder(&self.fp8);
         launch
             .arg(x)
@@ -486,71 +360,10 @@ impl QuantKernels {
             .arg(&lens[1])
             .arg(out)
             .arg(&lens[2])
-            .arg(scales)
+            .arg(scale)
             .arg(&lens[3]);
         // SAFETY: matches `quant_fp8`: one thread per element in full blocks of
-        // `ELEMENT_THREADS`, which covers every slot of `scales`
-        unsafe { launch.launch(config) }?;
-        Ok(())
-    }
-
-    /// E4M3 of `x` with one scale per row of `width` into `scales`
-    pub(crate) fn fp8_rows(
-        &self,
-        stream: &CudaStream,
-        x: &CudaView<'_, u16>,
-        out: &mut CudaViewMut<'_, u8>,
-        scales: &mut CudaViewMut<'_, f32>,
-        width: usize,
-    ) -> Result<(), Error> {
-        check_len("fp8 rows output", x.len(), out.len())?;
-        check_len("fp8 rows scales", x.len() / width.max(1), scales.len())?;
-        check_len("fp8 rows input", scales.len() * width, x.len())?;
-        let config = rows(scales.len())?;
-        let lens = [len(x), len_mut(out), len_mut(scales)];
-        let width = u32_of("fp8 rows width", width)?;
-        let mut launch = stream.launch_builder(&self.fp8_rows);
-        launch
-            .arg(x)
-            .arg(&lens[0])
-            .arg(out)
-            .arg(&lens[1])
-            .arg(scales)
-            .arg(&lens[2])
-            .arg(&width);
-        // SAFETY: matches `quant_fp8_rows`: one block per row, all rows full
-        unsafe { launch.launch(config) }?;
-        Ok(())
-    }
-
-    /// MXFP8 of rows of `width` into E4M3 `out` and tiled UE8M0 `scales`
-    pub(crate) fn mxfp8(
-        &self,
-        stream: &CudaStream,
-        x: &CudaView<'_, u16>,
-        out: &mut CudaViewMut<'_, u8>,
-        scales: &mut CudaViewMut<'_, u8>,
-        width: usize,
-    ) -> Result<(), Error> {
-        let layout = block_operand("mxfp8", x.len(), width, MX_BLOCK)?;
-        check_len("mxfp8 output", x.len(), out.len())?;
-        check_len("mxfp8 scales", layout.bytes(), scales.len())?;
-        let config = elements(x.len() / MX_BLOCK)?;
-        let lens = [len(x), len_mut(out), len_mut(scales)];
-        let width = u32_of("mxfp8 width", width)?;
-        let tiles = u32_of("mxfp8 tiles", layout.tile_columns())?;
-        let mut launch = stream.launch_builder(&self.mxfp8);
-        launch
-            .arg(x)
-            .arg(&lens[0])
-            .arg(out)
-            .arg(&lens[1])
-            .arg(scales)
-            .arg(&lens[2])
-            .arg(&width)
-            .arg(&tiles);
-        // SAFETY: matches `quant_mxfp8`: one thread per block of 32, bounds-checked
-        // against `x`, and every block's scale offset lies inside `layout`
+        // `ELEMENT_THREADS`, the first of which writes `scale`
         unsafe { launch.launch(config) }?;
         Ok(())
     }
@@ -609,22 +422,20 @@ impl QuantKernels {
         Ok(())
     }
 
-    /// FP16 of an INT8 weight with a scale per `width` elements: an output channel or
-    /// a group of inputs
+    /// FP16 of an INT8 weight with a scale per [`INT8_GROUP`] elements
     pub(crate) fn dequant_i8(
         &self,
         stream: &CudaStream,
         q: &CudaView<'_, u8>,
         scales: &CudaView<'_, f32>,
         out: &mut CudaViewMut<'_, u16>,
-        width: usize,
     ) -> Result<(), Error> {
         check_len("int8 weight", out.len(), q.len())?;
-        check_len("int8 scales", out.len() / width.max(1), scales.len())?;
-        check_len("int8 rows", scales.len() * width, out.len())?;
+        check_len("int8 scales", out.len() / INT8_GROUP, scales.len())?;
+        check_len("int8 groups", scales.len() * INT8_GROUP, out.len())?;
         let config = elements(out.len())?;
         let lens = [len(q), len(scales), len_mut(out)];
-        let width = u32_of("int8 width", width)?;
+        let group = u32_of("int8 group", INT8_GROUP)?;
         let mut launch = stream.launch_builder(&self.dequant_i8);
         launch
             .arg(q)
@@ -633,78 +444,8 @@ impl QuantKernels {
             .arg(&lens[1])
             .arg(out)
             .arg(&lens[2])
-            .arg(&width);
-        // SAFETY: matches `quant_dequant_i8`; the kernel bounds-checks against `out`
-        unsafe { launch.launch(config) }?;
-        Ok(())
-    }
-
-    /// FP16 of an INT4 weight with a scale per `group` elements
-    pub(crate) fn dequant_i4(
-        &self,
-        stream: &CudaStream,
-        q: &CudaView<'_, u8>,
-        scales: &CudaView<'_, f32>,
-        out: &mut CudaViewMut<'_, u16>,
-        group: usize,
-    ) -> Result<(), Error> {
-        check_len("int4 weight", out.len().div_ceil(2), q.len())?;
-        check_len("int4 scales", out.len() / group.max(1), scales.len())?;
-        check_len("int4 groups", scales.len() * group, out.len())?;
-        let config = elements(out.len())?;
-        let lens = [len(q), len(scales), len_mut(out)];
-        let group = u32_of("int4 group", group)?;
-        let mut launch = stream.launch_builder(&self.dequant_i4);
-        launch
-            .arg(q)
-            .arg(&lens[0])
-            .arg(scales)
-            .arg(&lens[1])
-            .arg(out)
-            .arg(&lens[2])
             .arg(&group);
-        // SAFETY: matches `quant_dequant_i4`; the kernel bounds-checks against `out`
-        unsafe { launch.launch(config) }?;
-        Ok(())
-    }
-
-    /// `c = alpha * t * scales[column] + beta * c` over rows of `scales.len()`
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "launchers mirror their kernel's parameter list so each launch reads against it"
-    )]
-    pub(crate) fn scale_columns(
-        &self,
-        stream: &CudaStream,
-        t: &CudaView<'_, f32>,
-        scales: &CudaView<'_, f32>,
-        c: &mut CudaViewMut<'_, f32>,
-        alpha: f32,
-        beta: f32,
-    ) -> Result<(), Error> {
-        check_len("scaled product", c.len(), t.len())?;
-        if scales.is_empty() || c.len() % scales.len() != 0 {
-            return Err(Error::BufferLength {
-                context: "column scales",
-                expected: scales.len(),
-                actual: c.len(),
-            });
-        }
-        let config = elements(c.len())?;
-        let lens = [len(t), len(scales), len_mut(c)];
-        let width = u32_of("column scales", scales.len())?;
-        let mut launch = stream.launch_builder(&self.scale_columns);
-        launch
-            .arg(t)
-            .arg(&lens[0])
-            .arg(scales)
-            .arg(&lens[1])
-            .arg(c)
-            .arg(&lens[2])
-            .arg(&width)
-            .arg(&alpha)
-            .arg(&beta);
-        // SAFETY: matches `quant_scale_columns`; the kernel bounds-checks against `c`
+        // SAFETY: matches `quant_dequant_i8`; the kernel bounds-checks against `out`
         unsafe { launch.launch(config) }?;
         Ok(())
     }
@@ -729,16 +470,14 @@ fn block_operand(
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{E2M1, E4M3, MX_BLOCK, NV_BLOCK, QuantizedWeight, ScaleLayout, decode, pow2};
+    use super::{E2M1, E4M3, INT8_GROUP, NV_BLOCK, QuantizedWeight, ScaleLayout, decode};
 
     impl QuantizedWeight {
         /// Bytes the weight takes on the device and in a quantized weight file
         pub(crate) fn bytes(&self) -> usize {
             match self {
-                Self::Fp8 { values, scales }
-                | Self::Int8 { values, scales }
-                | Self::Int4 { values, scales, .. } => values.len() + 4 * scales.len(),
-                Self::Mxfp8 { values, scales } => values.len() + scales.len(),
+                Self::Fp8 { values, .. } => values.len() + 4,
+                Self::Int8 { values, scales } => values.len() + 4 * scales.len(),
                 Self::Nvfp4 { values, scales, .. } => values.len() + scales.len() + 4,
             }
         }
@@ -747,21 +486,10 @@ pub(crate) mod test_support {
         pub(crate) fn dequantize(&self, out: usize, inputs: usize) -> Vec<f32> {
             let n = out * inputs;
             match self {
-                Self::Fp8 { values, scales } => {
-                    let per = n / scales.len();
-                    (0..n)
-                        .map(|i| e4m3_value(values[i]) * scales[i / per])
-                        .collect()
-                }
-                Self::Mxfp8 { values, scales } => {
-                    let layout = ScaleLayout::new(out, inputs, MX_BLOCK);
-                    (0..n)
-                        .map(|i| {
-                            let code = scales[layout.offset(i / inputs, i % inputs / MX_BLOCK)];
-                            e4m3_value(values[i]) * pow2(i32::from(code) - 127)
-                        })
-                        .collect()
-                }
+                Self::Fp8 { values, scale } => values
+                    .iter()
+                    .map(|bits| e4m3_value(*bits) * scale)
+                    .collect(),
                 Self::Nvfp4 {
                     values,
                     scales,
@@ -776,21 +504,8 @@ pub(crate) mod test_support {
                         })
                         .collect()
                 }
-                Self::Int8 { values, scales } => {
-                    let group = n / scales.len();
-                    (0..n)
-                        .map(|i| f32::from(values[i] as i8) * scales[i / group])
-                        .collect()
-                }
-                Self::Int4 {
-                    values,
-                    scales,
-                    group,
-                } => (0..n)
-                    .map(|i| {
-                        let nibble = values[i / 2] >> (4 * (i % 2)) & 0xf;
-                        (i32::from(nibble) - 8) as f32 * scales[i / group]
-                    })
+                Self::Int8 { values, scales } => (0..n)
+                    .map(|i| f32::from(values[i] as i8) * scales[i / INT8_GROUP])
                     .collect(),
             }
         }
@@ -921,15 +636,9 @@ mod tests {
         let weight = weights(out * inputs);
         let norm = weight.iter().map(|w| w * w).sum::<f32>().sqrt();
         let schemes = [
-            (Scheme::Fp8Tensor, 0.08),
-            (Scheme::Fp8Channel, 0.04),
-            (Scheme::Mxfp8, 0.04),
+            (Scheme::Fp8, 0.08),
             (Scheme::Nvfp4, 0.15),
-            // uniform INT8 rows lose more than FP8 to the rows holding an outlier
-            (Scheme::Int8Weights { group: None }, 0.06),
-            (Scheme::Int8Weights { group: Some(128) }, 0.03),
-            (Scheme::Int4Weights { group: 64 }, 0.15),
-            (Scheme::Int4Weights { group: 128 }, 0.25),
+            (Scheme::Int8, 0.03),
         ];
         for (scheme, bound) in schemes {
             let quantized = scheme.weight(&weight, out, inputs);
@@ -950,7 +659,7 @@ mod tests {
                 error > 0.0,
                 "{scheme:?} is lossless, so it did not quantize"
             );
-            assert_eq!(Scheme::from_name(&scheme.name()), Some(scheme));
+            assert_eq!(Scheme::from_name(scheme.name()), Some(scheme));
         }
     }
 
