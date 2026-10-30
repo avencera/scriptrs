@@ -6,8 +6,10 @@
 
 // the encoder writes FP16 GEMM operands through Rust's `f16` casts, and the quant
 // area reads them back
-#![feature(f16)]
+#![cfg_attr(any(feature = "encoder", feature = "quant"), feature(f16))]
 
+#[cfg(feature = "attention")]
+pub mod attention;
 #[cfg(any(feature = "encoder", feature = "decode", feature = "quant"))]
 mod common;
 #[cfg(feature = "decode")]
