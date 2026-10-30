@@ -14,6 +14,7 @@ pub(crate) mod model;
 pub(crate) mod quant;
 #[cfg(feature = "low-precision")]
 pub(crate) mod stored;
+pub(crate) mod streaming;
 #[cfg(test)]
 pub(crate) mod test_support;
 

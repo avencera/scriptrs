@@ -15,6 +15,10 @@ use cudakit::{
 
 use crate::cuda::fp16;
 
+mod stream;
+
+pub(crate) use stream::{StreamGeometry, StreamKernels, StreamRows};
+
 /// Build-wide CUDA policy: cuBLAS is allowed while the encoder is library-first, and
 /// only the `sm_75` baseline PTX ships. The FP16 encoder GEMMs call `cublasGemmEx`
 /// directly
@@ -124,7 +128,7 @@ const DECIDE_THREADS: u32 = 1024;
 
 /// Class logits each `decode_decide` thread holds in registers, the kernel's
 /// `DECIDE_VALUES`
-const DECIDE_VALUES: usize = 12;
+const DECIDE_VALUES: usize = 13;
 
 /// Threads per block of `decode_lstm` and `decode_project`, one block per output,
 /// the kernels' `ROW_WARPS` warps

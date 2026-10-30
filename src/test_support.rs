@@ -2,7 +2,9 @@
 //!
 //! Parity tests that use these are `#[ignore]`d because the references live
 //! outside the repository; `just parity` runs them. Set `SCRIPTRS_NEMO_REF`
-//! to point at a copy other than `/shared/datasets/parakeet-ref`.
+//! to point at a copy other than `/shared/datasets/parakeet-ref`, and
+//! `SCRIPTRS_STREAM_REF` for the streaming references `dev-tools/nemo/stream_ref.py`
+//! writes, other than `/shared/datasets/nemotron-stream-ref`.
 
 use std::fs::File;
 use std::path::PathBuf;
@@ -14,6 +16,9 @@ use safetensors::{Dtype, SafeTensors};
 use crate::deployment::ParakeetVersion;
 
 const DEFAULT_REFERENCE_DIR: &str = "/shared/datasets/parakeet-ref";
+
+#[cfg(feature = "cuda")]
+const DEFAULT_STREAM_REFERENCE_DIR: &str = "/shared/datasets/nemotron-stream-ref";
 
 /// One reference set (`b1` or `b8`) for one Parakeet version
 pub(crate) struct NemoReference {
@@ -44,6 +49,16 @@ impl NemoReference {
     #[cfg(all(feature = "cuda", feature = "vad"))]
     pub(crate) fn silero() -> Self {
         Self::open_in(reference_root().join("silero-v5"), "vad")
+    }
+
+    /// The tensor dump of NeMo's streaming run of `model` (`nemotron-en` or
+    /// `nemotron-3.5`) at `lookahead`
+    #[cfg(feature = "cuda")]
+    pub(crate) fn streaming(model: &str, lookahead: usize) -> Self {
+        let root = std::env::var_os("SCRIPTRS_STREAM_REF")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_STREAM_REFERENCE_DIR));
+        Self::open_in(root.join(model), &format!("r{lookahead}.dump"))
     }
 
     fn open_in(dir: PathBuf, set: &str) -> Self {
@@ -79,6 +94,12 @@ impl NemoReference {
 
     fn tensors(&self) -> SafeTensors<'_> {
         SafeTensors::deserialize(&self.mmap).expect("reference file should parse")
+    }
+
+    /// Whether the reference holds `key`
+    #[cfg(feature = "cuda")]
+    pub(crate) fn contains(&self, key: &str) -> bool {
+        self.tensors().tensor(key).is_ok()
     }
 
     pub(crate) fn f32(&self, key: &str) -> ArrayD<f32> {

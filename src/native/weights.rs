@@ -7,7 +7,7 @@ use safetensors::{Dtype, SafeTensors};
 
 use crate::deployment::ParakeetDeployment;
 use crate::error::TranscriptionError;
-use crate::native::spec::ParakeetSpec;
+use crate::native::spec::{ParakeetSpec, StreamingSpec};
 
 const FORMAT: &str = "scriptrs-native";
 /// Every tensor in FP32, as `dev-tools/nemo/export_native.py` writes it
@@ -186,13 +186,24 @@ impl WeightFile {
         &self,
         deployment: &ParakeetDeployment,
     ) -> Result<ParakeetSpec, TranscriptionError> {
-        let config = self
-            .metadata
-            .get("config")
-            .ok_or_else(|| invalid("metadata `config` is missing".to_owned()))?;
-        let spec = ParakeetSpec::from_config_json(config)?;
+        let spec = ParakeetSpec::from_config_json(self.config()?)?;
         spec.validate_for(deployment)?;
         Ok(spec)
+    }
+
+    /// Parse the embedded config of a cache-aware streaming checkpoint
+    pub(crate) fn streaming_spec(&self) -> Result<StreamingSpec, TranscriptionError> {
+        StreamingSpec::from_config_json(self.config()?)
+    }
+
+    fn config(&self) -> Result<&str, TranscriptionError> {
+        self.metadata("config")
+            .ok_or_else(|| invalid("metadata `config` is missing".to_owned()))
+    }
+
+    /// The shape of tensor `name`, if the file holds it
+    pub(crate) fn shape(&self, name: &str) -> Option<&[usize]> {
+        self.tensors.get(name).map(|entry| entry.shape.as_slice())
     }
 
     fn entry(&self, name: &str) -> Result<&TensorEntry, TranscriptionError> {
@@ -300,12 +311,12 @@ mod tests {
                 .parakeet_spec(&deployment)
                 .expect("spec should match");
             assert_eq!(spec.encoder.layers, 24);
-            assert_eq!(spec.joint.outputs, deployment.blank_id() + 1 + 5);
+            assert_eq!(spec.transducer.joint.outputs, deployment.blank_id() + 1 + 5);
 
             let joint = weights
                 .tensor(
                     "joint.joint_net.2.weight",
-                    &[spec.joint.outputs, spec.joint.hidden],
+                    &[spec.transducer.joint.outputs, spec.transducer.joint.hidden],
                 )
                 .expect("joint output weight should load");
             assert!(joint.iter().all(|value| value.is_finite()));

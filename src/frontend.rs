@@ -8,6 +8,9 @@ use realfft::{RealFftPlanner, RealToComplex, num_complex::Complex};
 use crate::config::TranscriptionConfig;
 use crate::error::TranscriptionError;
 
+#[cfg(feature = "cuda")]
+pub(crate) mod stream;
+
 pub(crate) struct ParakeetFeatureExtractor {
     config: TranscriptionConfig,
     mel_filterbank: MelFilterbank,
