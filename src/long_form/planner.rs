@@ -107,7 +107,8 @@ pub struct OverlapChunkConfig {
     /// Left-context samples prepended to non-first fallback windows
     ///
     /// Must be a whole number of encoder frames (1280 samples), so each window's
-    /// tokens map onto the recording timeline exactly
+    /// tokens map onto the recording timeline exactly, and leave room in
+    /// `max_model_samples` for at least one frame of audio after it
     pub context_samples: usize,
     /// Maximum samples accepted by the base Parakeet model
     pub max_model_samples: usize,
@@ -157,6 +158,17 @@ impl OverlapChunkConfig {
                 self.context_samples
             )));
         }
+        // the chunk never shrinks below one frame, so a large context can push
+        // a window past the limit; a first window rounded down to a frame moves
+        // earlier but keeps its length, so this is the longest window planned
+        if self.max_window_samples() > self.max_model_samples {
+            return Err(TranscriptionError::InvalidConfiguration(format!(
+                "overlap windows of context_samples={} plus at least one encoder frame of audio are {} samples, past max_model_samples={}",
+                self.context_samples,
+                self.max_window_samples(),
+                self.max_model_samples
+            )));
+        }
         if !self.overlap_seconds.is_finite() || self.overlap_seconds < 0.0 {
             return Err(TranscriptionError::InvalidConfiguration(format!(
                 "overlap overlap_seconds={} must be finite and non-negative",
@@ -182,6 +194,11 @@ impl OverlapChunkConfig {
             .saturating_sub(crate::constants::MEL_HOP_SAMPLES)
             .max(SAMPLES_PER_ENCODER_FRAME);
         raw / SAMPLES_PER_ENCODER_FRAME * SAMPLES_PER_ENCODER_FRAME
+    }
+
+    /// Longest window the planner builds, left context included
+    fn max_window_samples(&self) -> usize {
+        self.context_samples + self.chunk_samples()
     }
 
     pub(crate) fn overlap_samples(&self) -> usize {
@@ -858,6 +875,57 @@ mod tests {
 
         config.context_samples = 2 * SAMPLES_PER_ENCODER_FRAME;
         assert!(config.validate_for(&deployment).is_ok());
+    }
+
+    /// Longest window, context included, of a fast plan for `audio_len` samples
+    /// and, with `vad`, of a speech region as long that starts mid-frame
+    fn longest_planned_window(config: &LongFormConfig, audio_len: usize) -> usize {
+        let tasks = build_fast_execution_plan(audio_len, config).tasks;
+        #[cfg(feature = "vad")]
+        let tasks = {
+            let mut tasks = tasks;
+            let region = SampleRange {
+                start: 896,
+                end: 896 + audio_len,
+            };
+            let probabilities = vec![0.9; region.end.div_ceil(VAD_WINDOW_SAMPLES)];
+            build_region_plan(region, &probabilities, config, &mut tasks);
+            tasks
+        };
+        tasks
+            .iter()
+            .map(|task| task.audio_end - task.audio_start)
+            .max()
+            .expect("the plans have windows")
+    }
+
+    /// Validation accepts exactly the contexts whose planned windows all fit the
+    /// window limit, including a VAD region's first window rounded down to a frame
+    #[test]
+    fn overlap_validation_accepts_exactly_the_contexts_whose_windows_fit() {
+        let deployment = ParakeetDeployment::v3();
+        let hard_max = deployment.hard_sample_max();
+        let mut config = LongFormConfig::from_deployment(&deployment);
+        #[cfg(feature = "vad")]
+        {
+            config.segmentation.min_silence_at_max_speech = 10.0;
+        }
+        let mut rejected = 0;
+        for max_model_samples in [hard_max, 48_000, 2_000, 1_000] {
+            config.overlap.max_model_samples = max_model_samples;
+            for frames in 0..=max_model_samples / SAMPLES_PER_ENCODER_FRAME + 2 {
+                config.overlap.context_samples = frames * SAMPLES_PER_ENCODER_FRAME;
+                let longest = longest_planned_window(&config, 2 * hard_max);
+                let fits = longest <= max_model_samples;
+                assert_eq!(
+                    config.overlap.validate_for(&deployment).is_ok(),
+                    fits,
+                    "max_model_samples={max_model_samples} context frames {frames}: longest window {longest}"
+                );
+                rejected += usize::from(!fits);
+            }
+        }
+        assert!(rejected > 0);
     }
 
     #[test]

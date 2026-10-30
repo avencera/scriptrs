@@ -702,6 +702,24 @@ mod tests {
         assert!(config.validate_for(&deployment).is_err());
     }
 
+    /// Every deployment's defaults validate, and so do a native bundle's
+    #[test]
+    fn default_configs_validate() {
+        for deployment in [ParakeetDeployment::v2(), ParakeetDeployment::v3()] {
+            LongFormConfig::from_deployment(&deployment)
+                .validate_for(&deployment)
+                .expect("the deployment defaults should validate");
+
+            #[cfg(feature = "cuda")]
+            {
+                let bundle = crate::models::ModelBundle::from_native_dir("models", deployment);
+                LongFormConfig::for_bundle(&bundle)
+                    .validate_for(bundle.deployment())
+                    .expect("the native defaults should validate");
+            }
+        }
+    }
+
     /// The planner's own window, not the model's input limit, decides when audio
     /// is planned, so lowering it plans clips the model could take whole
     #[test]
