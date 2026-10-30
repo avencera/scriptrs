@@ -110,8 +110,10 @@ impl NemoReference {
         assert_eq!(view.dtype(), Dtype::F32, "`{key}` is not f32");
         let values = view
             .data()
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("4-byte chunk")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
             .collect();
         ArrayD::from_shape_vec(IxDyn(view.shape()), values).expect("shape should match data")
     }
@@ -124,8 +126,10 @@ impl NemoReference {
             .unwrap_or_else(|error| panic!("reference key `{key}`: {error}"));
         assert_eq!(view.dtype(), Dtype::I32, "`{key}` is not i32");
         view.data()
-            .chunks_exact(4)
-            .map(|bytes| i32::from_le_bytes(bytes.try_into().expect("4-byte chunk")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| i32::from_le_bytes(*bytes))
             .collect()
     }
 
@@ -136,8 +140,10 @@ impl NemoReference {
             .unwrap_or_else(|error| panic!("reference key `{key}`: {error}"));
         assert_eq!(view.dtype(), Dtype::I64, "`{key}` is not i64");
         view.data()
-            .chunks_exact(8)
-            .map(|bytes| i64::from_le_bytes(bytes.try_into().expect("8-byte chunk")))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|bytes| i64::from_le_bytes(*bytes))
             .collect()
     }
 }

@@ -777,7 +777,7 @@ fn state_shape(
     slots_state: usize,
 ) -> Result<(usize, usize), Error> {
     let per_row = count("state rows", &[groups, batch])?;
-    if per_row == 0 || rows % per_row != 0 {
+    if per_row == 0 || !rows.is_multiple_of(per_row) {
         return Err(Error::BufferLength {
             context: "state rows",
             expected: per_row,
@@ -786,7 +786,7 @@ fn state_shape(
     }
     let width = rows / per_row;
     let slot = count("state slot", &[groups, width])?;
-    if slots_state % slot != 0 {
+    if !slots_state.is_multiple_of(slot) {
         return Err(Error::BufferLength {
             context: "state slots",
             expected: slot * slots_state.div_ceil(slot),

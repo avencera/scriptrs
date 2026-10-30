@@ -195,7 +195,9 @@ impl QuantState {
             return Ok(None);
         };
         // whole INT8 groups and NVFP4 scale tiles along every linear layer's inputs
-        if spec.d_model % INPUT_MULTIPLE != 0 || spec.ff_hidden % INPUT_MULTIPLE != 0 {
+        if !spec.d_model.is_multiple_of(INPUT_MULTIPLE)
+            || !spec.ff_hidden.is_multiple_of(INPUT_MULTIPLE)
+        {
             return Err(TranscriptionError::InvalidConfiguration(format!(
                 "`{}` needs layer widths that are multiples of {INPUT_MULTIPLE}",
                 scheme.name()

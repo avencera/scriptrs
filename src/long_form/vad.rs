@@ -146,7 +146,12 @@ fn process_blocks(
         control.check()?;
         let windows = block_windows.min(count - first);
         let inputs = &mut inputs[..windows * WINDOW_INPUT_SAMPLES];
-        for (offset, input) in inputs.chunks_exact_mut(WINDOW_INPUT_SAMPLES).enumerate() {
+        for (offset, input) in inputs
+            .as_chunks_mut::<WINDOW_INPUT_SAMPLES>()
+            .0
+            .iter_mut()
+            .enumerate()
+        {
             fill_window(audio, first + offset, input);
         }
 
@@ -204,7 +209,7 @@ mod tests {
         let mut seen = Vec::new();
         let probabilities = process_blocks(audio, &control(), block_windows, |inputs, out| {
             assert!(inputs.len() <= block_windows * WINDOW_INPUT_SAMPLES);
-            for input in inputs.chunks_exact(WINDOW_INPUT_SAMPLES) {
+            for input in inputs.as_chunks::<WINDOW_INPUT_SAMPLES>().0 {
                 seen.push(input.to_vec());
                 out.push(seen.len() as f32);
             }
@@ -269,7 +274,13 @@ mod tests {
             if calls == 1 {
                 control.cancel();
             }
-            out.extend(inputs.chunks_exact(WINDOW_INPUT_SAMPLES).map(|_| 0.1));
+            out.extend(
+                inputs
+                    .as_chunks::<WINDOW_INPUT_SAMPLES>()
+                    .0
+                    .iter()
+                    .map(|_| 0.1),
+            );
             Ok(())
         })
         .expect_err("cancelled scan");
