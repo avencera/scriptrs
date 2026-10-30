@@ -302,6 +302,18 @@ struct UnfusedAttention {
     context: CudaSlice<f32>,
 }
 
+/// What an attention sublayer reads from its workspace beside the buffers of its
+/// path
+struct AttentionInputs<'a> {
+    shape: Heads,
+    /// Valid encoder frames per batch row
+    lens: CudaView<'a, u32>,
+    /// `[2 * frames - 1, d_model]` relative position table
+    pos_emb: &'a CudaSlice<f32>,
+    /// Its FP16 copy, where the linear layers read FP16
+    pos_emb_f16: Option<&'a CudaSlice<u16>>,
+}
+
 impl AttentionBuffers {
     fn bytes(&self) -> usize {
         match self {
@@ -338,7 +350,9 @@ struct Activations {
     qkv: CudaSlice<f32>,
     /// `[rows, d_model]` attention context or conv module output
     merged: CudaSlice<f32>,
-    /// FP16 GEMM inputs under [`EncoderMath::Fp16`]
+    /// FP16 copies for FP16 linear layers, which [`EncoderMath::fp16`] picks; where
+    /// present, the kernels before each linear layer write them and the layer reads
+    /// them in place of the FP32 activations
     fp16: Option<Fp16Inputs>,
     quant: QuantScratch,
 }
@@ -416,9 +430,8 @@ impl Activations {
     }
 
     /// Where a kernel writes `merged` for the next linear layer
-    fn merged_out(&mut self, math: EncoderMath) -> Result<GemmOperand<'_>, TranscriptionError> {
+    fn merged_out(&mut self) -> GemmOperand<'_> {
         gemm_output(
-            math,
             &mut self.merged,
             self.fp16.as_mut().map(|fp16| &mut fp16.merged),
         )
@@ -427,29 +440,13 @@ impl Activations {
 
 /// `normed` as the next linear layer reads it, borrowing only those fields so the
 /// layer can write another
-fn normed_in<'a>(
-    math: EncoderMath,
-    normed: &'a CudaSlice<f32>,
-    fp16: Option<&'a Fp16Inputs>,
-) -> Result<Operand<'a>, TranscriptionError> {
-    gemm_input(
-        math,
-        normed.slice(..),
-        fp16.map(|fp16| fp16.normed.slice(..)),
-    )
+fn normed_in<'a>(normed: &'a CudaSlice<f32>, fp16: Option<&'a Fp16Inputs>) -> Operand<'a> {
+    gemm_input(normed.slice(..), fp16.map(|fp16| fp16.normed.slice(..)))
 }
 
 /// `merged` as the next linear layer reads it, as [`normed_in`]
-fn merged_in<'a>(
-    math: EncoderMath,
-    merged: &'a CudaSlice<f32>,
-    fp16: Option<&'a Fp16Inputs>,
-) -> Result<Operand<'a>, TranscriptionError> {
-    gemm_input(
-        math,
-        merged.slice(..),
-        fp16.map(|fp16| fp16.merged.slice(..)),
-    )
+fn merged_in<'a>(merged: &'a CudaSlice<f32>, fp16: Option<&'a Fp16Inputs>) -> Operand<'a> {
+    gemm_input(merged.slice(..), fp16.map(|fp16| fp16.merged.slice(..)))
 }
 
 impl EncoderWorkspace {
@@ -1043,11 +1040,7 @@ impl CudaEncoder {
                 &layer.norm_out.bias.data().slice(..),
             ),
             next.as_ref().map(|(gamma, beta)| (gamma, beta)),
-            gemm_output(
-                self.math,
-                normed,
-                fp16.as_mut().map(|fp16| &mut fp16.normed),
-            )?,
+            gemm_output(normed, fp16.as_mut().map(|fp16| &mut fp16.normed)),
             self.spec.d_model,
             NORM_EPS,
         )?;
@@ -1070,11 +1063,7 @@ impl CudaEncoder {
             &x.slice(..),
             &norm.weight.data().slice(..),
             &norm.bias.data().slice(..),
-            gemm_output(
-                self.math,
-                normed,
-                fp16.as_mut().map(|fp16| &mut fp16.normed),
-            )?,
+            gemm_output(normed, fp16.as_mut().map(|fp16| &mut fp16.normed)),
             self.spec.d_model,
             NORM_EPS,
         )?;
@@ -1090,13 +1079,11 @@ impl CudaEncoder {
         weight: &Linear,
         c: &mut C,
     ) -> Result<(), TranscriptionError> {
-        match (a, weight, self.math) {
-            (Operand::Single(a), Linear::Single(w), EncoderMath::Single(_)) => {
-                runtime.sgemm(spec, &a, w.data(), c)?;
-            }
-            (Operand::Fp16(a), Linear::Fp16(w), EncoderMath::Fp16) => {
-                linear_fp16(runtime, spec, &a, w, c)?;
-            }
+        // the weight's precision follows the encoder's and the operand's the
+        // workspace's, which their types do not tie together
+        match (a, weight) {
+            (Operand::Single(a), Linear::Single(w)) => runtime.sgemm(spec, &a, w.data(), c)?,
+            (Operand::Fp16(a), Linear::Fp16(w)) => linear_fp16(runtime, spec, &a, w, c)?,
             _ => return Err(mixed_precision()),
         }
         Ok(())
@@ -1115,10 +1102,11 @@ impl CudaEncoder {
         quant: &mut QuantScratch,
     ) -> Result<(), TranscriptionError> {
         #[cfg(feature = "low-precision")]
-        if let (Operand::Fp16(a), Linear::Quantized(w), EncoderMath::Quantized(_)) =
-            (&a, weight, self.math)
-        {
-            let state = self.quant.as_ref().ok_or_else(mixed_precision)?;
+        if let Linear::Quantized(w) = weight {
+            // quantized weights come with their state, and read FP16 activations
+            let (Operand::Fp16(a), Some(state)) = (&a, &self.quant) else {
+                return Err(mixed_precision());
+            };
             return state.linear(runtime, spec, a, w, c, quant.inputs.as_mut());
         }
         self.linear(runtime, spec, a, weight, c)
@@ -1138,7 +1126,7 @@ impl CudaEncoder {
         self.linear_or_quantized(
             runtime,
             linear(rows, hidden, d, 1.0, 0.0, math),
-            normed_in(self.math, &act.normed, act.fp16.as_ref())?,
+            normed_in(&act.normed, act.fp16.as_ref()),
             &weights.linear1,
             &mut act.hidden.slice_mut(..rows * hidden),
             &mut act.quant,
@@ -1155,10 +1143,9 @@ impl CudaEncoder {
                 .silu(stream, &mut act.hidden.slice_mut(..rows * hidden))?,
         }
         let activated = gemm_input(
-            self.math,
             act.hidden.slice(..rows * hidden),
             act.fp16.as_ref().map(|fp16| fp16.hidden.slice(..)),
-        )?;
+        );
         // NeMo scales the feed-forward residual by 0.5 (`fc_factor`)
         self.linear_or_quantized(
             runtime,
@@ -1172,28 +1159,50 @@ impl CudaEncoder {
     }
 
     /// `x += linear_out(rel_pos_attention(normed))`, with `normed` the sublayer's
-    /// norm of `x`
+    /// norm of `x`, through the attention path the workspace was built for
     fn attention(
         &self,
         runtime: &CudaRuntime,
         ws: &mut EncoderWorkspace,
         weights: &Attention,
     ) -> Result<(), TranscriptionError> {
-        match &self.fused {
-            Some(fused) if !matches!(ws.attention, AttentionBuffers::Unfused(_)) => {
-                self.fused_attention(runtime, ws, weights, fused)?;
+        let spec = self.spec;
+        let EncoderWorkspace {
+            batch,
+            frames,
+            lens,
+            act,
+            pos_emb,
+            pos_emb_f16,
+            attention,
+            ..
+        } = ws;
+        let inputs = AttentionInputs {
+            shape: Heads {
+                batch: *batch,
+                frames: *frames,
+                heads: spec.heads,
+                head_dim: spec.d_model / spec.heads,
+            },
+            lens: lens[3].slice(..),
+            pos_emb,
+            pos_emb_f16: pos_emb_f16.as_ref(),
+        };
+        match attention {
+            AttentionBuffers::Unfused(buffers) => {
+                self.unfused_attention(runtime, act, buffers, &inputs, weights)?;
             }
-            _ => self.unfused_attention(runtime, ws, weights)?,
+            fused => self.fused_attention(runtime, act, fused, &inputs, weights)?,
         }
 
-        let d = self.spec.d_model;
+        let d = spec.d_model;
         self.linear_or_quantized(
             runtime,
-            linear(ws.act.rows, d, d, 1.0, 1.0, self.math.single()),
-            merged_in(self.math, &ws.act.merged, ws.act.fp16.as_ref())?,
+            linear(act.rows, d, d, 1.0, 1.0, self.math.single()),
+            merged_in(&act.merged, act.fp16.as_ref()),
             &weights.out,
-            &mut ws.act.x,
-            &mut ws.act.quant,
+            &mut act.x,
+            &mut act.quant,
         )?;
         Ok(())
     }
@@ -1203,21 +1212,17 @@ impl CudaEncoder {
     fn fused_attention(
         &self,
         runtime: &CudaRuntime,
-        ws: &mut EncoderWorkspace,
+        act: &mut Activations,
+        buffers: &mut AttentionBuffers,
+        inputs: &AttentionInputs<'_>,
         weights: &Attention,
-        fused: &FusedAttention,
     ) -> Result<(), TranscriptionError> {
+        // the encoder that built a fused workspace has the kernel
+        let fused = self.fused.as_ref().ok_or_else(mixed_precision)?;
         let stream = runtime.stream();
-        let spec = self.spec;
-        let (d, heads) = (spec.d_model, spec.heads);
-        let rows = ws.act.rows;
-        let positions = 2 * ws.frames - 1;
-        let shape = Heads {
-            batch: ws.batch,
-            frames: ws.frames,
-            heads,
-            head_dim: d / heads,
-        };
+        let d = self.spec.d_model;
+        let rows = act.rows;
+        let positions = 2 * inputs.shape.frames - 1;
         let math = self.math.single();
         let (qkv_spec, pos_spec) = (
             linear(rows, 3 * d, d, 1.0, 0.0, math),
@@ -1227,12 +1232,13 @@ impl CudaEncoder {
             weights.bias_u.data().slice(..),
             weights.bias_v.data().slice(..),
         );
-        let lens = ws.lens[3].slice(..);
 
+        // the buffers, activations and weights all follow the encoder's precision,
+        // which their types do not tie together
         match (
-            &mut ws.attention,
-            ws.act.fp16.as_mut(),
-            ws.pos_emb_f16.as_ref(),
+            buffers,
+            act.fp16.as_mut(),
+            inputs.pos_emb_f16,
             &weights.qkv,
             &weights.pos,
         ) {
@@ -1251,9 +1257,9 @@ impl CudaEncoder {
                     &pos.slice(..),
                     &bias_u,
                     &bias_v,
-                    &lens,
+                    &inputs.lens,
                     &mut fp16.merged.slice_mut(..),
-                    shape,
+                    inputs.shape,
                 )?;
             }
             (
@@ -1263,17 +1269,17 @@ impl CudaEncoder {
                 Linear::Single(qkv_weight),
                 Linear::Single(pos_weight),
             ) => {
-                runtime.sgemm(qkv_spec, &ws.act.normed, qkv_weight.data(), &mut ws.act.qkv)?;
-                runtime.sgemm(pos_spec, &ws.pos_emb, pos_weight.data(), pos)?;
+                runtime.sgemm(qkv_spec, &act.normed, qkv_weight.data(), &mut act.qkv)?;
+                runtime.sgemm(pos_spec, inputs.pos_emb, pos_weight.data(), pos)?;
                 fused.kernels.rel_pos_tf32(
                     stream,
-                    &ws.act.qkv.slice(..),
+                    &act.qkv.slice(..),
                     &pos.slice(..),
                     &bias_u,
                     &bias_v,
-                    &lens,
-                    &mut ws.act.merged.slice_mut(..),
-                    shape,
+                    &inputs.lens,
+                    &mut act.merged.slice_mut(..),
+                    inputs.shape,
                 )?;
             }
             _ => return Err(mixed_precision()),
@@ -1286,37 +1292,35 @@ impl CudaEncoder {
     fn unfused_attention(
         &self,
         runtime: &CudaRuntime,
-        ws: &mut EncoderWorkspace,
+        act: &mut Activations,
+        buffers: &mut UnfusedAttention,
+        inputs: &AttentionInputs<'_>,
         weights: &Attention,
     ) -> Result<(), TranscriptionError> {
         let stream = runtime.stream();
-        let spec = self.spec;
-        let (d, heads, head_dim) = (spec.d_model, spec.heads, spec.d_model / spec.heads);
-        let (batch, frames) = (ws.batch, ws.frames);
-        let rows = batch * frames;
-        let positions = 2 * frames - 1;
-        let shape = Heads {
+        let shape = inputs.shape;
+        let Heads {
             batch,
             frames,
             heads,
             head_dim,
-        };
-        let AttentionBuffers::Unfused(buffers) = &mut ws.attention else {
-            return Err(mixed_precision());
-        };
+        } = shape;
+        let d = self.spec.d_model;
+        let rows = batch * frames;
+        let positions = 2 * frames - 1;
 
         let math = self.math.single();
         self.linear_or_quantized(
             runtime,
             linear(rows, 3 * d, d, 1.0, 0.0, math),
-            normed_in(self.math, &ws.act.normed, ws.act.fp16.as_ref())?,
+            normed_in(&act.normed, act.fp16.as_ref()),
             &weights.qkv,
-            &mut ws.act.qkv,
-            &mut ws.act.quant,
+            &mut act.qkv,
+            &mut act.quant,
         )?;
         self.kernels.split_qkv(
             stream,
-            &ws.act.qkv.slice(..),
+            &act.qkv.slice(..),
             &weights.bias_u.data().slice(..),
             &weights.bias_v.data().slice(..),
             &mut buffers.q_u.slice_mut(..),
@@ -1326,17 +1330,16 @@ impl CudaEncoder {
             shape,
         )?;
         let table = gemm_input(
-            self.math,
-            ws.pos_emb.slice(..),
-            ws.pos_emb_f16.as_ref().map(|table| table.slice(..)),
-        )?;
+            inputs.pos_emb.slice(..),
+            inputs.pos_emb_f16.map(|table| table.slice(..)),
+        );
         self.linear_or_quantized(
             runtime,
             linear(positions, d, d, 1.0, 0.0, math),
             table,
             &weights.pos,
             &mut buffers.pos,
-            &mut ws.act.quant,
+            &mut act.quant,
         )?;
         self.kernels.split_heads(
             stream,
@@ -1375,7 +1378,7 @@ impl CudaEncoder {
             stream,
             &mut buffers.scores.slice_mut(..),
             &buffers.bd.slice(..),
-            &ws.lens[3].slice(..),
+            &inputs.lens,
             shape,
         )?;
 
@@ -1389,12 +1392,8 @@ impl CudaEncoder {
             &buffers.v,
             &mut buffers.context,
         )?;
-        self.kernels.merge_heads(
-            stream,
-            &buffers.context.slice(..),
-            ws.act.merged_out(self.math)?,
-            shape,
-        )?;
+        self.kernels
+            .merge_heads(stream, &buffers.context.slice(..), act.merged_out(), shape)?;
         Ok(())
     }
 
@@ -1414,7 +1413,7 @@ impl CudaEncoder {
         self.linear_or_quantized(
             runtime,
             linear(rows, 2 * d, d, 1.0, 0.0, math),
-            normed_in(self.math, &act.normed, act.fp16.as_ref())?,
+            normed_in(&act.normed, act.fp16.as_ref()),
             &weights.pointwise1,
             &mut act.hidden.slice_mut(..pw1_len),
             &mut act.quant,
@@ -1425,11 +1424,7 @@ impl CudaEncoder {
             fp16,
             ..
         } = act;
-        let glued = gemm_output(
-            self.math,
-            merged,
-            fp16.as_mut().map(|fp16| &mut fp16.merged),
-        )?;
+        let glued = gemm_output(merged, fp16.as_mut().map(|fp16| &mut fp16.merged));
         self.kernels.conv_glue(
             runtime.stream(),
             &hidden.slice(..pw1_len),
@@ -1446,7 +1441,7 @@ impl CudaEncoder {
         self.linear_or_quantized(
             runtime,
             linear(rows, d, d, 1.0, 1.0, math),
-            merged_in(self.math, &act.merged, act.fp16.as_ref())?,
+            merged_in(&act.merged, act.fp16.as_ref()),
             &weights.pointwise2,
             &mut act.x,
             &mut act.quant,
@@ -1474,31 +1469,24 @@ impl Linear {
     }
 }
 
-/// Where a kernel writes the activation a linear layer reads next: `single`, or
-/// `fp16`, its FP16 copy, under [`EncoderMath::Fp16`]
+/// Where a kernel writes the activation a linear layer reads next: `fp16`, its FP16
+/// copy, where the workspace keeps one for FP16 linear layers, else `single`
 fn gemm_output<'a>(
-    math: EncoderMath,
     single: &'a mut CudaSlice<f32>,
     fp16: Option<&'a mut CudaSlice<u16>>,
-) -> Result<GemmOperand<'a>, TranscriptionError> {
-    match (math.fp16(), fp16) {
-        (false, _) => Ok(GemmOperand::Single(single.slice_mut(..))),
-        (true, Some(fp16)) => Ok(GemmOperand::Fp16(fp16.slice_mut(..))),
-        (true, None) => Err(mixed_precision()),
+) -> GemmOperand<'a> {
+    match fp16 {
+        Some(fp16) => GemmOperand::Fp16(fp16.slice_mut(..)),
+        None => GemmOperand::Single(single.slice_mut(..)),
     }
 }
 
-/// The activation a linear layer reads: `single`, or `fp16`, its FP16 copy, under
-/// [`EncoderMath::Fp16`]
-fn gemm_input<'a>(
-    math: EncoderMath,
-    single: CudaView<'a, f32>,
-    fp16: Option<CudaView<'a, u16>>,
-) -> Result<Operand<'a>, TranscriptionError> {
-    match (math.fp16(), fp16) {
-        (false, _) => Ok(Operand::Single(single)),
-        (true, Some(fp16)) => Ok(Operand::Fp16(fp16)),
-        (true, None) => Err(mixed_precision()),
+/// The activation a linear layer reads: `fp16`, its FP16 copy, where the workspace
+/// keeps one for FP16 linear layers, else `single`
+fn gemm_input<'a>(single: CudaView<'a, f32>, fp16: Option<CudaView<'a, u16>>) -> Operand<'a> {
+    match fp16 {
+        Some(fp16) => Operand::Fp16(fp16),
+        None => Operand::Single(single),
     }
 }
 

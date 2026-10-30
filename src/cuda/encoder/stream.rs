@@ -275,10 +275,9 @@ impl CudaEncoder {
         let mut pos = zeros(stream, self.layers.len() * positions * d)?;
         for (index, layer) in self.layers.iter().enumerate() {
             let table = gemm_input(
-                self.math,
                 table.slice(..),
                 table_f16.as_ref().map(|table| table.slice(..)),
-            )?;
+            );
             self.linear(
                 runtime,
                 linear(positions, d, d, 1.0, 0.0, self.math.single()),
@@ -532,7 +531,7 @@ impl CudaEncoder {
         self.linear(
             runtime,
             linear(rows_count, 3 * d, d, 1.0, 0.0, math),
-            normed_in(self.math, &ws.act.normed, ws.act.fp16.as_ref())?,
+            normed_in(&ws.act.normed, ws.act.fp16.as_ref()),
             &weights.qkv,
             &mut ws.act.qkv,
         )?;
@@ -551,10 +550,9 @@ impl CudaEncoder {
             &weights.bias_v.data().slice(..),
             &rows,
             gemm_output(
-                self.math,
                 &mut act.merged,
                 act.fp16.as_mut().map(|fp16| &mut fp16.merged),
-            )?,
+            ),
             geometry,
             index,
         )?;
@@ -569,7 +567,7 @@ impl CudaEncoder {
         self.linear(
             runtime,
             linear(rows_count, d, d, 1.0, 1.0, math),
-            merged_in(self.math, &act.merged, act.fp16.as_ref())?,
+            merged_in(&act.merged, act.fp16.as_ref()),
             &weights.out,
             &mut act.x,
         )?;
@@ -595,7 +593,7 @@ impl CudaEncoder {
         self.linear(
             runtime,
             linear(rows_count, 2 * d, d, 1.0, 0.0, math),
-            normed_in(self.math, &ws.act.normed, ws.act.fp16.as_ref())?,
+            normed_in(&ws.act.normed, ws.act.fp16.as_ref()),
             &weights.pointwise1,
             &mut ws.act.hidden.slice_mut(..pw1_len),
         )?;
@@ -613,10 +611,9 @@ impl CudaEncoder {
                 &weights.shift.data().slice(..),
             ),
             gemm_output(
-                self.math,
                 &mut act.merged,
                 act.fp16.as_mut().map(|fp16| &mut fp16.merged),
-            )?,
+            ),
             geometry,
             self.spec.conv_kernel,
             index,
@@ -634,7 +631,7 @@ impl CudaEncoder {
         self.linear(
             runtime,
             linear(rows_count, d, d, 1.0, 1.0, math),
-            merged_in(self.math, &act.merged, act.fp16.as_ref())?,
+            merged_in(&act.merged, act.fp16.as_ref()),
             &weights.pointwise2,
             &mut act.x,
         )?;
