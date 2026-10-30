@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use eyre::{Result, bail, eyre};
-use parakeet_rs::{ParakeetTDT, TimestampMode, Transcriber};
+use parakeet_rs::{ExecutionConfig, ParakeetTDT, TimestampMode, Transcriber};
 use scriptrs::{TimedToken, TranscriptionPipeline};
 
 const DEFAULT_DATASET: &str = "voxconverse";
@@ -30,7 +30,10 @@ fn run() -> Result<()> {
     let args = Args::parse(env::args().skip(1))?;
     let scriptrs_pipeline = TranscriptionPipeline::from_dir(&args.models_dir)?;
     let parakeet_dir = PreparedParakeetDir::new(&args.models_dir, &args.onnx_dir)?;
-    let mut parakeet = ParakeetTDT::from_pretrained(parakeet_dir.path(), None)?;
+    // ONNX Runtime allows one environment per process, and parakeet-rs needs it passed in
+    let environment = parakeet_rs::ort::init().build()?;
+    let config = ExecutionConfig::new().with_environment(environment);
+    let mut parakeet = ParakeetTDT::from_pretrained(parakeet_dir.path(), Some(config))?;
 
     match args.input.clone() {
         InputMode::Audio(audio_path) => {
