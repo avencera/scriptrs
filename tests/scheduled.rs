@@ -200,13 +200,13 @@ fn gpu_short_clips_transcribe_like_run() {
     let pipeline = TranscriptionPipeline::from_bundle(bundle()).expect("pipeline");
     let clips: Vec<(String, Arc<[f32]>)> = requests()
         .into_iter()
-        .filter(|(_, audio)| audio.len() <= pipeline.config().max_audio_samples)
+        .filter(|(_, audio)| audio.len() <= pipeline.deployment().hard_sample_max())
         .collect();
     let alone: Vec<TranscriptionResult> = clips
         .iter()
         .map(|(_, audio)| pipeline.run(audio).expect("run"))
         .collect();
-    let too_long = vec![0.0f32; pipeline.config().max_audio_samples + 1];
+    let too_long = vec![0.0f32; pipeline.deployment().hard_sample_max() + 1];
     let scheduler = pipeline
         .into_scheduler(SchedulerConfig::default())
         .expect("scheduler");

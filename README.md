@@ -45,29 +45,54 @@ The base crate exposes a single-chunk `TranscriptionPipeline`. Fast long-audio c
 
 ```toml
 [dependencies]
-scriptrs = "0.4"
+scriptrs = "0.5"
 ```
 
 For native CUDA on Linux:
 
 ```toml
 [dependencies]
-scriptrs = { version = "0.4", features = ["cuda"] }
+scriptrs = { version = "0.5", features = ["cuda"] }
 ```
 
 For fast long-form transcription:
 
 ```toml
 [dependencies]
-scriptrs = { version = "0.4", features = ["long-form"] }
+scriptrs = { version = "0.5", features = ["long-form"] }
 ```
 
 For VAD-backed long-form transcription:
 
 ```toml
 [dependencies]
-scriptrs = { version = "0.4", features = ["vad"] }
+scriptrs = { version = "0.5", features = ["vad"] }
 ```
+
+## Breaking changes in 0.5.0
+
+- `TranscriptionConfig` has only a `language` field. The frontend settings and
+  the single-chunk limit belong to the model's deployment, so read them from
+  `pipeline.deployment().frontend()` and `pipeline.deployment().hard_sample_max()`
+  instead of `pipeline.config()`. Write `TranscriptionConfig { language }` or
+  `TranscriptionConfig::default()` in place of
+  `TranscriptionConfig::from_deployment(..)`; `validate_for` is gone.
+- With `long-form`, `TranscriptionError::Cancelled`, `DeadlineExpired` and
+  `WindowLimitExceeded` are now wrapped in `TranscriptionError::Control`, with
+  the same messages. Match
+  `TranscriptionError::Control(TranscriptionControlError::Cancelled)` instead of
+  `TranscriptionError::Cancelled`, and likewise for the other two.
+- `VadConfig` is gone. The speech threshold is now
+  `VadSegmentationConfig::threshold`, still 0.5 by default: set
+  `config.segmentation.threshold` instead of `config.vad.default_threshold`.
+- `Vocabulary` loads only through a deployment, with
+  `Vocabulary::load(path, &deployment)` or
+  `Vocabulary::from_bytes(bytes, &deployment)`. `load` takes the deployment in
+  place of a `VocabKind`, and the two replace `load_for_deployment`,
+  `from_bytes_for_deployment` and the other `from_file`, `from_json` and
+  SentencePiece constructors. `VocabKind`,
+  `ModelLayout::vocab_kind` and `ParakeetDeployment::vocab_kind` are gone; the
+  deployment's version picks the tokenizer format.
 
 ## Python
 
@@ -394,7 +419,7 @@ fn load_mono_16khz_audio() -> Vec<f32> {
 }
 ```
 
-Enable `vad` when you want VAD-backed speech region planning for sparse speech, long silences, or recordings with a lot of non-speech audio. Windows with a speech probability of at least `config.vad.default_threshold` (0.5 by default) count as speech:
+Enable `vad` when you want VAD-backed speech region planning for sparse speech, long silences, or recordings with a lot of non-speech audio. Windows with a speech probability of at least `config.segmentation.threshold` (0.5 by default) count as speech:
 
 ```rust
 use scriptrs::{LongFormConfig, LongFormMode, LongFormTranscriptionPipeline};

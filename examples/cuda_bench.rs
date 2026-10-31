@@ -163,10 +163,7 @@ fn bench_manifest(
     scheduler_config: Option<SchedulerConfig>,
 ) -> Result<Bench> {
     let pipeline = TranscriptionPipeline::from_bundle(bundle)?;
-    let config = TranscriptionConfig {
-        language,
-        ..pipeline.config().clone()
-    };
+    let config = TranscriptionConfig { language };
     let mut utterances = load_manifest(manifest)?;
     utterances.sort_by(|a, b| b.audio.len().cmp(&a.audio.len()).then(a.id.cmp(&b.id)));
     let audio_s: f64 = utterances
@@ -185,7 +182,7 @@ fn bench_manifest(
         .map(|scheduler| {
             pipeline
                 .clone()
-                .into_scheduler_with_config(config.clone(), scheduler)
+                .into_scheduler_with_config(config, scheduler)
         })
         .transpose()?;
     let mut walls = Vec::with_capacity(repeats);
@@ -240,7 +237,7 @@ fn bench_long(bundle: ModelBundle, paths: &[PathBuf], args: &Args) -> Result<Ben
     if args.vad {
         config.mode = scriptrs::LongFormMode::Vad;
         if let Some(threshold) = args.vad_threshold {
-            config.vad.default_threshold = threshold;
+            config.segmentation.threshold = threshold;
         }
         if let Some(padding) = args.vad_padding {
             config.segmentation.speech_padding = padding;

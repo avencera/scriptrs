@@ -159,18 +159,6 @@ impl TranscriptionControl {
     }
 }
 
-impl From<TranscriptionControlError> for TranscriptionError {
-    fn from(error: TranscriptionControlError) -> Self {
-        match error {
-            TranscriptionControlError::Cancelled => Self::Cancelled,
-            TranscriptionControlError::DeadlineExpired => Self::DeadlineExpired,
-            TranscriptionControlError::WindowLimitExceeded { planned, limit } => {
-                Self::WindowLimitExceeded { planned, limit }
-            }
-        }
-    }
-}
-
 /// A validated half-open source range in the original 16 kHz recording
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceSampleRange {
@@ -310,7 +298,7 @@ where
     E: std::error::Error + Send + Sync + 'static,
 {
     fn from(error: TranscriptionControlError) -> Self {
-        Self::Transcription(error.into())
+        Self::Transcription(TranscriptionError::Control(error))
     }
 }
 

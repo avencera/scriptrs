@@ -388,7 +388,10 @@ fn benchmark_scriptrs(
     let benchmark_inputs: Vec<_> = chunks
         .iter()
         .map(|chunk| {
-            pad_audio_for_scriptrs(&chunk.audio, scriptrs_pipeline.config().max_audio_samples)
+            pad_audio_for_scriptrs(
+                &chunk.audio,
+                scriptrs_pipeline.deployment().hard_sample_max(),
+            )
         })
         .collect();
 
@@ -444,7 +447,7 @@ fn compare_chunk(
     chunk: &AudioChunk,
 ) -> Result<Comparison> {
     let padded_audio =
-        pad_audio_for_scriptrs(&chunk.audio, scriptrs_pipeline.config().max_audio_samples);
+        pad_audio_for_scriptrs(&chunk.audio, scriptrs_pipeline.deployment().hard_sample_max());
     let scriptrs_result = scriptrs_pipeline.run(&padded_audio)?;
     let parakeet_result =
         parakeet.transcribe_samples(padded_audio, 16_000, 1, Some(TimestampMode::Tokens))?;

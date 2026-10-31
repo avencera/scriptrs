@@ -27,7 +27,7 @@ use crate::config::TranscriptionConfig;
 use crate::decode::RawTranscription;
 use crate::error::TranscriptionError;
 use crate::model::{BatcherShape, Bucket, ModelBatcher};
-use crate::pipeline::{PreparedChunk, TranscriptionPipeline};
+use crate::pipeline::{ChunkSpec, PreparedChunk, TranscriptionPipeline};
 use crate::types::TranscriptionResult;
 
 /// Options for a [`TranscriptionScheduler`]
@@ -186,17 +186,9 @@ impl Planner {
 
     fn plan(&self, audio: &[f32]) -> Result<(Plan, Vec<WindowSpan>), TranscriptionError> {
         match self {
-            Self::Single { config, .. } => {
+            Self::Single { pipeline, .. } => {
                 // the same checks `run` makes, before any work is queued
-                if audio.is_empty() {
-                    return Err(TranscriptionError::EmptyAudio);
-                }
-                if audio.len() > config.max_audio_samples {
-                    return Err(TranscriptionError::AudioTooLong {
-                        max_seconds: config.max_duration_seconds(),
-                        actual_seconds: audio.len() as f64 / config.sample_rate as f64,
-                    });
-                }
+                pipeline.chunk_spec().check(audio)?;
                 let window = WindowSpan {
                     start: 0,
                     end: audio.len(),
@@ -220,7 +212,7 @@ impl Planner {
         plan: Plan,
         raws: Vec<RawTranscription>,
     ) -> Result<TranscriptionResult, TranscriptionError> {
-        let duration_seconds = audio_len as f64 / self.transcription().sample_rate as f64;
+        let duration_seconds = self.pipeline().chunk_spec().duration_seconds(audio_len);
         match (self, plan) {
             (Self::Single { pipeline, .. }, Plan::Single) => {
                 let raw = raws.into_iter().next().ok_or_else(|| {
@@ -285,7 +277,7 @@ impl TranscriptionPipeline {
         self,
         scheduler: SchedulerConfig,
     ) -> Result<TranscriptionScheduler, TranscriptionError> {
-        let config = self.config().clone();
+        let config = *self.config();
         self.into_scheduler_with_config(config, scheduler)
     }
 
@@ -296,7 +288,7 @@ impl TranscriptionPipeline {
         config: TranscriptionConfig,
         scheduler: SchedulerConfig,
     ) -> Result<TranscriptionScheduler, TranscriptionError> {
-        config.validate_for(self.deployment())?;
+        self.deployment().select_language(config.language)?;
         TranscriptionScheduler::start(
             Planner::Single {
                 pipeline: Box::new(self),
@@ -405,15 +397,15 @@ impl TranscriptionScheduler {
             frames_per_batch: config.frames_per_batch,
             min_batch: config.min_batch,
             max_batch: config.max_batch,
-            max_mel_frames: transcription.max_feature_frames(),
+            max_mel_frames: planner.pipeline().chunk_spec().max_feature_frames(),
         };
         let batcher = planner.pipeline().batcher(transcription.language, shape)?;
         let buckets = BucketOf(batcher.bucket_fn());
 
-        let transcription = transcription.clone();
+        let chunk = planner.pipeline().chunk_spec();
         let shared = Arc::new(Shared {
             planners: Planners::new(planner),
-            transcription,
+            chunk,
             config,
             buckets,
             state: Mutex::new(State::default()),
@@ -536,7 +528,7 @@ impl TranscriptionScheduler {
         }
         if request.windows.is_empty() {
             drop(state);
-            request.finish(Ok(()));
+            request.finish(Outcome::Done);
             return Ok(pending);
         }
 
@@ -598,7 +590,7 @@ impl PendingTranscription {
 impl Drop for PendingTranscription {
     fn drop(&mut self) {
         if !self.waited && self.request.progress().outcome.is_none() {
-            self.request.finish(Err(TranscriptionError::Cancelled));
+            self.request.finish(Outcome::Abandoned);
             self.shared.forget(self.request.id);
         }
     }
@@ -620,7 +612,18 @@ struct Progress {
     remaining: usize,
     plan: Option<Plan>,
     /// Set once every window is done, or at the first failure
-    outcome: Option<Result<(), TranscriptionError>>,
+    outcome: Option<Outcome>,
+}
+
+/// How a request ended
+enum Outcome {
+    /// Every window delivered its output
+    Done,
+    /// A window or the plan failed, or the scheduler stopped
+    Failed(TranscriptionError),
+    /// Nothing will read the outcome: the caller dropped its handle, or took the
+    /// error already
+    Abandoned,
 }
 
 impl Request {
@@ -633,7 +636,7 @@ impl Request {
     }
 
     /// Records the end of the request, unless it already ended
-    fn finish(&self, outcome: Result<(), TranscriptionError>) {
+    fn finish(&self, outcome: Outcome) {
         let mut progress = self.progress();
         if progress.outcome.is_none() {
             progress.outcome = Some(outcome);
@@ -651,10 +654,10 @@ impl Request {
                 .wait(progress)
                 .unwrap_or_else(PoisonError::into_inner);
         }
-        if let Some(Err(error)) = progress.outcome.as_mut() {
-            // the outcome stays set, so the request's windows still waiting see it
-            // has ended and never start
-            return Err(std::mem::replace(error, TranscriptionError::Cancelled));
+        // the outcome stays set, so the request's windows still waiting see it has
+        // ended and never start
+        if let Some(Outcome::Failed(error)) = progress.outcome.replace(Outcome::Abandoned) {
+            return Err(error);
         }
 
         let plan = progress.plan.take().ok_or_else(|| {
@@ -683,7 +686,7 @@ impl Request {
         if progress.remaining > 0 {
             return false;
         }
-        progress.outcome = Some(Ok(()));
+        progress.outcome = Some(Outcome::Done);
         self.done.notify_all();
         true
     }
@@ -702,8 +705,8 @@ struct BucketOf(Box<dyn Fn(usize) -> Bucket + Send + Sync>);
 
 struct Shared {
     planners: Planners,
-    /// The config every request is transcribed with
-    transcription: TranscriptionConfig,
+    /// The deployment's frontend and input limit, which workers prepare windows with
+    chunk: ChunkSpec,
     config: SchedulerConfig,
     buckets: BucketOf,
     state: Mutex<State>,
@@ -775,7 +778,7 @@ impl Shared {
 
     /// Fails `request` with `error` and forgets it
     fn fail(&self, request: &Request, error: TranscriptionError) {
-        request.finish(Err(error));
+        request.finish(Outcome::Failed(error));
         self.forget(request.id);
     }
 }
@@ -804,7 +807,9 @@ impl Drop for StopOnExit<'_> {
         state.buckets.clear();
         drop(state);
         for request in live {
-            request.finish(Err(TranscriptionError::SchedulerStopped(reason.clone())));
+            request.finish(Outcome::Failed(TranscriptionError::SchedulerStopped(
+                reason.clone(),
+            )));
         }
         self.0.wake_all();
     }
@@ -812,7 +817,7 @@ impl Drop for StopOnExit<'_> {
 
 /// A worker: prepares one window at a time, oldest request first
 fn prepare_windows(shared: &Shared) {
-    let preparer = TranscriptionPipeline::chunk_preparer(&shared.transcription);
+    let preparer = shared.chunk.preparer();
     while let Some((request, index)) = next_window(shared) {
         let span = request.windows[index];
         let prepared = preparer.prepare(&request.audio[span.start..span.end]);
@@ -1078,7 +1083,7 @@ mod tests {
     #[test]
     fn a_waited_error_leaves_the_request_ended() {
         let request = request(3);
-        request.finish(Err(TranscriptionError::EmptyAudio));
+        request.finish(Outcome::Failed(TranscriptionError::EmptyAudio));
 
         let waited = request.wait_windows();
         assert!(matches!(waited, Err(TranscriptionError::EmptyAudio)));

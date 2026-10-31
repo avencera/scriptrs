@@ -11,32 +11,6 @@ pub(crate) struct SampleRange {
     pub end: usize,
 }
 
-/// Runtime threshold configuration for the VAD model
-#[cfg(feature = "vad")]
-#[derive(Debug, Clone)]
-pub struct VadConfig {
-    /// Positive speech threshold applied to per-window probabilities
-    pub default_threshold: f32,
-}
-
-#[cfg(feature = "vad")]
-impl Default for VadConfig {
-    fn default() -> Self {
-        // Silero's own default; 0.85 dropped low-confidence phone and far-field
-        // speech, raising long-form WER on every set measured (README)
-        Self {
-            default_threshold: 0.5,
-        }
-    }
-}
-
-#[cfg(feature = "vad")]
-impl VadConfig {
-    pub(crate) fn validate(&self) -> Result<(), TranscriptionError> {
-        validate_probability("vad.default_threshold", self.default_threshold)
-    }
-}
-
 /// Segmentation parameters for converting VAD probabilities into speech regions
 ///
 /// The model hard sample maximum is not stored here. Pass
@@ -44,6 +18,8 @@ impl VadConfig {
 #[cfg(feature = "vad")]
 #[derive(Debug, Clone)]
 pub struct VadSegmentationConfig {
+    /// Speech probability at or above which a VAD window counts as speech
+    pub threshold: f32,
     /// Minimum speech span kept in the output
     pub min_speech_duration: f64,
     /// Minimum silence span required to end a speech region
@@ -64,6 +40,9 @@ pub struct VadSegmentationConfig {
 impl Default for VadSegmentationConfig {
     fn default() -> Self {
         Self {
+            // Silero's own default; 0.85 dropped low-confidence phone and far-field
+            // speech, raising long-form WER on every set measured (README)
+            threshold: 0.5,
             min_speech_duration: 0.15,
             min_silence_duration: 0.75,
             // Silero crosses the threshold up to ~220 ms into a soft onset, so 0.1 s
@@ -81,8 +60,8 @@ impl Default for VadSegmentationConfig {
 
 #[cfg(feature = "vad")]
 impl VadSegmentationConfig {
-    pub(crate) fn validate_for(&self, default_threshold: f32) -> Result<(), TranscriptionError> {
-        validate_probability("vad.default_threshold", default_threshold)?;
+    pub(crate) fn validate(&self) -> Result<(), TranscriptionError> {
+        validate_probability("vad.threshold", self.threshold)?;
         validate_positive_duration("vad.min_speech_duration", self.min_speech_duration)?;
         validate_positive_duration("vad.min_silence_duration", self.min_silence_duration)?;
         validate_positive_duration("vad.speech_padding", self.speech_padding)?;
@@ -101,9 +80,10 @@ impl VadSegmentationConfig {
 
         if let Some(negative_threshold) = self.negative_threshold {
             validate_probability("vad.negative_threshold", negative_threshold)?;
-            if negative_threshold > default_threshold {
+            if negative_threshold > self.threshold {
                 return Err(TranscriptionError::InvalidConfiguration(format!(
-                    "vad.negative_threshold={negative_threshold} exceeds vad.default_threshold={default_threshold}"
+                    "vad.negative_threshold={negative_threshold} exceeds vad.threshold={}",
+                    self.threshold
                 )));
             }
         }
@@ -111,15 +91,11 @@ impl VadSegmentationConfig {
         Ok(())
     }
 
-    pub(crate) fn threshold(&self, default_threshold: f32) -> f32 {
-        default_threshold
-    }
-
-    fn effective_negative_threshold(&self, base_threshold: f32) -> f32 {
+    fn effective_negative_threshold(&self) -> f32 {
         if let Some(override_threshold) = self.negative_threshold {
             return override_threshold;
         }
-        (base_threshold - self.negative_threshold_offset).max(0.01)
+        (self.threshold - self.negative_threshold_offset).max(0.01)
     }
 }
 
@@ -250,7 +226,6 @@ fn validate_positive_duration(field: &str, value: f64) -> Result<(), Transcripti
 pub(crate) fn detect_speech_regions(
     probabilities: &[f32],
     audio_length_samples: usize,
-    threshold: f32,
     config: &VadSegmentationConfig,
 ) -> Vec<SampleRange> {
     if probabilities.is_empty() || audio_length_samples == 0 {
@@ -261,7 +236,8 @@ pub(crate) fn detect_speech_regions(
     let min_speech_samples = (config.min_speech_duration * SAMPLE_RATE as f64) as usize;
     let min_silence_samples = (config.min_silence_duration * SAMPLE_RATE as f64) as usize;
     let speech_pad_samples = (config.speech_padding * SAMPLE_RATE as f64) as usize;
-    let negative_threshold = config.effective_negative_threshold(threshold);
+    let threshold = config.threshold;
+    let negative_threshold = config.effective_negative_threshold();
 
     let mut triggered = false;
     let mut current_speech_start = 0usize;
@@ -575,20 +551,27 @@ mod tests {
     use super::{OverlapChunkConfig, RegionTaskKind, SampleRange, build_fast_execution_plan};
     #[cfg(feature = "vad")]
     use super::{
-        VadConfig, VadSegmentationConfig, build_region_plan, detect_speech_regions,
-        plan_region_subsegments,
+        VadSegmentationConfig, build_region_plan, detect_speech_regions, plan_region_subsegments,
     };
     #[cfg(feature = "vad")]
     use crate::constants::VAD_WINDOW_SAMPLES;
     use crate::deployment::ParakeetDeployment;
     use crate::long_form::{LongFormConfig, LongFormMode};
 
+    /// Default segmentation with speech at or above `threshold`
+    #[cfg(feature = "vad")]
+    fn segmentation_at(threshold: f32) -> VadSegmentationConfig {
+        VadSegmentationConfig {
+            threshold,
+            ..VadSegmentationConfig::default()
+        }
+    }
+
     #[cfg(feature = "vad")]
     #[test]
     fn vad_defaults_lock_threshold_and_segmentation() {
-        let vad = VadConfig::default();
         let segmentation = VadSegmentationConfig::default();
-        assert_eq!(vad.default_threshold, 0.5);
+        assert_eq!(segmentation.threshold, 0.5);
         assert_eq!(segmentation.min_speech_duration, 0.15);
         assert_eq!(segmentation.min_silence_duration, 0.75);
         assert_eq!(segmentation.speech_padding, 0.2);
@@ -599,8 +582,9 @@ mod tests {
     fn vad_rejects_non_finite_or_out_of_range_probabilities() {
         for threshold in [f32::NAN, -0.01, 1.01] {
             assert!(
-                VadConfig {
-                    default_threshold: threshold,
+                VadSegmentationConfig {
+                    threshold,
+                    ..VadSegmentationConfig::default()
                 }
                 .validate()
                 .is_err()
@@ -611,19 +595,19 @@ mod tests {
             silence_threshold_for_split: 1.01,
             ..VadSegmentationConfig::default()
         };
-        assert!(segmentation.validate_for(0.85).is_err());
+        assert!(segmentation.validate().is_err());
 
         let segmentation = VadSegmentationConfig {
             negative_threshold: Some(f32::NAN),
             ..VadSegmentationConfig::default()
         };
-        assert!(segmentation.validate_for(0.85).is_err());
+        assert!(segmentation.validate().is_err());
 
         let segmentation = VadSegmentationConfig {
             negative_threshold_offset: -0.01,
             ..VadSegmentationConfig::default()
         };
-        assert!(segmentation.validate_for(0.85).is_err());
+        assert!(segmentation.validate().is_err());
     }
 
     #[cfg(feature = "vad")]
@@ -634,25 +618,25 @@ mod tests {
                 min_speech_duration: duration,
                 ..VadSegmentationConfig::default()
             };
-            assert!(segmentation.validate_for(0.85).is_err());
+            assert!(segmentation.validate().is_err());
 
             let segmentation = VadSegmentationConfig {
                 min_silence_duration: duration,
                 ..VadSegmentationConfig::default()
             };
-            assert!(segmentation.validate_for(0.85).is_err());
+            assert!(segmentation.validate().is_err());
 
             let segmentation = VadSegmentationConfig {
                 speech_padding: duration,
                 ..VadSegmentationConfig::default()
             };
-            assert!(segmentation.validate_for(0.85).is_err());
+            assert!(segmentation.validate().is_err());
 
             let segmentation = VadSegmentationConfig {
                 min_silence_at_max_speech: duration,
                 ..VadSegmentationConfig::default()
             };
-            assert!(segmentation.validate_for(0.85).is_err());
+            assert!(segmentation.validate().is_err());
         }
     }
 
@@ -663,8 +647,7 @@ mod tests {
         let regions = detect_speech_regions(
             &probabilities,
             probabilities.len() * VAD_WINDOW_SAMPLES,
-            0.85,
-            &VadSegmentationConfig::default(),
+            &segmentation_at(0.85),
         );
         assert_eq!(regions.len(), 1);
     }
@@ -675,12 +658,7 @@ mod tests {
         let probabilities = vec![0.9, 0.9, 0.9, 0.9];
         let audio_len = probabilities.len() * VAD_WINDOW_SAMPLES;
         assert!(audio_len as f64 / 16_000.0 < 0.15);
-        let regions = detect_speech_regions(
-            &probabilities,
-            audio_len,
-            0.85,
-            &VadSegmentationConfig::default(),
-        );
+        let regions = detect_speech_regions(&probabilities, audio_len, &segmentation_at(0.85));
         assert!(regions.is_empty());
     }
 
@@ -693,8 +671,7 @@ mod tests {
         let regions = detect_speech_regions(
             &probabilities,
             probabilities.len() * VAD_WINDOW_SAMPLES,
-            0.85,
-            &VadSegmentationConfig::default(),
+            &segmentation_at(0.85),
         );
         assert_eq!(regions.len(), 2);
     }
@@ -705,12 +682,7 @@ mod tests {
         let mut probabilities = vec![0.9; 16];
         probabilities.extend(std::iter::repeat_n(0.1, 25));
         let audio_len = probabilities.len() * VAD_WINDOW_SAMPLES;
-        let regions = detect_speech_regions(
-            &probabilities,
-            audio_len,
-            0.85,
-            &VadSegmentationConfig::default(),
-        );
+        let regions = detect_speech_regions(&probabilities, audio_len, &segmentation_at(0.85));
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].start, 0);
         assert_eq!(regions[0].end, 16 * VAD_WINDOW_SAMPLES + 3_200);

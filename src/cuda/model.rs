@@ -405,8 +405,7 @@ mod tests {
         .expect("model");
         let policy =
             DecodePolicy::new(&deployment, &vocab, LanguageSelection::Auto).expect("policy");
-        let extractor =
-            ParakeetFeatureExtractor::new(&TranscriptionConfig::from_deployment(&deployment));
+        let extractor = ParakeetFeatureExtractor::new(deployment.frontend());
 
         let reference = NemoReference::open(ParakeetVersion::V3, "b8");
         let audio = reference.f32("audio");
@@ -639,10 +638,9 @@ mod tests {
         let deployment = bundle.deployment().clone();
         let vocab = bundle.vocabulary().expect("vocabulary");
         let pipeline = TranscriptionPipeline::from_bundle(bundle).expect("pipeline");
-        let automatic = pipeline.config().clone();
+        let automatic = *pipeline.config();
         let english = TranscriptionConfig {
             language: LanguageSelection::Language(ParakeetLanguage::English),
-            ..automatic.clone()
         };
         let policy = DecodePolicy::new(&deployment, &vocab, english.language).expect("policy");
         let mask = policy

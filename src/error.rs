@@ -2,6 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::deployment::ParakeetVersion;
+#[cfg(feature = "long-form")]
+use crate::preprocessing::TranscriptionControlError;
 
 /// Errors returned by `scriptrs`
 #[derive(Debug, thiserror::Error)]
@@ -25,20 +27,11 @@ pub enum TranscriptionError {
         /// Index of the invalid sample in the validated input or window
         index: usize,
     },
-    /// The transcription was cancelled through its shared control state
-    #[error("transcription was cancelled")]
-    Cancelled,
-    /// The transcription's absolute deadline has passed
-    #[error("transcription deadline expired")]
-    DeadlineExpired,
-    /// The planned task count exceeded the request limit
-    #[error("transcription planned {planned} windows, exceeding the limit of {limit}")]
-    WindowLimitExceeded {
-        /// Number of windows in the completed plan
-        planned: usize,
-        /// Maximum number of windows allowed for the request
-        limit: usize,
-    },
+    /// Cancellation, the deadline or the window limit of the run's
+    /// [`crate::TranscriptionControl`] stopped it
+    #[cfg(feature = "long-form")]
+    #[error(transparent)]
+    Control(#[from] TranscriptionControlError),
     /// Required model assets were missing
     #[error("missing model asset: {path}")]
     MissingModelAsset {

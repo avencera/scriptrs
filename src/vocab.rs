@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::deployment::{ParakeetDeployment, VocabKind};
+use crate::deployment::{ParakeetDeployment, ParakeetVersion};
 use crate::error::TranscriptionError;
 use crate::language::ParakeetLanguage;
 
@@ -12,115 +12,48 @@ use crate::language::ParakeetLanguage;
 /// past the last tokenizer entry
 #[derive(Debug, Clone)]
 pub struct Vocabulary {
-    pub(crate) id_to_token: Vec<String>,
-    pub(crate) blank_id: usize,
+    id_to_token: Vec<String>,
+    blank_id: usize,
 }
 
 impl Vocabulary {
-    /// Parse a SentencePiece `vocab.txt` file
-    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, TranscriptionError> {
-        parse_file(path, None)
+    /// Load and validate the vocabulary file a deployment uses
+    ///
+    /// v2 reads a SentencePiece `vocab.txt` and v3 a JSON tokenizer such as
+    /// `parakeet_vocab.json`, whose table has no blank, so the deployment
+    /// supplies it
+    pub fn load(
+        path: impl AsRef<Path>,
+        deployment: &ParakeetDeployment,
+    ) -> Result<Self, TranscriptionError> {
+        let data = std::fs::read(path)?;
+        Self::from_bytes(&data, deployment)
     }
 
-    /// Parse a Parakeet JSON tokenizer such as `parakeet_vocab.json`
-    pub fn from_json(path: impl AsRef<Path>) -> Result<Self, TranscriptionError> {
-        let data = std::fs::read_to_string(path)?;
-        Self::from_json_str(&data)
-    }
-
-    /// Load a vocabulary using the parser owned by a deployment
-    pub fn load(path: impl AsRef<Path>, kind: VocabKind) -> Result<Self, TranscriptionError> {
-        let deployment = match kind {
-            VocabKind::SentencePieceTxt => ParakeetDeployment::v2(),
-            VocabKind::JsonTokenizer => ParakeetDeployment::v3(),
+    /// Parse and validate tokenizer bytes in the format a deployment uses
+    pub fn from_bytes(
+        data: &[u8],
+        deployment: &ParakeetDeployment,
+    ) -> Result<Self, TranscriptionError> {
+        let blank_id = Some(deployment.blank_id());
+        let vocabulary = match deployment.version() {
+            ParakeetVersion::V2 => {
+                parse_sentencepiece_text(utf8(data, "SentencePiece")?, blank_id)?
+            }
+            ParakeetVersion::V3 => parse_json_str(utf8(data, "JSON")?, blank_id)?,
         };
-        Self::load_for_deployment(path, &deployment)
-    }
-
-    /// Load and validate the vocabulary required by a deployment
-    pub fn load_for_deployment(
-        path: impl AsRef<Path>,
-        deployment: &ParakeetDeployment,
-    ) -> Result<Self, TranscriptionError> {
-        let data = std::fs::read(path)?;
-        Self::from_bytes_for_deployment(&data, deployment)
-    }
-
-    /// Parse tokenizer bytes using a deployment's exact blank contract
-    pub fn from_bytes_for_deployment(
-        data: &[u8],
-        deployment: &ParakeetDeployment,
-    ) -> Result<Self, TranscriptionError> {
-        match deployment.vocab_kind() {
-            VocabKind::SentencePieceTxt => {
-                Self::from_sentencepiece_bytes_for_deployment(data, deployment)
-            }
-            VocabKind::JsonTokenizer => {
-                let text = std::str::from_utf8(data).map_err(|error| {
-                    TranscriptionError::InvalidVocabulary(format!(
-                        "JSON tokenizer is not UTF-8: {error}"
-                    ))
-                })?;
-                Self::from_json_str_for_deployment(text, deployment)
-            }
-        }
-    }
-
-    /// Parse JSON tokenizer bytes without a filesystem path
-    pub fn from_json_str(data: &str) -> Result<Self, TranscriptionError> {
-        parse_json_str(data, None)
-    }
-
-    /// Parse a tokenizer using a deployment's exact blank contract
-    pub fn from_json_str_for_deployment(
-        data: &str,
-        deployment: &ParakeetDeployment,
-    ) -> Result<Self, TranscriptionError> {
-        if deployment.vocab_kind() != VocabKind::JsonTokenizer {
-            return Err(TranscriptionError::InvalidVocabulary(
-                "JSON tokenizer is not valid for this deployment".to_owned(),
-            ));
-        }
-
-        let vocabulary = parse_json_str(data, Some(deployment.blank_id()))?;
         deployment.validate_vocabulary(&vocabulary)?;
         Ok(vocabulary)
     }
 
-    /// Parse a `vocab.txt` file using a deployment's exact blank contract
-    pub fn from_file_for_deployment(
+    /// Parse a SentencePiece `vocab.txt` with an explicit blank token, for models
+    /// outside the Parakeet deployments
+    #[cfg(feature = "cuda")]
+    pub(crate) fn from_sentencepiece_file(
         path: impl AsRef<Path>,
-        deployment: &ParakeetDeployment,
     ) -> Result<Self, TranscriptionError> {
-        if deployment.vocab_kind() != VocabKind::SentencePieceTxt {
-            return Err(TranscriptionError::InvalidVocabulary(
-                "SentencePiece tokenizer is not valid for this deployment".to_owned(),
-            ));
-        }
-
         let data = std::fs::read(path)?;
-        Self::from_sentencepiece_bytes_for_deployment(&data, deployment)
-    }
-
-    /// Parse SentencePiece tokenizer bytes using a deployment's blank contract
-    pub fn from_sentencepiece_bytes_for_deployment(
-        data: &[u8],
-        deployment: &ParakeetDeployment,
-    ) -> Result<Self, TranscriptionError> {
-        if deployment.vocab_kind() != VocabKind::SentencePieceTxt {
-            return Err(TranscriptionError::InvalidVocabulary(
-                "SentencePiece tokenizer is not valid for this deployment".to_owned(),
-            ));
-        }
-
-        let text = std::str::from_utf8(data).map_err(|error| {
-            TranscriptionError::InvalidVocabulary(format!(
-                "SentencePiece tokenizer is not UTF-8: {error}"
-            ))
-        })?;
-        let vocabulary = parse_sentencepiece_text(text, Some(deployment.blank_id()))?;
-        deployment.validate_vocabulary(&vocabulary)?;
-        Ok(vocabulary)
+        parse_sentencepiece_text(utf8(&data, "SentencePiece")?, None)
     }
 
     /// Look up a token string by id
@@ -166,17 +99,11 @@ impl Vocabulary {
     }
 }
 
-fn parse_file(
-    path: impl AsRef<Path>,
-    expected_blank_id: Option<usize>,
-) -> Result<Vocabulary, TranscriptionError> {
-    let data = std::fs::read(path)?;
-    let text = std::str::from_utf8(&data).map_err(|error| {
-        TranscriptionError::InvalidVocabulary(format!(
-            "SentencePiece tokenizer is not UTF-8: {error}"
-        ))
-    })?;
-    parse_sentencepiece_text(text, expected_blank_id)
+/// The tokenizer file as text, naming its `format` when it is not UTF-8
+fn utf8<'a>(data: &'a [u8], format: &str) -> Result<&'a str, TranscriptionError> {
+    std::str::from_utf8(data).map_err(|error| {
+        TranscriptionError::InvalidVocabulary(format!("{format} tokenizer is not UTF-8: {error}"))
+    })
 }
 
 fn parse_sentencepiece_text(
@@ -212,7 +139,7 @@ fn parse_json_str(
             TranscriptionError::InvalidVocabulary(format!("invalid tokenizer json: {error}"))
         })?;
         let entries = tokens.into_iter().enumerate().collect();
-        return finish_json_entries(entries, expected_blank_id);
+        return finish_entries(entries, expected_blank_id);
     }
 
     if trimmed.starts_with('{') {
@@ -228,7 +155,7 @@ fn parse_json_str(
                     Ok((id, token))
                 })
                 .collect::<Result<Vec<_>, TranscriptionError>>()?;
-            return finish_json_entries(entries, expected_blank_id);
+            return finish_entries(entries, expected_blank_id);
         }
 
         if let Ok(map) = serde_json::from_str::<BTreeMap<String, u64>>(data) {
@@ -243,7 +170,7 @@ fn parse_json_str(
                     Ok((id, token))
                 })
                 .collect::<Result<Vec<_>, TranscriptionError>>()?;
-            return finish_json_entries(entries, expected_blank_id);
+            return finish_entries(entries, expected_blank_id);
         }
 
         return Err(TranscriptionError::InvalidVocabulary(
@@ -281,13 +208,6 @@ fn finish_entries(
     finish(id_to_token, blank_id.or(expected_blank_id))
 }
 
-fn finish_json_entries(
-    entries: Vec<(usize, String)>,
-    expected_blank_id: Option<usize>,
-) -> Result<Vocabulary, TranscriptionError> {
-    finish_entries(entries, expected_blank_id)
-}
-
 fn finish(
     id_to_token: Vec<String>,
     blank_id: Option<usize>,
@@ -310,21 +230,17 @@ fn finish(
     })
 }
 
-fn is_blank_token(token: &str) -> bool {
+/// Whether `token` is one of the tokenizer spellings of the RNNT blank
+pub(crate) fn is_blank_token(token: &str) -> bool {
     matches!(token, "<blk>" | "<blank>")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Vocabulary;
+    use super::{Vocabulary, parse_json_str};
     use crate::deployment::ParakeetDeployment;
     use crate::language::ParakeetLanguage;
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
-
-    fn fixture_path(relative: &str) -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
-    }
 
     #[test]
     fn blank_is_taken_from_the_explicit_token() {
@@ -340,12 +256,10 @@ mod tests {
         let path = tempfile::NamedTempFile::new().expect("temporary vocabulary should exist");
         std::fs::write(path.path(), data).expect("temporary vocabulary should be written");
 
-        let vocab = Vocabulary::from_file(path.path()).expect("v2 vocab should parse");
+        let vocab = Vocabulary::load(path.path(), &ParakeetDeployment::v2())
+            .expect("v2 vocab should match the deployment contract");
         assert_eq!(vocab.blank_id(), 1_024);
         assert_eq!(vocab.token(vocab.blank_id()), Some("<blk>"));
-        ParakeetDeployment::v2()
-            .validate_vocabulary(&vocab)
-            .expect("v2 fixture should match the deployment contract");
     }
 
     const V3_TOKENIZER_FIXTURE: &str = r#"{
@@ -362,24 +276,17 @@ mod tests {
 
     #[test]
     fn v3_json_tokenizer_fixture_has_language_tokens_and_blank() {
-        let vocab = Vocabulary::from_json_str(V3_TOKENIZER_FIXTURE)
-            .expect("v3 tokenizer fixture should parse");
+        let vocab =
+            parse_json_str(V3_TOKENIZER_FIXTURE, None).expect("v3 tokenizer fixture should parse");
         assert_eq!(vocab.token(vocab.blank_id()), Some("<blk>"));
         assert_eq!(vocab.language_of_token(3), Some(ParakeetLanguage::English));
         assert_eq!(vocab.language_of_token(4), Some(ParakeetLanguage::Polish));
         assert_eq!(vocab.language_of_token(5), Some(ParakeetLanguage::Russian));
-
-        let path = fixture_path("fixtures/models/parakeet-v3/parakeet_vocab.json");
-        if path.exists() {
-            let from_file = Vocabulary::from_json(&path).expect("on-disk v3 fixture should parse");
-            assert_eq!(from_file.blank_id(), vocab.blank_id());
-            assert_eq!(from_file.token(3), vocab.token(3));
-        }
     }
 
     #[test]
     fn json_tokenizer_without_blank_is_rejected() {
-        let error = Vocabulary::from_json_str(r#"{"0":"<unk>","1":"hello","2":"world"}"#)
+        let error = parse_json_str(r#"{"0":"<unk>","1":"hello","2":"world"}"#, None)
             .expect_err("an arbitrary tokenizer must not infer its blank id");
         assert!(matches!(
             error,
@@ -389,7 +296,7 @@ mod tests {
 
     #[test]
     fn sparse_json_ids_are_rejected_without_placeholder_tokens() {
-        let error = Vocabulary::from_json_str(r#"{"0":"<unk>","8191":"Œ"}"#)
+        let error = parse_json_str(r#"{"0":"<unk>","8191":"Œ"}"#, None)
             .expect_err("sparse tokenizer ids must not create empty placeholders");
         assert!(matches!(
             error,
@@ -399,7 +306,7 @@ mod tests {
 
     #[test]
     fn sparse_token_to_id_maps_are_rejected() {
-        let error = Vocabulary::from_json_str(r#"{"<unk>":0,"Œ":8191}"#)
+        let error = parse_json_str(r#"{"<unk>":0,"Œ":8191}"#, None)
             .expect_err("sparse token-to-id maps must be rejected at the parser boundary");
         assert!(matches!(
             error,
@@ -424,14 +331,14 @@ mod tests {
     fn published_v3_json_shape_uses_deployment_blank_8192() {
         let data = serde_json::to_string(&published_v3_tokens())
             .expect("published v3 tokenizer fixture should serialize");
-        let generic_error = Vocabulary::from_json_str(&data)
+        let generic_error = parse_json_str(&data, None)
             .expect_err("generic parsing must not infer a deployment blank");
         assert!(matches!(
             generic_error,
             crate::error::TranscriptionError::InvalidVocabulary(_)
         ));
 
-        let vocabulary = Vocabulary::from_json_str_for_deployment(&data, &ParakeetDeployment::v3())
+        let vocabulary = Vocabulary::from_bytes(data.as_bytes(), &ParakeetDeployment::v3())
             .expect("published v3 tokenizer should match the deployment contract");
         assert_eq!(vocabulary.len(), 8_192);
         assert_eq!(vocabulary.blank_id(), 8_192);
@@ -444,7 +351,7 @@ mod tests {
         let mut tokens = published_v3_tokens();
         tokens.insert("8191".to_owned(), "<blk>".to_owned());
         let data = serde_json::to_string(&tokens).expect("wrong-blank fixture should serialize");
-        let error = Vocabulary::from_json_str_for_deployment(&data, &ParakeetDeployment::v3())
+        let error = Vocabulary::from_bytes(data.as_bytes(), &ParakeetDeployment::v3())
             .expect_err("v3 must reject a blank inside the tokenizer table");
         assert!(matches!(
             error,
@@ -457,7 +364,7 @@ mod tests {
         let data = "a 0\nb 1\n";
         let path = tempfile::NamedTempFile::new().expect("temporary vocabulary should exist");
         std::fs::write(path.path(), data).expect("temporary vocabulary should be written");
-        let error = Vocabulary::from_file_for_deployment(path.path(), &ParakeetDeployment::v2())
+        let error = Vocabulary::load(path.path(), &ParakeetDeployment::v2())
             .expect_err("v2 must require its explicit blank token");
         assert!(matches!(
             error,
@@ -471,7 +378,7 @@ mod tests {
             .map(|id| (id.to_string(), format!("token-{id}")))
             .collect();
         let data = serde_json::to_string(&tokens).expect("wrong-size fixture should serialize");
-        let error = Vocabulary::from_json_str_for_deployment(&data, &ParakeetDeployment::v3())
+        let error = Vocabulary::from_bytes(data.as_bytes(), &ParakeetDeployment::v3())
             .expect_err("v3 must require the published tokenizer size");
         assert!(matches!(
             error,

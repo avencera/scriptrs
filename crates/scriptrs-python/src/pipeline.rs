@@ -110,8 +110,7 @@ impl PyPipeline {
 
     #[getter]
     fn max_chunk_seconds(&self) -> f64 {
-        let transcription = &self.config.transcription;
-        transcription.max_audio_samples as f64 / transcription.sample_rate as f64
+        self.deployment.hard_sample_max() as f64 / self.deployment.frontend().sample_rate() as f64
     }
 
     #[pyo3(signature = (samples, language=None))]

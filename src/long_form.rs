@@ -28,7 +28,7 @@ const NATIVE_OVERLAP_SECONDS: f64 = 8.0;
 #[cfg(feature = "cuda")]
 const NATIVE_BATCH_SIZE: usize = 16;
 #[cfg(feature = "vad")]
-pub use planner::{VadConfig, VadSegmentationConfig};
+pub use planner::VadSegmentationConfig;
 
 use self::execute::{RunRequest, execute_plan, transcribe_task};
 use self::merge::merge_overlapping_windows;
@@ -78,9 +78,6 @@ pub struct LongFormConfig {
     pub batch_size: usize,
     /// Single-chunk transcription settings
     pub transcription: TranscriptionConfig,
-    /// VAD processing settings
-    #[cfg(feature = "vad")]
-    pub vad: VadConfig,
     /// VAD segmentation settings
     #[cfg(feature = "vad")]
     pub segmentation: VadSegmentationConfig,
@@ -101,9 +98,7 @@ impl LongFormConfig {
             mode: LongFormMode::default(),
             worker_count: 4,
             batch_size: 1,
-            transcription: TranscriptionConfig::from_deployment(deployment),
-            #[cfg(feature = "vad")]
-            vad: VadConfig::default(),
+            transcription: TranscriptionConfig::default(),
             #[cfg(feature = "vad")]
             segmentation: VadSegmentationConfig::default(),
             overlap: OverlapChunkConfig::from_deployment(deployment),
@@ -137,14 +132,11 @@ impl LongFormConfig {
                 "long-form batch_size must be positive".to_owned(),
             ));
         }
-        self.transcription.validate_for(deployment)?;
+        deployment.select_language(self.transcription.language)?;
         self.overlap.validate_for(deployment)?;
 
         #[cfg(feature = "vad")]
-        {
-            self.vad.validate()?;
-            self.segmentation.validate_for(self.vad.default_threshold)?;
-        }
+        self.segmentation.validate()?;
 
         Ok(())
     }
@@ -262,7 +254,7 @@ impl LongFormTranscriptionPipeline {
             control,
             preprocessor,
         };
-        if audio.len() <= config.transcription.max_audio_samples {
+        if audio.len() <= self.inner.chunk_spec().max_samples() {
             control.check_plan(1)?;
             return self.run_single_task(request);
         }
@@ -278,15 +270,7 @@ impl LongFormTranscriptionPipeline {
         let control = TranscriptionControl::internal_unbounded();
         let config = &self.default_config;
         config.validate_for(self.inner.deployment())?;
-        if audio.is_empty() {
-            return Err(TranscriptionError::EmptyAudio);
-        }
-        if audio.len() > config.transcription.max_audio_samples {
-            return Err(TranscriptionError::AudioTooLong {
-                max_seconds: config.transcription.max_duration_seconds(),
-                actual_seconds: audio.len() as f64 / config.transcription.sample_rate as f64,
-            });
-        }
+        self.inner.chunk_spec().check(audio)?;
         validate_finite_samples(audio, 0)?;
         control.check_plan(1).map_err(TranscriptionError::from)?;
         self.run_single_task(RunRequest {
@@ -340,15 +324,10 @@ impl LongFormTranscriptionPipeline {
             .ok_or_else(|| self.inner.bundle().missing_vad_error())
             .map_err(PreprocessedTranscriptionError::from)?;
         let probabilities = vad
-            .process(audio, &config.vad, control)
+            .process(audio, control)
             .map_err(PreprocessedTranscriptionError::from)?;
         control.check()?;
-        let regions = detect_speech_regions(
-            &probabilities,
-            audio.len(),
-            config.segmentation.threshold(config.vad.default_threshold),
-            &config.segmentation,
-        );
+        let regions = detect_speech_regions(&probabilities, audio.len(), &config.segmentation);
         let execution_plan = build_vad_execution_plan(&regions, &probabilities, config);
         control.check_plan(execution_plan.tasks.len())?;
         self.run_plan(request, execution_plan)
@@ -525,7 +504,7 @@ impl LongFormTranscriptionPipeline {
             return Err(TranscriptionError::EmptyAudio);
         }
         validate_finite_samples(audio, 0)?;
-        if audio.len() <= config.transcription.max_audio_samples {
+        if audio.len() <= self.inner.chunk_spec().max_samples() {
             return Ok(ScheduledPlan::Single);
         }
 
@@ -538,13 +517,9 @@ impl LongFormTranscriptionPipeline {
                     .vad
                     .as_ref()
                     .ok_or_else(|| self.inner.bundle().missing_vad_error())?;
-                let probabilities = vad.process(audio, &config.vad, &control)?;
-                let regions = detect_speech_regions(
-                    &probabilities,
-                    audio.len(),
-                    config.segmentation.threshold(config.vad.default_threshold),
-                    &config.segmentation,
-                );
+                let probabilities = vad.process(audio, &control)?;
+                let regions =
+                    detect_speech_regions(&probabilities, audio.len(), &config.segmentation);
                 build_vad_execution_plan(&regions, &probabilities, config)
             }
         };
@@ -692,7 +667,7 @@ mod tests {
     use crate::preprocessing::PreprocessedTranscriptionError;
     use crate::preprocessing::{AudioWindowMut, TranscriptionControl};
     #[cfg(feature = "cuda")]
-    use crate::preprocessing::{TranscriptionDeadline, WindowLimit};
+    use crate::preprocessing::{TranscriptionControlError, TranscriptionDeadline, WindowLimit};
     #[cfg(all(feature = "cuda", feature = "vad"))]
     use crate::test_support::NemoReference;
 
@@ -762,7 +737,7 @@ mod tests {
     fn long_form_config_rejects_invalid_vad_threshold() {
         let deployment = ParakeetDeployment::v3();
         let mut config = LongFormConfig::from_deployment(&deployment);
-        config.vad.default_threshold = f32::NAN;
+        config.segmentation.threshold = f32::NAN;
 
         assert!(config.validate_for(&deployment).is_err());
     }
@@ -839,7 +814,7 @@ mod tests {
             "the native defaults must select the batched path"
         );
         assert!(
-            LONG_AUDIO_SAMPLES > config.transcription.max_audio_samples,
+            LONG_AUDIO_SAMPLES > bundle.deployment().hard_sample_max(),
             "the audio must exceed the single-input limit"
         );
 
@@ -978,9 +953,9 @@ mod tests {
             assert!(
                 matches!(
                     error,
-                    PreprocessedTranscriptionError::Transcription(
-                        TranscriptionError::DeadlineExpired
-                    )
+                    PreprocessedTranscriptionError::Transcription(TranscriptionError::Control(
+                        TranscriptionControlError::DeadlineExpired
+                    ))
                 ),
                 "{path:?} returned {error}"
             );
@@ -1041,7 +1016,9 @@ mod tests {
             assert!(
                 matches!(
                     error,
-                    PreprocessedTranscriptionError::Transcription(TranscriptionError::Cancelled)
+                    PreprocessedTranscriptionError::Transcription(TranscriptionError::Control(
+                        TranscriptionControlError::Cancelled
+                    ))
                 ),
                 "{path:?} returned {error}"
             );
@@ -1172,11 +1149,7 @@ mod tests {
             .expect("native VAD should load")
             .expect("the native bundle should have a VAD model");
         let ours = vad
-            .process(
-                audio,
-                &LongFormConfig::default().vad,
-                &TranscriptionControl::internal_unbounded(),
-            )
+            .process(audio, &TranscriptionControl::internal_unbounded())
             .expect("VAD scan");
         (
             ours,
@@ -1192,12 +1165,7 @@ mod tests {
         audio_len: usize,
         config: &LongFormConfig,
     ) -> (Vec<SampleRange>, Vec<(usize, usize)>) {
-        let regions = detect_speech_regions(
-            probabilities,
-            audio_len,
-            config.segmentation.threshold(config.vad.default_threshold),
-            &config.segmentation,
-        );
+        let regions = detect_speech_regions(probabilities, audio_len, &config.segmentation);
         let mut tasks = Vec::new();
         for region in &regions {
             build_region_plan(*region, probabilities, config, &mut tasks);
@@ -1265,11 +1233,7 @@ mod tests {
             .as_ref()
             .expect("the native bundle has a VAD model");
         let probabilities = vad
-            .process(
-                audio,
-                &config.vad,
-                &TranscriptionControl::internal_unbounded(),
-            )
+            .process(audio, &TranscriptionControl::internal_unbounded())
             .expect("VAD scan");
         let (_, windows) = speech_plan(&probabilities, audio.len(), config);
         windows
@@ -1287,7 +1251,7 @@ mod tests {
     fn gpu_vad_runs_the_preprocessor_once_per_planned_speech_window() {
         let (pipeline, base) = native_vad_pipeline();
         let (audio, gap_midpoints) = sparse_speech();
-        assert!(audio.len() > base.transcription.max_audio_samples);
+        assert!(audio.len() > pipeline.base_pipeline().deployment().hard_sample_max());
 
         for path in [
             ExecutionPath::Serial,

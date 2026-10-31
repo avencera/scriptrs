@@ -13,7 +13,7 @@ use crate::error::TranscriptionError;
 use crate::pipeline::{ChunkPreparer, PreparedWindow, TranscriptionPipeline};
 use crate::preprocessing::{
     AudioWindowMut, PreprocessedTranscriptionError, SourceSampleRange, TranscriptionControl,
-    WindowIndex, WindowPreprocessor,
+    TranscriptionControlError, WindowIndex, WindowPreprocessor,
 };
 
 /// One long-form run's input, shared by every execution path
@@ -34,10 +34,6 @@ impl<P: ?Sized> Clone for RunRequest<'_, P> {
 impl<P: ?Sized> Copy for RunRequest<'_, P> {}
 
 impl<'a, P: ?Sized> RunRequest<'a, P> {
-    fn chunk_preparer(&self) -> ChunkPreparer {
-        TranscriptionPipeline::chunk_preparer(&self.config.transcription)
-    }
-
     /// Context for running this request's windows through `pipeline`
     pub(super) fn task_context<'p>(self, pipeline: &'p TranscriptionPipeline) -> TaskContext<'p, P>
     where
@@ -45,7 +41,7 @@ impl<'a, P: ?Sized> RunRequest<'a, P> {
     {
         TaskContext {
             pipeline,
-            preparer: self.chunk_preparer(),
+            preparer: pipeline.chunk_spec().preparer(),
             request: self,
         }
     }
@@ -106,6 +102,8 @@ fn run_batched_plan<P: WindowPreprocessor + ?Sized>(
     let worker_count = parallel_worker_count(tasks.len(), config.worker_count);
     let next_task = AtomicUsize::new(0);
     let lookahead = Lookahead::new(batch_size);
+    // the pipeline is not `Sync`, so each worker builds its preparer from this
+    let chunk = pipeline.chunk_spec();
 
     thread::scope(
         |scope| -> Result<Vec<_>, PreprocessedTranscriptionError<P::Error>> {
@@ -118,7 +116,7 @@ fn run_batched_plan<P: WindowPreprocessor + ?Sized>(
                     // drop their senders, the model side sees the channel close,
                     // and the scope's join raises the panic instead of hanging
                     let _stop_on_panic = StopOnPanic(lookahead);
-                    let preparer = request.chunk_preparer();
+                    let preparer = chunk.preparer();
                     loop {
                         let task_idx = next_task.fetch_add(1, Ordering::Relaxed);
                         let Some(task) = tasks.get(task_idx) else {
@@ -438,9 +436,9 @@ where
 {
     matches!(
         error,
-        PreprocessedTranscriptionError::Transcription(
-            TranscriptionError::Cancelled | TranscriptionError::DeadlineExpired
-        )
+        PreprocessedTranscriptionError::Transcription(TranscriptionError::Control(
+            TranscriptionControlError::Cancelled | TranscriptionControlError::DeadlineExpired
+        ))
     )
 }
 
