@@ -9,6 +9,7 @@
 mod prompt;
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 
@@ -17,8 +18,8 @@ use cudakit::{Graph, Library, Options};
 use crate::cuda::decoder::{CudaDecoder, DecodeRow, DecodeWorkspace, DecoderStates};
 use crate::cuda::encoder::{ChunkRow, CudaEncoder, StreamCaches, StreamWorkspace};
 use crate::cuda::kernels::CudaRuntime;
-use crate::cuda::math;
-use crate::cuda::model::{ExclusiveTeardown, STEPS_PER_CHECK, exclusive_device_work};
+use crate::cuda::model::{ExclusiveTeardown, exclusive_device_work};
+use crate::cuda::{math, replay_or_capture};
 use crate::decode::RawTranscription;
 use crate::error::TranscriptionError;
 use crate::models::Precision;
@@ -216,18 +217,16 @@ impl StreamEngine {
         // the lock guards device buffers a panic leaves no worse than an error does
         let mut device = engine.device.lock().unwrap_or_else(PoisonError::into_inner);
         let device = &mut *device;
-        if !device.shapes.contains_key(&batch) {
-            let _exclusive = exclusive_device_work();
-            let shape = engine
-                .shape(&device.caches, batch)
-                .map_err(RunError::before)?;
-            device.shapes.insert(batch, shape);
-        }
-        let shape = device.shapes.get_mut(&batch).ok_or_else(|| {
-            RunError::before(TranscriptionError::InvalidModelOutput(
-                "a streaming shape went missing".to_owned(),
-            ))
-        })?;
+        let shape = match device.shapes.entry(batch) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let _exclusive = exclusive_device_work();
+                let shape = engine
+                    .shape(&device.caches, batch)
+                    .map_err(RunError::before)?;
+                entry.insert(shape)
+            }
+        };
         let rows = engine
             .stage(shape, &device.caches, chunks)
             .map_err(RunError::before)?;
@@ -372,24 +371,15 @@ impl Engine {
         chunks: usize,
     ) -> Result<Vec<RawTranscription>, TranscriptionError> {
         let runtime = &self.runtime;
-        match &shape.encoder_graph {
-            Some(graph) => graph.launch()?,
-            None => {
-                self.enqueue(caches, &mut shape.encoder, shape.prompt.as_mut())?;
-                let encoder_ws = &mut shape.encoder;
-                let prompt_ws = &mut shape.prompt;
-                let _exclusive = exclusive_device_work();
-                // SAFETY: the graph is stored in the same `Shape` as the workspace it
-                // records, ahead of it, and the shapes drop before the caches; none of
-                // their buffers is ever reallocated, and every launch is on the
-                // runtime's stream. The closure returns errors instead of panicking
-                let graph = unsafe {
-                    runtime
-                        .capture_nonempty(|| self.enqueue(caches, encoder_ws, prompt_ws.as_mut()))
-                }?;
-                shape.encoder_graph = Some(graph);
-            }
-        }
+        // SAFETY: the graph is stored in the same `Shape` as the workspaces it
+        // records, ahead of them, and the shapes drop before the caches; none of their
+        // buffers is ever reallocated, and every launch is on the runtime's stream.
+        // The encoder and projector return errors instead of panicking
+        unsafe {
+            replay_or_capture(runtime, &mut shape.encoder_graph, || {
+                self.enqueue(caches, &mut shape.encoder, shape.prompt.as_mut())
+            })
+        }?;
 
         let lens: Vec<usize> = shape
             .encoder
@@ -417,28 +407,11 @@ impl Engine {
             states,
             &decode_rows,
         )?;
-        match &shape.decode_graph {
-            Some(graph) => {
-                self.decoder
-                    .run_with(runtime, &mut shape.decoder, STEPS_PER_CHECK, |_| {
-                        Ok(graph.launch()?)
-                    })?
-            }
-            None => {
-                self.decoder
-                    .run(runtime, &mut shape.decoder, STEPS_PER_CHECK)?;
-                let decoder_ws = &mut shape.decoder;
-                let _exclusive = exclusive_device_work();
-                // SAFETY: as for the encoder graph above
-                let graph = unsafe {
-                    runtime.capture_nonempty(|| {
-                        (0..STEPS_PER_CHECK)
-                            .try_for_each(|_| self.decoder.step(runtime, decoder_ws))
-                    })
-                }?;
-                shape.decode_graph = Some(graph);
-            }
-        }
+        // SAFETY: as for the encoder graph above
+        unsafe {
+            self.decoder
+                .run_graphed(runtime, &mut shape.decoder, &mut shape.decode_graph)
+        }?;
         self.decoder.save(runtime, &shape.decoder, states)?;
 
         let mut decoded = self.decoder.output(runtime, &mut shape.decoder)?;

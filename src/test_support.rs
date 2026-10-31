@@ -13,12 +13,20 @@ use memmap2::Mmap;
 use ndarray::{ArrayD, IxDyn};
 use safetensors::{Dtype, SafeTensors};
 
-use crate::deployment::ParakeetVersion;
+use crate::deployment::{ParakeetDeployment, ParakeetVersion};
 
 const DEFAULT_REFERENCE_DIR: &str = "/shared/datasets/parakeet-ref";
 
 #[cfg(feature = "cuda")]
 const DEFAULT_STREAM_REFERENCE_DIR: &str = "/shared/datasets/nemotron-stream-ref";
+
+/// The stock deployment of `version`, the one its references were dumped from
+pub(crate) fn deployment(version: ParakeetVersion) -> ParakeetDeployment {
+    match version {
+        ParakeetVersion::V2 => ParakeetDeployment::v2(),
+        ParakeetVersion::V3 => ParakeetDeployment::v3(),
+    }
+}
 
 /// One reference set (`b1` or `b8`) for one Parakeet version
 pub(crate) struct NemoReference {

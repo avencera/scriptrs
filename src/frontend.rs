@@ -482,8 +482,7 @@ mod tests {
 
     /// Frontend output against NeMo's `mel` for the same audio, over NeMo's valid frames
     fn assert_matches_nemo_mel(version: crate::deployment::ParakeetVersion) {
-        use crate::deployment::ParakeetDeployment;
-        use crate::test_support::NemoReference;
+        use crate::test_support::{NemoReference, deployment};
 
         let reference = NemoReference::open(version, "b1");
         let audio = reference.f32("audio");
@@ -491,12 +490,9 @@ mod tests {
         let mel = reference.f32("mel");
         let mel_len = reference.i64("mel_len")[0] as usize;
 
-        let deployment = match version {
-            crate::deployment::ParakeetVersion::V2 => ParakeetDeployment::v2(),
-            crate::deployment::ParakeetVersion::V3 => ParakeetDeployment::v3(),
-        };
-        let extractor =
-            ParakeetFeatureExtractor::new(&TranscriptionConfig::from_deployment(&deployment));
+        let extractor = ParakeetFeatureExtractor::new(&TranscriptionConfig::from_deployment(
+            &deployment(version),
+        ));
         let samples: Vec<f32> = audio.iter().take(audio_len).copied().collect();
         let features = extractor.extract(&samples).unwrap();
 

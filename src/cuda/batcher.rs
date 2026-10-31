@@ -16,12 +16,13 @@ use cudakit::Graph;
 use cudakit::cudarc::driver::CudaSlice;
 
 use crate::backend::{EncoderChunk, LanguageMask};
+use crate::cuda::decoder::STEPS_PER_CHECK;
 use crate::cuda::decoder::{Admission, DecodeLane};
 use crate::cuda::encoder::EncoderWorkspace;
 use crate::cuda::model::{
-    CACHE_SHARE_DIVISOR, CudaModel, Engine, MEL_BUCKET, STEPS_PER_CHECK, exclusive_device_work,
+    CACHE_SHARE_DIVISOR, CudaModel, Engine, MEL_BUCKET, exclusive_device_work,
 };
-use crate::cuda::zeros;
+use crate::cuda::{capture, zeros};
 use crate::error::TranscriptionError;
 use crate::model::FinishedRows;
 
@@ -265,13 +266,12 @@ impl CudaBatcher {
         })?;
         if graph.is_none() {
             let ws = lane.workspace();
-            let _exclusive = exclusive_device_work();
             // SAFETY: the graphs are stored in `Parts` ahead of the lane whose buffers
             // they record, so they drop first; the buffers are never reallocated, and
             // every launch is on the runtime's stream. Capture records the steps
             // without running them, so the lane's state is unchanged
             let graph = unsafe {
-                runtime.capture_nonempty(|| {
+                capture(runtime, || {
                     (0..STEPS_PER_CHECK).try_for_each(|_| decoder.step_rows(runtime, ws, span))
                 })
             }?;

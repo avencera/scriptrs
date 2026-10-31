@@ -76,11 +76,6 @@ impl Scheme {
         }
     }
 
-    /// Whether the product reads FP16 activations and a dequantized FP16 weight
-    pub(crate) fn weight_only(self) -> bool {
-        self == Self::Int8
-    }
-
     /// The name of the scheme in a quantized weight file's metadata
     pub(crate) fn name(self) -> &'static str {
         match self {
@@ -370,7 +365,7 @@ impl QuantKernels {
 
     /// NVFP4 of rows of `width` with the tensor scale from `partials`, and `alpha[0] =
     /// alpha_base * tensor scale`
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "launchers mirror their kernel's parameter list so each launch reads against it"
     )]
