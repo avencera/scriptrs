@@ -278,7 +278,7 @@ impl Weights {
         let count = windows.len() / VAD_INPUT_SAMPLES;
         let features = self.encode(windows);
         matmul_t(&features, &self.input_gates, gates, count, HIDDEN, GATES);
-        for row in gates.chunks_exact_mut(GATES) {
+        for row in gates.as_chunks_mut::<GATES>().0 {
             for (gate, bias) in row.iter_mut().zip(&self.gate_bias) {
                 *gate += bias;
             }
@@ -306,15 +306,17 @@ impl Weights {
         let mut frames = vec![0.0; count * FRAMES * FILTER];
         let mut padded = [0.0f32; VAD_INPUT_SAMPLES + REFLECT_PAD];
         for (window, frames) in windows
-            .chunks_exact(VAD_INPUT_SAMPLES)
-            .zip(frames.chunks_exact_mut(FRAMES * FILTER))
+            .as_chunks::<VAD_INPUT_SAMPLES>()
+            .0
+            .iter()
+            .zip(frames.as_chunks_mut::<{ FRAMES * FILTER }>().0)
         {
             padded[..VAD_INPUT_SAMPLES].copy_from_slice(window);
             for offset in 0..REFLECT_PAD {
                 // reflection excludes the edge sample, as `ReflectionPad1d` does
                 padded[VAD_INPUT_SAMPLES + offset] = window[VAD_INPUT_SAMPLES - 2 - offset];
             }
-            for (frame, out) in frames.chunks_exact_mut(FILTER).enumerate() {
+            for (frame, out) in frames.as_chunks_mut::<FILTER>().0.iter_mut().enumerate() {
                 out.copy_from_slice(&padded[frame * HOP..frame * HOP + FILTER]);
             }
         }
@@ -329,7 +331,9 @@ impl Weights {
             2 * BINS,
         );
         spectrum
-            .chunks_exact(2 * BINS)
+            .as_chunks::<{ 2 * BINS }>()
+            .0
+            .iter()
             .flat_map(|row| {
                 let (real, imaginary) = row.split_at(BINS);
                 real.iter()
@@ -341,7 +345,7 @@ impl Weights {
 
     /// Recurrence over the input gates of consecutive windows, `[windows, GATES]`
     fn recur(&self, gates: &mut [f32], state: &mut SileroState, probabilities: &mut Vec<f32>) {
-        for gates in gates.chunks_exact_mut(GATES) {
+        for gates in gates.as_chunks_mut::<GATES>().0 {
             probabilities.push(self.step(gates, state));
         }
     }
@@ -475,11 +479,11 @@ const TILE: usize = 64;
 /// times slower
 #[inline(always)]
 fn recurrent(gates: &mut [f32], h: &[f32], recurrent_tiles: &[f32]) {
-    for (tile_index, tile) in gates.chunks_exact_mut(TILE).enumerate() {
+    for (tile_index, tile) in gates.as_chunks_mut::<TILE>().0.iter_mut().enumerate() {
         let mut sums = [0.0f32; TILE];
         sums.copy_from_slice(tile);
         let tile_weights = &recurrent_tiles[tile_index * HIDDEN * TILE..][..HIDDEN * TILE];
-        for (h, weights) in h.iter().zip(tile_weights.chunks_exact(TILE)) {
+        for (h, weights) in h.iter().zip(tile_weights.as_chunks::<TILE>().0) {
             for (sum, weight) in sums.iter_mut().zip(weights) {
                 *sum += h * weight;
             }

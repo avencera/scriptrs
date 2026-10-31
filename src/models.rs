@@ -7,7 +7,7 @@ use crate::vocab::Vocabulary;
 #[cfg(all(feature = "online", feature = "cuda"))]
 use crate::deployment::ParakeetVersion;
 #[cfg(feature = "online")]
-use hf_hub::{Repo, RepoType};
+use crate::hf::{Hub, HubError, HubRepo};
 
 #[cfg(feature = "vad")]
 const VAD_DIR: &str = "vad/silero-vad.mlmodelc";
@@ -499,7 +499,7 @@ impl ModelBundle {
     ///
     /// By default this resolves models from the pinned `avencera/scriptrs-models`
     /// snapshot. Set `SCRIPTRS_MODELS_DIR` to force a local bundle.
-    pub fn from_pretrained() -> Result<Self, hf_hub::api::sync::ApiError> {
+    pub fn from_pretrained() -> Result<Self, HubError> {
         Self::from_pretrained_with_deployment(ParakeetDeployment::v2())
     }
 
@@ -507,7 +507,7 @@ impl ModelBundle {
     /// Download a Parakeet bundle for an explicit deployment
     pub fn from_pretrained_with_deployment(
         deployment: ParakeetDeployment,
-    ) -> Result<Self, hf_hub::api::sync::ApiError> {
+    ) -> Result<Self, HubError> {
         if let Ok(models_dir) = std::env::var(SCRIPTRS_MODELS_DIR_ENV) {
             return Ok(Self::from_dir_with_deployment(models_dir, deployment));
         }
@@ -519,7 +519,7 @@ impl ModelBundle {
     ///
     /// By default this resolves models from the pinned `avencera/scriptrs-models`
     /// snapshot. Set `SCRIPTRS_MODELS_DIR` to force a local bundle.
-    pub fn from_pretrained_long_form() -> Result<Self, hf_hub::api::sync::ApiError> {
+    pub fn from_pretrained_long_form() -> Result<Self, HubError> {
         Self::from_pretrained_long_form_with_deployment(ParakeetDeployment::v2())
     }
 
@@ -527,7 +527,7 @@ impl ModelBundle {
     /// Download Parakeet and VAD assets for an explicit deployment
     pub fn from_pretrained_long_form_with_deployment(
         deployment: ParakeetDeployment,
-    ) -> Result<Self, hf_hub::api::sync::ApiError> {
+    ) -> Result<Self, HubError> {
         if let Ok(models_dir) = std::env::var(SCRIPTRS_MODELS_DIR_ENV) {
             return Ok(Self::from_dir_with_deployment(models_dir, deployment));
         }
@@ -542,9 +542,7 @@ impl ModelBundle {
     /// `avencera/parakeet-tdt-0.6b-v2-cuda` or `avencera/parakeet-tdt-0.6b-v3-cuda`,
     /// then behaves like [`Self::from_native_dir`]. Set `SCRIPTRS_MODELS_DIR` to
     /// force a local native bundle.
-    pub fn from_pretrained_native(
-        deployment: ParakeetDeployment,
-    ) -> Result<Self, hf_hub::api::sync::ApiError> {
+    pub fn from_pretrained_native(deployment: ParakeetDeployment) -> Result<Self, HubError> {
         if let Ok(models_dir) = std::env::var(SCRIPTRS_MODELS_DIR_ENV) {
             return Ok(Self::from_native_dir(models_dir, deployment));
         }
@@ -559,7 +557,7 @@ impl ModelBundle {
     /// local native bundle.
     pub fn from_pretrained_native_long_form(
         deployment: ParakeetDeployment,
-    ) -> Result<Self, hf_hub::api::sync::ApiError> {
+    ) -> Result<Self, HubError> {
         if let Ok(models_dir) = std::env::var(SCRIPTRS_MODELS_DIR_ENV) {
             return Ok(Self::from_native_dir(models_dir, deployment));
         }
@@ -626,12 +624,8 @@ impl HuggingFaceModelSource {
         }
     }
 
-    fn api_repo(self, api: &hf_hub::api::sync::Api) -> hf_hub::api::sync::ApiRepo {
-        api.repo(Repo::with_revision(
-            self.repository.0.to_owned(),
-            RepoType::Model,
-            self.revision.0.to_owned(),
-        ))
+    fn pinned_repo(self, hub: &Hub) -> HubRepo {
+        hub.model(self.repository.0, self.revision.0)
     }
 }
 
@@ -643,30 +637,32 @@ impl HuggingFaceModelSource {
 pub struct ModelManager {
     // only native weights live outside the Core ML repository, in per-model ones
     #[cfg(feature = "cuda")]
-    api: hf_hub::api::sync::Api,
-    repo: hf_hub::api::sync::ApiRepo,
+    hub: Hub,
+    repo: HubRepo,
 }
 
 #[cfg(feature = "online")]
 impl ModelManager {
     /// Create a model manager using the default Hugging Face cache
-    pub fn new() -> Result<Self, hf_hub::api::sync::ApiError> {
-        let api = hf_hub::api::sync::Api::new()?;
-        Ok(Self::from_api(api))
+    ///
+    /// That is `HF_HUB_CACHE` when set, else `$HF_HOME/hub`, else
+    /// `~/.cache/huggingface/hub`, the same cache the Python `huggingface_hub` uses.
+    /// Downloads read `HF_ENDPOINT` and the token in `HF_TOKEN` or saved by
+    /// `hf auth login`
+    pub fn new() -> Result<Self, HubError> {
+        Ok(Self::from_hub(Hub::from_env()?))
     }
 
     /// Create a model manager using a custom cache directory
-    pub fn with_cache_dir(cache_dir: PathBuf) -> Result<Self, hf_hub::api::sync::ApiError> {
-        let api =
-            hf_hub::api::sync::ApiBuilder::from_cache(hf_hub::Cache::new(cache_dir)).build()?;
-        Ok(Self::from_api(api))
+    pub fn with_cache_dir(cache_dir: PathBuf) -> Result<Self, HubError> {
+        Ok(Self::from_hub(Hub::with_cache_dir(cache_dir)?))
     }
 
-    fn from_api(api: hf_hub::api::sync::Api) -> Self {
+    fn from_hub(hub: Hub) -> Self {
         Self {
-            repo: HuggingFaceModelSource::runtime().api_repo(&api),
+            repo: HuggingFaceModelSource::runtime().pinned_repo(&hub),
             #[cfg(feature = "cuda")]
-            api,
+            hub,
         }
     }
 
@@ -674,7 +670,7 @@ impl ModelManager {
     ///
     /// The returned [`ModelBundle`] points at the resolved snapshot directory
     /// inside the Hugging Face cache.
-    pub fn ensure_base(&self) -> Result<ModelBundle, hf_hub::api::sync::ApiError> {
+    pub fn ensure_base(&self) -> Result<ModelBundle, HubError> {
         self.ensure_with_deployment(ParakeetDeployment::v2(), false)
     }
 
@@ -683,7 +679,7 @@ impl ModelManager {
     ///
     /// The returned [`ModelBundle`] points at the resolved snapshot directory
     /// inside the Hugging Face cache.
-    pub fn ensure_long_form(&self) -> Result<ModelBundle, hf_hub::api::sync::ApiError> {
+    pub fn ensure_long_form(&self) -> Result<ModelBundle, HubError> {
         self.ensure_with_deployment(ParakeetDeployment::v2(), true)
     }
 
@@ -692,7 +688,7 @@ impl ModelManager {
         &self,
         deployment: ParakeetDeployment,
         include_vad: bool,
-    ) -> Result<ModelBundle, hf_hub::api::sync::ApiError> {
+    ) -> Result<ModelBundle, HubError> {
         #[cfg(feature = "vad")]
         let mut files = repo_files(&deployment);
         #[cfg(not(feature = "vad"))]
@@ -719,8 +715,8 @@ impl ModelManager {
         &self,
         deployment: ParakeetDeployment,
         include_vad: bool,
-    ) -> Result<ModelBundle, hf_hub::api::sync::ApiError> {
-        let repo = HuggingFaceModelSource::native(&deployment).api_repo(&self.api);
+    ) -> Result<ModelBundle, HubError> {
+        let repo = HuggingFaceModelSource::native(&deployment).pinned_repo(&self.hub);
         let weights_path = repo.get(NATIVE_HUB_WEIGHTS)?;
         let vocab_path = repo.get(native_hub_vocab(&deployment))?;
 
@@ -728,7 +724,7 @@ impl ModelManager {
         let vad_path = match include_vad {
             true => Some(
                 NATIVE_VAD_SOURCE
-                    .api_repo(&self.api)
+                    .pinned_repo(&self.hub)
                     .get(NATIVE_HUB_WEIGHTS)?,
             ),
             false => None,
@@ -747,11 +743,7 @@ impl ModelManager {
         ))
     }
 
-    fn download_repo_layout(
-        &self,
-        repo: &hf_hub::api::sync::ApiRepo,
-        files: &[String],
-    ) -> Result<PathBuf, hf_hub::api::sync::ApiError> {
+    fn download_repo_layout(&self, repo: &HubRepo, files: &[String]) -> Result<PathBuf, HubError> {
         let mut first = None;
         for file in files {
             let cached_path = repo.get(file)?;
@@ -1014,21 +1006,32 @@ mod online_tests {
 
     #[test]
     fn runtime_source_uses_the_published_immutable_revision() {
+        // a file already in the cache under the pinned commit resolves without a
+        // request, so this checks the pin and the cache layout offline
+        let cache_dir = tempfile::tempdir().expect("temp dir should be created");
+        let file = "parakeet-v3/parakeet_vocab.json";
+        let snapshot = cache_dir
+            .path()
+            .join("models--avencera--scriptrs-models/snapshots")
+            .join(HF_REVISION.0);
+        let cached = snapshot.join(file);
+        std::fs::create_dir_all(cached.parent().expect("file should have a parent"))
+            .expect("snapshot dir should be created");
+        std::fs::write(&cached, "{}").expect("cached file should be written");
+
+        let manager = ModelManager::with_cache_dir(cache_dir.path().to_path_buf())
+            .expect("Hugging Face client should build without credentials");
         let source = HuggingFaceModelSource::runtime();
-        let api =
-            hf_hub::api::sync::ApiBuilder::from_cache(hf_hub::Cache::new(std::env::temp_dir()))
-                .build()
-                .expect("Hugging Face API should build without credentials");
-        let manager = ModelManager::from_api(api);
 
         assert_eq!(source.repository, HF_REPO);
         assert_eq!(source.revision, HF_REVISION);
         assert_eq!(
-            manager.repo.url("parakeet-v3/parakeet_vocab.json"),
-            format!(
-                "https://huggingface.co/{}/resolve/{}/parakeet-v3/parakeet_vocab.json",
-                HF_REPO.0, HF_REVISION.0
-            )
+            manager
+                .repo
+                .get(file)
+                .expect("pinned file should resolve from the cache"),
+            cached
         );
+        assert_eq!(snapshot_root_from_cached_file(&cached, file), snapshot);
     }
 }

@@ -206,7 +206,7 @@ impl CudaEncoder {
         // whole chunks fill the cache, so every chunk's window is the same shape and
         // chunked_limited attention sees all of it
         if frames == 0
-            || context % frames != 0
+            || !context.is_multiple_of(frames)
             || caches.kv.len()
                 != self
                     .geometry(caches.slots, frames, context, caches.slots)

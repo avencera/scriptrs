@@ -59,21 +59,6 @@ def test_bad_precision_is_rejected_before_download(tmp_path):
     assert not any(tmp_path.iterdir())
 
 
-def test_hugging_face_cache_variables_pick_the_download_dir(monkeypatch, tmp_path):
-    for name in ("SCRIPTRS_MODELS_DIR", "HF_HUB_CACHE", "HF_HOME"):
-        monkeypatch.delenv(name, raising=False)
-    assert scriptrs._cache_dir(None) is None
-
-    monkeypatch.setenv("HF_HOME", str(tmp_path))
-    assert scriptrs._cache_dir(None) == tmp_path / "hub"
-    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "cache"))
-    assert scriptrs._cache_dir(None) == tmp_path / "cache"
-    assert scriptrs._cache_dir(tmp_path / "explicit") == tmp_path / "explicit"
-    # a local model directory replaces the download entirely
-    monkeypatch.setenv("SCRIPTRS_MODELS_DIR", str(tmp_path / "models"))
-    assert scriptrs._cache_dir(None) is None
-
-
 @pytest.mark.model
 def test_transcribes_file_and_samples(pipeline, clip):
     from_file = pipeline.transcribe_file(CLIP)

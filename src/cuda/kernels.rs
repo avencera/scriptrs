@@ -112,7 +112,7 @@ fn layer_norm_rows(
     out: usize,
     width: usize,
 ) -> Result<LaunchConfig, Error> {
-    if width == 0 || x % width != 0 {
+    if width == 0 || !x.is_multiple_of(width) {
         return Err(Error::BufferLength {
             context: "layer norm input",
             expected: width.max(1) * x.div_ceil(width.max(1)),
