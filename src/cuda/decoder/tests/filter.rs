@@ -172,7 +172,8 @@ fn decide_once(
         .reset_cursors(runtime, ws, &vec![0; ws.batch])
         .expect("reset");
     decoder.set_language(runtime, ws, mask).expect("filter");
-    decoder.decide(runtime, ws).expect("decide");
+    let batch = ws.batch;
+    decoder.decide(runtime, ws, batch).expect("decide");
 
     let read = |buffer: &CudaSlice<u32>| stream.clone_dtoh(buffer).expect("read back");
     Decided {
