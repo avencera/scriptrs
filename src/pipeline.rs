@@ -13,12 +13,12 @@ use ndarray::Array2;
 /// Single-chunk Parakeet transcription pipeline
 ///
 /// This is the base `scriptrs` entry point for audio that already fits inside a
-/// single Parakeet window. It expects mono 16kHz audio samples as `&[f32]`.
+/// single Parakeet window. It expects mono 16kHz audio samples as `&[f32]`
 ///
 /// If the input is longer than [`TranscriptionConfig::max_audio_samples`], this
 /// pipeline returns [`TranscriptionError::AudioTooLong`] instead of splitting it.
 /// Use `LongFormTranscriptionPipeline` with the `long-form` feature if you want
-/// `scriptrs` to own chunk planning internally.
+/// `scriptrs` to own chunk planning internally
 #[derive(Debug, Clone)]
 pub struct TranscriptionPipeline {
     bundle: ModelBundle,
@@ -32,7 +32,7 @@ impl TranscriptionPipeline {
     /// Build a v2 transcription pipeline from a local model directory
     ///
     /// The directory must contain the Parakeet runtime bundle expected by
-    /// [`ModelBundle::from_dir`].
+    /// [`ModelBundle::from_dir`]
     pub fn from_dir(models_dir: impl Into<std::path::PathBuf>) -> Result<Self, TranscriptionError> {
         Self::from_dir_with_deployment(models_dir, ParakeetDeployment::v2())
     }
@@ -61,12 +61,12 @@ impl TranscriptionPipeline {
         })
     }
 
-    #[cfg(feature = "online")]
     /// Download models and build a transcription pipeline
     ///
     /// With the default configuration this resolves models from the pinned
     /// `avencera/scriptrs-models` snapshot on Hugging Face. Set
-    /// `SCRIPTRS_MODELS_DIR` to force a local bundle.
+    /// `SCRIPTRS_MODELS_DIR` to force a local bundle
+    #[cfg(feature = "online")]
     pub fn from_pretrained() -> Result<Self, TranscriptionError> {
         let bundle = ModelBundle::from_pretrained().map_err(|error| {
             TranscriptionError::CoreMl(format!("model download failed: {error}"))
@@ -78,7 +78,7 @@ impl TranscriptionPipeline {
     ///
     /// `audio` must be mono 16kHz samples. Empty input returns
     /// [`TranscriptionError::EmptyAudio`]. Oversized input returns
-    /// [`TranscriptionError::AudioTooLong`].
+    /// [`TranscriptionError::AudioTooLong`]
     pub fn run(&self, audio: &[f32]) -> Result<TranscriptionResult, TranscriptionError> {
         self.run_with_config(audio, &self.config)
     }
@@ -87,7 +87,7 @@ impl TranscriptionPipeline {
     ///
     /// The configuration must use the same deployment-owned frontend settings
     /// as this pipeline. Use its language field to select a deployment-supported
-    /// language for this run.
+    /// language for this run
     pub fn run_with_config(
         &self,
         audio: &[f32],
@@ -176,10 +176,10 @@ impl TranscriptionPipeline {
             .zip(windows)
             .map(|(decoded, window)| {
                 let mut raw = decoded.raw;
-                apply_time_offsets(
+                Self::place_window(
                     &mut raw,
-                    window.global_sample_offset / SAMPLES_PER_ENCODER_FRAME,
-                    window.context_samples / SAMPLES_PER_ENCODER_FRAME,
+                    window.global_sample_offset,
+                    window.context_samples,
                 );
                 raw
             })
@@ -202,10 +202,9 @@ impl TranscriptionPipeline {
         global_sample_offset: usize,
         context_samples: usize,
     ) {
-        apply_time_offsets(
-            raw,
-            global_sample_offset / SAMPLES_PER_ENCODER_FRAME,
+        raw.drop_context_frames(
             context_samples / SAMPLES_PER_ENCODER_FRAME,
+            global_sample_offset / SAMPLES_PER_ENCODER_FRAME,
         );
     }
 
@@ -286,39 +285,4 @@ impl ChunkPreparer {
     pub(crate) fn prepare(&self, audio: &[f32]) -> Result<PreparedChunk, TranscriptionError> {
         PreparedChunk::from_audio(audio, &self.config, &self.extractor)
     }
-}
-
-fn apply_time_offsets(raw: &mut RawTranscription, frame_offset: usize, context_frames: usize) {
-    if context_frames == 0 {
-        for frame_idx in &mut raw.frame_indices {
-            *frame_idx += frame_offset;
-        }
-        return;
-    }
-
-    let mut keep_indices = Vec::new();
-    for (index, frame_idx) in raw.frame_indices.iter_mut().enumerate() {
-        if *frame_idx < context_frames {
-            continue;
-        }
-        *frame_idx = *frame_idx - context_frames + frame_offset;
-        keep_indices.push(index);
-    }
-
-    raw.token_ids = keep_indices
-        .iter()
-        .map(|index| raw.token_ids[*index])
-        .collect();
-    raw.frame_indices = keep_indices
-        .iter()
-        .map(|index| raw.frame_indices[*index])
-        .collect();
-    raw.durations = keep_indices
-        .iter()
-        .map(|index| raw.durations[*index])
-        .collect();
-    raw.confidences = keep_indices
-        .iter()
-        .map(|index| raw.confidences[*index])
-        .collect();
 }

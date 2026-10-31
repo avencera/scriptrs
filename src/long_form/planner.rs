@@ -1,3 +1,4 @@
+use super::LongFormConfig;
 #[cfg(feature = "vad")]
 use crate::constants::VAD_WINDOW_SAMPLES;
 use crate::constants::{SAMPLE_RATE, SAMPLES_PER_ENCODER_FRAME};
@@ -10,8 +11,8 @@ pub(crate) struct SampleRange {
     pub end: usize,
 }
 
-#[cfg(feature = "vad")]
 /// Runtime threshold configuration for the VAD model
+#[cfg(feature = "vad")]
 #[derive(Debug, Clone)]
 pub struct VadConfig {
     /// Positive speech threshold applied to per-window probabilities
@@ -36,11 +37,11 @@ impl VadConfig {
     }
 }
 
-#[cfg(feature = "vad")]
 /// Segmentation parameters for converting VAD probabilities into speech regions
 ///
 /// The model hard sample maximum is not stored here. Pass
-/// [`ParakeetDeployment::hard_sample_max`] into the planner.
+/// [`ParakeetDeployment::hard_sample_max`] into the planner
+#[cfg(feature = "vad")]
 #[derive(Debug, Clone)]
 pub struct VadSegmentationConfig {
     /// Minimum speech span kept in the output
@@ -433,14 +434,154 @@ fn silence_spans(
     spans
 }
 
+#[cfg(feature = "vad")]
+pub(super) fn build_vad_execution_plan(
+    regions: &[SampleRange],
+    probabilities: &[f32],
+    config: &LongFormConfig,
+) -> LongFormExecutionPlan {
+    let mut tasks = Vec::new();
+    let mut region_tasks = Vec::with_capacity(regions.len());
+    for region in regions.iter().copied() {
+        region_tasks.push(build_region_plan(region, probabilities, config, &mut tasks));
+    }
+    LongFormExecutionPlan {
+        tasks,
+        regions: region_tasks,
+    }
+}
+
+pub(super) fn build_fast_execution_plan(
+    audio_len: usize,
+    config: &LongFormConfig,
+) -> LongFormExecutionPlan {
+    let mut tasks = Vec::new();
+    let full_audio = SampleRange {
+        start: 0,
+        end: audio_len,
+    };
+    let task_indices = config
+        .overlap
+        .plan(full_audio)
+        .into_iter()
+        .map(|chunk| push_overlap_task(&mut tasks, chunk, config))
+        .collect();
+    let regions = vec![RegionTask {
+        task_indices,
+        kind: RegionTaskKind::Overlap,
+    }];
+    LongFormExecutionPlan { tasks, regions }
+}
+
+#[derive(Debug)]
+pub(crate) struct LongFormExecutionPlan {
+    pub(super) tasks: Vec<ChunkTask>,
+    pub(super) regions: Vec<RegionTask>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ChunkTask {
+    pub(super) audio_start: usize,
+    pub(super) audio_end: usize,
+    pub(super) global_sample_offset: usize,
+    pub(super) context_samples: usize,
+}
+
+#[derive(Debug)]
+pub(super) struct RegionTask {
+    pub(super) task_indices: Vec<usize>,
+    pub(super) kind: RegionTaskKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum RegionTaskKind {
+    #[cfg(feature = "vad")]
+    Segments,
+    Overlap,
+}
+
+#[cfg(feature = "vad")]
+pub(super) fn build_region_plan(
+    region: SampleRange,
+    probabilities: &[f32],
+    config: &LongFormConfig,
+    tasks: &mut Vec<ChunkTask>,
+) -> RegionTask {
+    let region_len = region.end.saturating_sub(region.start);
+    let max_chunk_samples = config.overlap.max_model_samples;
+    if region_len <= max_chunk_samples {
+        return RegionTask {
+            task_indices: vec![push_segment_task(tasks, region)],
+            kind: RegionTaskKind::Segments,
+        };
+    }
+
+    if let Some(subsegments) = plan_region_subsegments(
+        region,
+        region_probability_slice(probabilities, region),
+        &config.segmentation,
+        max_chunk_samples,
+    ) {
+        return RegionTask {
+            task_indices: subsegments
+                .into_iter()
+                .map(|subsegment| push_segment_task(tasks, subsegment))
+                .collect(),
+            kind: RegionTaskKind::Segments,
+        };
+    }
+
+    RegionTask {
+        task_indices: config
+            .overlap
+            .plan(region)
+            .into_iter()
+            .map(|chunk| push_overlap_task(tasks, chunk, config))
+            .collect(),
+        kind: RegionTaskKind::Overlap,
+    }
+}
+
+#[cfg(feature = "vad")]
+fn push_segment_task(tasks: &mut Vec<ChunkTask>, segment: SampleRange) -> usize {
+    let task_idx = tasks.len();
+    tasks.push(ChunkTask {
+        audio_start: segment.start,
+        audio_end: segment.end,
+        global_sample_offset: 0,
+        context_samples: 0,
+    });
+    task_idx
+}
+
+fn push_overlap_task(
+    tasks: &mut Vec<ChunkTask>,
+    chunk: SampleRange,
+    config: &LongFormConfig,
+) -> usize {
+    let task_idx = tasks.len();
+    let context_start = chunk.start.saturating_sub(config.overlap.context_samples);
+    tasks.push(ChunkTask {
+        audio_start: context_start,
+        audio_end: chunk.end,
+        global_sample_offset: chunk.start,
+        context_samples: chunk.start - context_start,
+    });
+    task_idx
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{OverlapChunkConfig, SampleRange};
+    use super::{OverlapChunkConfig, RegionTaskKind, SampleRange, build_fast_execution_plan};
     #[cfg(feature = "vad")]
-    use super::{VadConfig, VadSegmentationConfig, detect_speech_regions, plan_region_subsegments};
+    use super::{
+        VadConfig, VadSegmentationConfig, build_region_plan, detect_speech_regions,
+        plan_region_subsegments,
+    };
     #[cfg(feature = "vad")]
     use crate::constants::VAD_WINDOW_SAMPLES;
     use crate::deployment::ParakeetDeployment;
+    use crate::long_form::{LongFormConfig, LongFormMode};
 
     #[cfg(feature = "vad")]
     #[test]
@@ -710,5 +851,89 @@ mod tests {
         config.overlap_seconds = 16.0;
 
         assert!(config.validate_for(&deployment).is_err());
+    }
+
+    #[cfg(feature = "vad")]
+    #[test]
+    fn short_region_stays_as_a_single_segment_task() {
+        let config = LongFormConfig::default();
+        let mut tasks = Vec::new();
+        let region = SampleRange {
+            start: 16_000,
+            end: 32_000,
+        };
+
+        let plan = build_region_plan(region, &[], &config, &mut tasks);
+
+        assert!(matches!(plan.kind, RegionTaskKind::Segments));
+        assert_eq!(plan.task_indices, vec![0]);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!((tasks[0].audio_start, tasks[0].audio_end), (16_000, 32_000));
+    }
+
+    #[cfg(feature = "vad")]
+    #[test]
+    fn overlap_plan_keeps_window_order_and_context_offsets() {
+        let mut config = LongFormConfig::default();
+        config.overlap.max_model_samples = 48_000;
+        config.segmentation.min_silence_at_max_speech = 10.0;
+
+        let mut tasks = Vec::new();
+        let region = SampleRange {
+            start: 0,
+            end: 96_000,
+        };
+        let probabilities = vec![1.0; region.end.div_ceil(512)];
+
+        let plan = build_region_plan(region, &probabilities, &config, &mut tasks);
+
+        assert!(matches!(plan.kind, RegionTaskKind::Overlap));
+        assert_eq!(plan.task_indices.len(), tasks.len());
+        assert!(
+            tasks
+                .windows(2)
+                .all(|window| window[0].global_sample_offset <= window[1].global_sample_offset)
+        );
+        assert!(
+            tasks
+                .iter()
+                .all(|task| task.context_samples <= task.global_sample_offset)
+        );
+    }
+
+    #[test]
+    fn fast_execution_plan_uses_one_overlap_region_for_full_audio() {
+        let config = LongFormConfig {
+            mode: LongFormMode::Fast,
+            ..LongFormConfig::default()
+        };
+        let plan = build_fast_execution_plan(96_000, &config);
+
+        assert_eq!(plan.regions.len(), 1);
+        assert!(matches!(plan.regions[0].kind, RegionTaskKind::Overlap));
+        assert_eq!(plan.regions[0].task_indices.len(), plan.tasks.len());
+        assert!(!plan.tasks.is_empty());
+    }
+
+    #[cfg(feature = "vad")]
+    #[test]
+    fn hook_source_range_keeps_vad_segment_position_separate_from_decoder_offset() {
+        let config = LongFormConfig::default();
+        let mut tasks = Vec::new();
+        let plan = build_region_plan(
+            SampleRange {
+                start: 16_000,
+                end: 32_000,
+            },
+            &[],
+            &config,
+            &mut tasks,
+        );
+        let task = tasks[plan.task_indices[0]];
+
+        assert_eq!(task.audio_start, 16_000);
+        assert_eq!(task.audio_end, 32_000);
+        assert_eq!(task.global_sample_offset, 0);
+        assert_eq!(task.context_samples, 0);
     }
 }

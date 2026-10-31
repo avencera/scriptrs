@@ -77,7 +77,7 @@ impl JointOutputs {
     /// Reject tensors that cannot come from a well-formed joint head
     ///
     /// Every token id, including top-K candidates, must be at most the RNNT
-    /// blank id, which is the last id the joint head can emit.
+    /// blank id, which is the last id the joint head can emit
     fn validate(&self, blank_id: usize) -> Result<(), TranscriptionError> {
         if self.token_id > blank_id {
             return Err(TranscriptionError::InvalidModelOutput(format!(

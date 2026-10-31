@@ -14,23 +14,23 @@
 //! long-audio chunking and overlap merging are available behind the
 //! `long-form` feature via [`LongFormTranscriptionPipeline`]. VAD-backed speech
 //! region planning is available behind the `vad` feature, which also enables
-//! `long-form`.
+//! `long-form`
 //!
 //! # Choosing a pipeline
 //!
 //! Use [`TranscriptionPipeline`] when your audio already fits in one Parakeet
-//! window. If the input is too long, it returns [`TranscriptionError::AudioTooLong`].
+//! window. If the input is too long, it returns [`TranscriptionError::AudioTooLong`]
 //!
 //! Use [`LongFormTranscriptionPipeline`] with the `long-form` feature when you
 //! want `scriptrs` to own long-audio chunking internally. This default path is
-//! tuned for speed and works well on dense, mostly continuous speech.
+//! tuned for speed and works well on dense, mostly continuous speech
 //!
 //! Add `vad` when you need VAD-backed speech region planning for
-//! sparse speech, long silences, or recordings with a lot of non-speech audio.
+//! sparse speech, long silences, or recordings with a lot of non-speech audio
 //!
 //! With the `cuda` feature, `StreamingModel` transcribes live audio from many
 //! streams at once with the cache-aware Nemotron Speech Streaming EN and
-//! Nemotron 3.5 ASR Streaming models, one chunk per stream per batch.
+//! Nemotron 3.5 ASR Streaming models, one chunk per stream per batch
 //!
 //! To transcribe many inputs, or serve many concurrent callers from one model,
 //! move either pipeline behind a [`TranscriptionScheduler`] with `into_scheduler`.
@@ -42,7 +42,7 @@
 //! and [`LongFormTranscriptionPipeline::from_pretrained`] download the runtime
 //! bundle from a pinned snapshot of `avencera/scriptrs-models` on Hugging Face.
 //! With `cuda`, `ModelBundle::from_pretrained_native` downloads native weights
-//! from the pinned model repositories, such as `avencera/parakeet-tdt-0.6b-v3-cuda`.
+//! from the pinned model repositories, such as `avencera/parakeet-tdt-0.6b-v3-cuda`
 //!
 //! If you already manage models yourself, use [`TranscriptionPipeline::from_dir`]
 //! or [`LongFormTranscriptionPipeline::from_dir`] with a local bundle layout:
@@ -61,7 +61,7 @@
 //!     parakeet_vocab.json
 //! ```
 //!
-//! Select a version with [`ParakeetDeployment::v2`] or [`ParakeetDeployment::v3`].
+//! Select a version with [`ParakeetDeployment::v2`] or [`ParakeetDeployment::v3`]
 //!
 //! With `vad`, add:
 //!
@@ -78,7 +78,7 @@
 //! # Input requirements
 //!
 //! `scriptrs` expects mono 16kHz audio samples as `&[f32]`. File decoding stays
-//! outside the core library on purpose.
+//! outside the core library on purpose
 //!
 //! # Examples
 //!

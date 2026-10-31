@@ -5,7 +5,7 @@ use crate::vocab::Vocabulary;
 /// Languages in the NVIDIA Parakeet TDT v3 allowlist
 ///
 /// Automatic detection and explicit selection may only use this set. v2
-/// deployments accept English only.
+/// deployments accept English only
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ParakeetLanguage {
     /// Bulgarian (`bg`)
@@ -237,7 +237,7 @@ impl LanguageSelection {
 ///
 /// `languages` and `logits` are parallel. Entries whose language is not in the
 /// allowlist are ignored, so automatic detection cannot leave the typed set.
-/// Non-finite logits are rejected.
+/// Non-finite logits are rejected
 pub fn select_language_from_logits(
     languages: &[ParakeetLanguage],
     logits: &[f32],
@@ -336,7 +336,7 @@ impl TopKCandidates {
 ///
 /// Blank tokens are never replaced. Returned probability is softmax over the
 /// supplied top-K logits only, not the full vocabulary. Non-finite logits are
-/// rejected.
+/// rejected
 pub fn filter_top_k_language(
     top_k: &TopKCandidates,
     vocabulary: &Vocabulary,

@@ -3,7 +3,7 @@ use std::cell::RefCell;
 use ndarray::{Array1, Array2, Array3};
 
 use crate::backend::{ChunkDecode, DecodePolicy, EncoderChunk};
-use crate::decode::RawTranscription;
+use crate::decode::{RawToken, RawTranscription};
 use crate::deployment::DecoderDimensions;
 use crate::error::TranscriptionError;
 use crate::language::TopKCandidates;
@@ -13,7 +13,7 @@ use crate::model_io::{DecoderStepOutputs, JointOutputs};
 ///
 /// The loop owns encoder input padding, decoder-state caching, blank handling,
 /// duration advancement and the per-frame token cap; a runtime only moves
-/// tensors.
+/// tensors
 pub(crate) trait StepRuntime {
     /// Encode `[1, features, target_frames]` mel input with `feature_frames`
     /// valid frames into `[1, hidden, time]` and its valid time steps
@@ -45,7 +45,7 @@ pub(crate) trait StepRuntime {
 /// Host greedy TDT loop shared by step runtimes
 ///
 /// Chunks run one at a time at batch 1, with one joint call per decode step
-/// and one decoder call per emitted token.
+/// and one decoder call per emitted token
 #[derive(Debug)]
 pub(crate) struct HostLoop {
     dims: DecoderDimensions,
@@ -226,10 +226,12 @@ impl GreedyDecodeState {
 
         self.hidden_state = decoder.hidden_state;
         self.cell_state = decoder.cell_state;
-        self.raw.token_ids.push(token_id as u32);
-        self.raw.frame_indices.push(self.frame_idx);
-        self.raw.durations.push(duration_step);
-        self.raw.confidences.push(confidence);
+        self.raw.tokens.push(RawToken {
+            id: token_id as u32,
+            frame: self.frame_idx,
+            duration: duration_step,
+            confidence,
+        });
         self.last_token = token_id as i32;
         self.emitted_tokens += 1;
         Ok(())
@@ -429,9 +431,9 @@ mod tests {
         let runtime = ScriptedRuntime::new(6, &[(1, 0), (2, 2), (4, 0), (3, 1), (4, 2)]);
         let decode = run(&runtime, true);
 
-        assert_eq!(decode.raw.token_ids, vec![1, 2, 3]);
-        assert_eq!(decode.raw.frame_indices, vec![0, 0, 3]);
-        assert_eq!(decode.raw.durations, vec![0, 2, 1]);
+        assert_eq!(decode.raw.ids(), vec![1, 2, 3]);
+        assert_eq!(decode.raw.frames(), vec![0, 0, 3]);
+        assert_eq!(decode.raw.durations(), vec![0, 2, 1]);
         assert_eq!(decode.top_k.map(|top_k| top_k.len()), Some(3));
 
         // decoder runs for SOS (blank) and each emitted token, never for blanks
@@ -449,7 +451,12 @@ mod tests {
         let decode = run(&runtime, false);
 
         // ten tokens at frame 0, then the cap forces frame 1, where two more arrive
-        let at_frame_zero = decode.raw.frame_indices.iter().filter(|f| **f == 0).count();
+        let at_frame_zero = decode
+            .raw
+            .tokens
+            .iter()
+            .filter(|token| token.frame == 0)
+            .count();
         assert_eq!(at_frame_zero, 10);
         assert!(decode.top_k.is_none());
     }

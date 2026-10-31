@@ -464,20 +464,16 @@ mod tests {
         for (call, row) in order.enumerate() {
             let raw = run(&features[row]);
             let want = &expected[row];
+            assert_eq!(raw.ids(), want.ids(), "call {call} row {row} tokens");
+            assert_eq!(raw.frames(), want.frames(), "call {call} row {row} frames");
             assert_eq!(
-                raw.token_ids, want.token_ids,
-                "call {call} row {row} tokens"
-            );
-            assert_eq!(
-                raw.frame_indices, want.frame_indices,
-                "call {call} row {row} frames"
-            );
-            assert_eq!(
-                raw.durations, want.durations,
+                raw.durations(),
+                want.durations(),
                 "call {call} row {row} durations"
             );
             assert_eq!(
-                raw.confidences, want.confidences,
+                raw.confidences(),
+                want.confidences(),
                 "call {call} row {row} confidences"
             );
 

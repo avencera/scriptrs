@@ -3,7 +3,7 @@
 //! Everything before the LSTM sees one window and no recurrent state, so the STFT,
 //! the four convolutions and the LSTM input gates run as matrix multiplies over
 //! tasks of windows on worker threads. The calling thread runs the LSTM recurrence
-//! window by window over the tasks already encoded, so the encoder hides behind it.
+//! window by window over the tasks already encoded, so the encoder hides behind it
 //!
 //! It runs on the CPU because the recurrence is the critical path either way, and
 //! on a GPU each step is a dependent pair of launches. On an RTX 5090 a

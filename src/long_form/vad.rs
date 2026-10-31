@@ -14,7 +14,7 @@ use crate::preprocessing::TranscriptionControl;
 /// Silero VAD owner: window chunking, context carry-over, tail padding, and
 /// per-recording recurrent state reset
 ///
-/// Runtimes only classify prepared windows and advance the opaque state.
+/// Runtimes only classify prepared windows and advance the opaque state
 #[derive(Debug, Clone)]
 pub(crate) struct SileroVad {
     model: VadModelInner,

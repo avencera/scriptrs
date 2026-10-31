@@ -84,11 +84,7 @@ impl StftWorkspace {
                 self.padded[start + offset + window_idx] * window_value;
         }
 
-        let input = &mut self.input;
-        let output = &mut self.output;
-        let scratch = &mut self.scratch;
-        r2c.process_with_scratch(input, output, scratch)
-            .map_err(|error| TranscriptionError::InvalidModelOutput(format!("fft failed: {error}")))
+        forward_fft(r2c, &mut self.input, &mut self.output, &mut self.scratch)
     }
 }
 
@@ -122,15 +118,11 @@ impl ParakeetFeatureExtractor {
             .power
             .chunks_exact(freq_bins)
             .zip(features.rows_mut());
-        let log_zero_guard = 2.0f32.powi(-24);
         for (power, mut mels) in rows {
             let mels = mels
                 .as_slice_mut()
                 .expect("a fresh standard-layout array has contiguous rows");
-            self.mel_filterbank.apply(power, mels);
-            for value in mels {
-                *value = (*value + log_zero_guard).ln();
-            }
+            self.mel_filterbank.apply_log(power, mels);
         }
         normalize_columns(&mut features);
         Ok(features)
@@ -180,13 +172,22 @@ impl ParakeetFeatureExtractor {
 
 fn apply_preemphasis_into(audio: &[f32], coefficient: f32, output: &mut Vec<f32>) {
     output.clear();
-    if output.capacity() < audio.len() {
-        output.reserve(audio.len() - output.capacity());
-    }
+    output.reserve(audio.len());
     output.push(audio[0]);
     for index in 1..audio.len() {
         output.push(audio[index] - coefficient * audio[index - 1]);
     }
+}
+
+/// One frame's forward FFT of `input` into `output`
+fn forward_fft(
+    r2c: &Arc<dyn RealToComplex<f32>>,
+    input: &mut [f32],
+    output: &mut [Complex<f32>],
+    scratch: &mut [Complex<f32>],
+) -> Result<(), TranscriptionError> {
+    r2c.process_with_scratch(input, output, scratch)
+        .map_err(|error| TranscriptionError::InvalidModelOutput(format!("fft failed: {error}")))
 }
 
 fn hann_window(window_length: usize) -> Vec<f32> {
@@ -313,6 +314,16 @@ impl MelFilterbank {
         self.apply_with(power, out, f32::mul_add);
         #[cfg(not(target_arch = "aarch64"))]
         self.apply_with(power, out, |weight, bin, sum| sum + weight * bin);
+    }
+
+    /// Writes the log-mel energies of one frame's power spectrum into `out`, guarded
+    /// against log(0) as NeMo's featurizer is
+    fn apply_log(&self, power: &[f32], out: &mut [f32]) {
+        self.apply(power, out);
+        let log_zero_guard = 2.0f32.powi(-24);
+        for value in out {
+            *value = (*value + log_zero_guard).ln();
+        }
     }
 
     /// # Safety

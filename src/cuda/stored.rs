@@ -30,7 +30,11 @@ use crate::native::weights::{
 };
 
 /// The `linear_weights` value of a version 3 file with FP16 linear weights
-const FP16: &str = "fp16";
+pub(crate) const FP16: &str = "fp16";
+
+/// The attention projections a version 2 file stores apart and a version 3 file
+/// stacks to `self_attn.linear_qkv`
+const QKV_PARTS: [&str; 3] = ["linear_q", "linear_k", "linear_v"];
 
 /// Each Conformer layer's linear weights by name under `encoder.layers.<i>.`, and
 /// the shape a version 2 file stores them in, `[out, inputs]` and a trailing 1 for the
@@ -94,7 +98,7 @@ pub(crate) fn read_linear<'a>(
             match weight.strip_suffix("self_attn.linear_qkv.weight") {
                 Some(prefix) => {
                     let mut qkv = Vec::with_capacity(out * inputs);
-                    for part in ["linear_q", "linear_k", "linear_v"] {
+                    for part in QKV_PARTS {
                         qkv.extend_from_slice(file.tensor(
                             &format!("{prefix}self_attn.{part}.weight"),
                             &[out / 3, inputs],
@@ -139,7 +143,7 @@ pub(crate) fn read_linear<'a>(
 
 /// Whether `name` is a linear weight a version 3 file stores differently: the
 /// tensors [`read_linear`] reads from a version 2 file
-fn is_linear(name: &str) -> bool {
+fn is_linear(name: &str, spec: EncoderSpec) -> bool {
     let Some(rest) = name.strip_prefix("encoder.layers.") else {
         return false;
     };
@@ -147,20 +151,14 @@ fn is_linear(name: &str) -> bool {
         return false;
     };
     let linear = rest.strip_suffix(".weight").unwrap_or("");
-    [
-        "feed_forward1.linear1",
-        "feed_forward1.linear2",
-        "feed_forward2.linear1",
-        "feed_forward2.linear2",
-        "self_attn.linear_q",
-        "self_attn.linear_k",
-        "self_attn.linear_v",
-        "self_attn.linear_pos",
-        "self_attn.linear_out",
-        "conv.pointwise_conv1",
-        "conv.pointwise_conv2",
-    ]
-    .contains(&linear)
+    linears(spec)
+        .iter()
+        .any(|(stored, _)| match stored.strip_suffix("linear_qkv") {
+            Some(module) => linear
+                .strip_prefix(module)
+                .is_some_and(|part| QKV_PARTS.contains(&part)),
+            None => *stored == linear,
+        })
 }
 
 /// Bytes of one tensor of a file being written
@@ -214,7 +212,7 @@ pub fn write_native_weights(
             input.display()
         )));
     }
-    if matches!(precision, Precision::Fp32 | Precision::Tf32) {
+    if precision.weights_name().is_none() {
         return Err(TranscriptionError::InvalidConfiguration(format!(
             "{precision:?} reads the FP32 weights as they are"
         )));
@@ -235,7 +233,7 @@ pub fn write_native_weights(
 
     let mut tensors: Vec<(String, Tensor)> = Vec::new();
     for (name, dtype, shape) in file.tensors() {
-        if is_linear(name) {
+        if is_linear(name, spec) {
             continue;
         }
         if dtype != Dtype::F32 {
@@ -407,7 +405,7 @@ mod tests {
                 }
             }
             for (tensor, _, shape) in written.tensors() {
-                if source.dtype(tensor).is_ok() && !super::is_linear(tensor) {
+                if source.dtype(tensor).is_ok() && !super::is_linear(tensor, spec) {
                     assert_eq!(
                         written.tensor(tensor, shape).ok(),
                         source.tensor(tensor, shape).ok(),
@@ -416,7 +414,7 @@ mod tests {
                 }
             }
             for (tensor, _, _) in source.tensors() {
-                if !super::is_linear(tensor) {
+                if !super::is_linear(tensor, spec) {
                     assert!(written.dtype(tensor).is_ok(), "{name} is missing {tensor}");
                 }
             }

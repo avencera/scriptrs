@@ -11,7 +11,7 @@ use crate::error::TranscriptionError;
 /// The native engines size every buffer and loop from this, not from crate
 /// constants. Parsing rejects NeMo options the engines do not implement, so a
 /// checkpoint with biased linears or local attention fails at load instead of
-/// computing a wrong transcript.
+/// computing a wrong transcript
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ParakeetSpec {
     pub version: ParakeetVersion,

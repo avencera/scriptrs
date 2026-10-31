@@ -4,7 +4,7 @@
 //! encoder plus the whole decode loop. Device backends run the loop on the
 //! device. Step backends, such as Core ML, supply encoder, decoder and joint
 //! calls and share the host loop in [`host_loop`]. Either way, the token rule
-//! comes from one [`DecodePolicy`].
+//! comes from one [`DecodePolicy`]
 
 #[cfg(any(test, target_os = "macos"))]
 mod host_loop;
@@ -21,7 +21,7 @@ pub(crate) use policy::DecodePolicy;
 #[cfg(feature = "cuda")]
 pub(crate) use policy::LanguageMask;
 #[cfg(all(test, feature = "cuda"))]
-pub(crate) use policy::decide_from_logits;
+pub(crate) use policy::test_support::decide_from_logits;
 
 /// Log-mel input for one chunk, in `[frames, features]` order
 #[derive(Debug, Clone, Copy)]
@@ -49,6 +49,9 @@ pub(crate) struct ChunkDecode {
     /// Emitted tokens with encoder frames, durations and confidences
     pub raw: RawTranscription,
     /// Joint top-K candidates per emitted token, when the policy asked for them
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "only tests read the candidates back so far")
+    )]
     pub top_k: Option<Vec<TopKCandidates>>,
 }

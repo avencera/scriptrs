@@ -4,7 +4,7 @@
 //! outside the repository; `just parity` runs them. Set `SCRIPTRS_NEMO_REF`
 //! to point at a copy other than `/shared/datasets/parakeet-ref`, and
 //! `SCRIPTRS_STREAM_REF` for the streaming references `dev-tools/nemo/stream_ref.py`
-//! writes, other than `/shared/datasets/nemotron-stream-ref`.
+//! writes, other than `/shared/datasets/nemotron-stream-ref`
 
 use std::fs::File;
 use std::path::PathBuf;

@@ -15,7 +15,7 @@ use crate::cuda::kernels::{
     EncoderKernels, LstmInput, LstmState, LstmWeights, MAX_FILTER_TOP_K, Projection, StreamKernels,
 };
 use crate::cuda::{Direction, HostStaging, linear, upload, upload_host, zeros};
-use crate::decode::RawTranscription;
+use crate::decode::{RawToken, RawTranscription};
 use crate::error::TranscriptionError;
 use crate::model::FinishedRows;
 use crate::native::spec::TransducerSpec;
@@ -849,15 +849,19 @@ impl CudaDecoder {
             .enumerate()
             .map(|(row, count)| {
                 let slots = row * ws.capacity..row * ws.capacity + *count as usize;
-                RawTranscription {
-                    token_ids: tokens[slots.clone()].to_vec(),
-                    frame_indices: frames[slots.clone()].iter().map(|f| *f as usize).collect(),
-                    durations: durations[slots.clone()]
-                        .iter()
-                        .map(|d| *d as usize)
-                        .collect(),
-                    confidences: confidences[slots].to_vec(),
-                }
+                let tokens = tokens[slots.clone()]
+                    .iter()
+                    .zip(&frames[slots.clone()])
+                    .zip(&durations[slots.clone()])
+                    .zip(&confidences[slots])
+                    .map(|(((&id, &frame), &duration), &confidence)| RawToken {
+                        id,
+                        frame: frame as usize,
+                        duration: duration as usize,
+                        confidence,
+                    })
+                    .collect();
+                RawTranscription { tokens }
             })
             .collect())
     }
@@ -1219,15 +1223,19 @@ impl CudaDecoder {
             stream.memcpy_dtoh(&ws.token_durations.slice(slots.clone()), &mut durations)?;
             stream.memcpy_dtoh(&ws.confidences.slice(slots), &mut confidences)?;
         }
-        Ok(RawTranscription {
-            token_ids,
-            frame_indices: frames.into_iter().map(|frame| frame as usize).collect(),
-            durations: durations
-                .into_iter()
-                .map(|duration| duration as usize)
-                .collect(),
-            confidences,
-        })
+        let tokens = token_ids
+            .into_iter()
+            .zip(frames)
+            .zip(durations)
+            .zip(confidences)
+            .map(|(((id, frame), duration), confidence)| RawToken {
+                id,
+                frame: frame as usize,
+                duration: duration as usize,
+                confidence,
+            })
+            .collect();
+        Ok(RawTranscription { tokens })
     }
 }
 
@@ -1303,18 +1311,18 @@ mod tests {
                     .map(|value| *value as u32)
                     .collect()
             };
-            let frames: Vec<u32> = raw.frame_indices.iter().map(|f| *f as u32).collect();
-            let durations: Vec<u32> = raw.durations.iter().map(|d| *d as u32).collect();
-            assert_eq!(raw.token_ids, as_u32("tokens"), "{name} row {row} tokens");
+            let frames: Vec<u32> = raw.frames().iter().map(|f| *f as u32).collect();
+            let durations: Vec<u32> = raw.durations().iter().map(|d| *d as u32).collect();
+            assert_eq!(raw.ids(), as_u32("tokens"), "{name} row {row} tokens");
             assert_eq!(frames, as_u32("timestamps"), "{name} row {row} frames");
             assert_eq!(durations, as_u32("durations"), "{name} row {row} durations");
             assert!(
-                raw.confidences
+                raw.tokens
                     .iter()
-                    .all(|confidence| *confidence > 0.0 && *confidence <= 1.0),
+                    .all(|token| token.confidence > 0.0 && token.confidence <= 1.0),
                 "{name} row {row} confidences"
             );
-            tokens += raw.token_ids.len();
+            tokens += raw.tokens.len();
         }
         tokens
     }
@@ -1447,9 +1455,13 @@ mod tests {
             };
             let replayed = decode(&mut ws);
             for (row, (a, b)) in eager.iter().zip(&replayed).enumerate() {
-                assert_eq!(a.token_ids, b.token_ids, "{set} row {row} tokens");
-                assert_eq!(a.frame_indices, b.frame_indices, "{set} row {row} frames");
-                assert_eq!(a.confidences, b.confidences, "{set} row {row} confidences");
+                assert_eq!(a.ids(), b.ids(), "{set} row {row} tokens");
+                assert_eq!(a.frames(), b.frames(), "{set} row {row} frames");
+                assert_eq!(
+                    a.confidences(),
+                    b.confidences(),
+                    "{set} row {row} confidences"
+                );
             }
 
             let start = std::time::Instant::now();
@@ -1457,7 +1469,7 @@ mod tests {
                 decode(&mut ws);
             }
             let ms = start.elapsed().as_secs_f64() * 1e3 / f64::from(REPEATS);
-            let tokens: usize = replayed.iter().map(|raw| raw.token_ids.len()).sum();
+            let tokens: usize = replayed.iter().map(|raw| raw.tokens.len()).sum();
             let longest = lens.iter().copied().max().unwrap_or(0);
             println!(
                 "v3 {set}: batch {batch}, {longest} frames, {tokens} tokens, graph decode {ms:.3} ms"

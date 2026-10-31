@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use crate::decode::RawTranscription;
 
 /// Most encoder frames apart two tokens can be and still count as the same token
@@ -42,13 +44,13 @@ fn merge_pair(left: RawTranscription, right: RawTranscription) -> RawTranscripti
 /// Index of the first `left` token within match distance of any `right` frame; no
 /// earlier token can match, so skipping them changes no match
 fn first_reachable(left: &RawTranscription, right: &RawTranscription) -> usize {
-    let Some(right_first) = right.frame_indices.iter().copied().min() else {
-        return left.token_ids.len();
+    let Some(right_first) = right.tokens.iter().map(|token| token.frame).min() else {
+        return left.tokens.len();
     };
-    left.frame_indices
+    left.tokens
         .iter()
-        .position(|frame| frame + MAX_MATCH_FRAMES >= right_first)
-        .unwrap_or(left.token_ids.len())
+        .position(|token| token.frame + MAX_MATCH_FRAMES >= right_first)
+        .unwrap_or(left.tokens.len())
 }
 
 fn contiguous_matches(
@@ -57,15 +59,15 @@ fn contiguous_matches(
     right: &RawTranscription,
 ) -> Vec<(usize, usize)> {
     let mut best = Vec::new();
-    for left_idx in left_start..left.token_ids.len() {
-        for right_idx in 0..right.token_ids.len() {
+    for left_idx in left_start..left.tokens.len() {
+        for right_idx in 0..right.tokens.len() {
             if !tokens_match(left, left_idx, right, right_idx) {
                 continue;
             }
             let mut current = Vec::new();
             let mut lhs = left_idx;
             let mut rhs = right_idx;
-            while lhs < left.token_ids.len() && rhs < right.token_ids.len() {
+            while lhs < left.tokens.len() && rhs < right.tokens.len() {
                 if !tokens_match(left, lhs, right, rhs) {
                     break;
                 }
@@ -88,11 +90,11 @@ fn lcs_matches(
     left_start: usize,
     right: &RawTranscription,
 ) -> Vec<(usize, usize)> {
-    let left_len = left.token_ids.len() - left_start;
+    let left_len = left.tokens.len() - left_start;
     let matches_at = |row: usize, col: usize| tokens_match(left, left_start + row, right, col);
-    let mut dp = vec![vec![0usize; right.token_ids.len() + 1]; left_len + 1];
+    let mut dp = vec![vec![0usize; right.tokens.len() + 1]; left_len + 1];
     for left_idx in 1..=left_len {
-        for right_idx in 1..=right.token_ids.len() {
+        for right_idx in 1..=right.tokens.len() {
             if matches_at(left_idx - 1, right_idx - 1) {
                 dp[left_idx][right_idx] = dp[left_idx - 1][right_idx - 1] + 1;
             } else {
@@ -104,7 +106,7 @@ fn lcs_matches(
 
     let mut matches = Vec::new();
     let mut left_idx = left_len;
-    let mut right_idx = right.token_ids.len();
+    let mut right_idx = right.tokens.len();
     while left_idx > 0 && right_idx > 0 {
         if matches_at(left_idx - 1, right_idx - 1) {
             matches.push((left_start + left_idx - 1, right_idx - 1));
@@ -128,8 +130,8 @@ fn tokens_match(
     right: &RawTranscription,
     right_idx: usize,
 ) -> bool {
-    left.token_ids[left_idx] == right.token_ids[right_idx]
-        && left.frame_indices[left_idx].abs_diff(right.frame_indices[right_idx]) <= MAX_MATCH_FRAMES
+    let (left, right) = (left.tokens[left_idx], right.tokens[right_idx]);
+    left.id == right.id && left.frame.abs_diff(right.frame) <= MAX_MATCH_FRAMES
 }
 
 fn merge_using_matches(
@@ -140,14 +142,14 @@ fn merge_using_matches(
     let left_indices: Vec<usize> = matches.iter().map(|(left_idx, _)| *left_idx).collect();
     let right_indices: Vec<usize> = matches.iter().map(|(_, right_idx)| *right_idx).collect();
 
-    let mut merged = RawTranscriptionBuilder::new();
+    let mut merged = RawTranscription::empty();
 
     if let Some(first_left) = left_indices.first().copied() {
-        merged.extend(&left, 0..first_left);
+        copy_tokens(&mut merged, &left, 0..first_left);
     }
 
     for (match_idx, (left_idx, right_idx)) in matches.iter().copied().enumerate() {
-        merged.extend(&left, left_idx..left_idx + 1);
+        copy_tokens(&mut merged, &left, left_idx..left_idx + 1);
         if match_idx == matches.len() - 1 {
             continue;
         }
@@ -156,121 +158,69 @@ fn merge_using_matches(
         let left_gap = next_left.saturating_sub(left_idx + 1);
         let right_gap = next_right.saturating_sub(right_idx + 1);
         if right_gap > left_gap {
-            merged.extend(&right, right_idx + 1..next_right);
+            copy_tokens(&mut merged, &right, right_idx + 1..next_right);
         } else {
-            merged.extend(&left, left_idx + 1..next_left);
+            copy_tokens(&mut merged, &left, left_idx + 1..next_left);
         }
     }
 
     if let Some(last_right) = right_indices.last().copied() {
-        merged.extend(&right, last_right + 1..right.token_ids.len());
+        copy_tokens(&mut merged, &right, last_right + 1..right.tokens.len());
     }
 
-    merged.finish()
+    merged
 }
 
 fn merge_by_midpoint(left: RawTranscription, right: RawTranscription) -> RawTranscription {
-    let left_cutoff = left.frame_indices.last().copied().unwrap_or(0);
-    let right_start = right.frame_indices.first().copied().unwrap_or(left_cutoff);
+    let left_cutoff = left.tokens.last().map_or(0, |token| token.frame);
+    let right_start = right
+        .tokens
+        .first()
+        .map_or(left_cutoff, |token| token.frame);
     let midpoint = (left_cutoff + right_start) / 2;
 
-    let mut merged = RawTranscriptionBuilder::new();
-
-    for index in 0..left.token_ids.len() {
-        if left.frame_indices[index] >= midpoint {
-            continue;
+    let mut merged = RawTranscription::empty();
+    for token in &left.tokens {
+        if token.frame < midpoint {
+            merged.tokens.push(*token);
         }
-        merged.push(&left, index);
     }
-
-    for index in 0..right.token_ids.len() {
-        if right.frame_indices[index] < midpoint {
-            continue;
+    for token in &right.tokens {
+        if token.frame >= midpoint {
+            merged.tokens.push(*token);
         }
-        merged.push(&right, index);
     }
-
-    merged.finish()
+    merged
 }
 
-#[derive(Debug, Default)]
-struct RawTranscriptionBuilder {
-    token_ids: Vec<u32>,
-    frame_indices: Vec<usize>,
-    durations: Vec<usize>,
-    confidences: Vec<f32>,
-}
-
-impl RawTranscriptionBuilder {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    fn extend(&mut self, source: &RawTranscription, range: std::ops::Range<usize>) {
-        for index in range {
-            self.push(source, index);
-        }
-    }
-
-    fn push(&mut self, source: &RawTranscription, index: usize) {
-        self.token_ids.push(source.token_ids[index]);
-        self.frame_indices.push(source.frame_indices[index]);
-        self.durations.push(source.durations[index]);
-        self.confidences.push(source.confidences[index]);
-    }
-
-    fn finish(self) -> RawTranscription {
-        RawTranscription {
-            token_ids: self.token_ids,
-            frame_indices: self.frame_indices,
-            durations: self.durations,
-            confidences: self.confidences,
-        }
-    }
+/// Appends `source`'s tokens at `range`, which may be empty or reversed
+fn copy_tokens(merged: &mut RawTranscription, source: &RawTranscription, range: Range<usize>) {
+    merged
+        .tokens
+        .extend(range.map(|index| source.tokens[index]));
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::decode::RawTranscription;
-
     use super::merge_overlapping_windows;
+    use crate::decode::test_support::raw_from_columns;
 
     #[test]
     fn contiguous_tokens_are_deduplicated() {
-        let left = RawTranscription {
-            token_ids: vec![1, 2, 3],
-            frame_indices: vec![0, 10, 20],
-            durations: vec![1, 1, 1],
-            confidences: vec![0.9; 3],
-        };
-        let right = RawTranscription {
-            token_ids: vec![2, 3, 4],
-            frame_indices: vec![10, 20, 30],
-            durations: vec![1, 1, 1],
-            confidences: vec![0.9; 3],
-        };
+        let left = raw_from_columns(&[1, 2, 3], &[0, 10, 20], &[1, 1, 1], &[0.9; 3]);
+        let right = raw_from_columns(&[2, 3, 4], &[10, 20, 30], &[1, 1, 1], &[0.9; 3]);
         let merged = merge_overlapping_windows(vec![left, right]);
-        assert_eq!(merged.token_ids, vec![1, 2, 3, 4]);
+        assert_eq!(merged.ids(), vec![1, 2, 3, 4]);
     }
 
     #[test]
     fn midpoint_fallback_keeps_monotonic_frames() {
-        let left = RawTranscription {
-            token_ids: vec![1, 2],
-            frame_indices: vec![0, 10],
-            durations: vec![1, 1],
-            confidences: vec![0.9; 2],
-        };
-        let right = RawTranscription {
-            token_ids: vec![9, 10],
-            frame_indices: vec![8, 18],
-            durations: vec![1, 1],
-            confidences: vec![0.9; 2],
-        };
+        let left = raw_from_columns(&[1, 2], &[0, 10], &[1, 1], &[0.9; 2]);
+        let right = raw_from_columns(&[9, 10], &[8, 18], &[1, 1], &[0.9; 2]);
         let merged = merge_overlapping_windows(vec![left, right]);
         assert!(
             merged
-                .frame_indices
+                .frames()
                 .windows(2)
                 .all(|window| window[0] <= window[1])
         );

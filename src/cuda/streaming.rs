@@ -110,10 +110,7 @@ impl StreamEngine {
     ) -> Result<(Self, StreamingSpec), TranscriptionError> {
         // the quantized products exist only in the offline encoder
         #[cfg(feature = "low-precision")]
-        if matches!(
-            precision,
-            Precision::Fp8 | Precision::Int8 | Precision::Nvfp4
-        ) {
+        if crate::cuda::stored::scheme(precision).is_some() {
             return Err(TranscriptionError::InvalidConfiguration(format!(
                 "streaming runs at FP16, TF32 or FP32; {precision:?} is for offline \
                  transcription only"

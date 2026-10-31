@@ -3,17 +3,16 @@ use crate::constants::MAX_TOKENS_PER_STEP;
 use crate::deployment::ParakeetDeployment;
 use crate::error::TranscriptionError;
 use crate::language::{LanguageSelection, ParakeetLanguage, Script, token_matches_script};
-use crate::model_io::DecodedJointStep;
 #[cfg(any(test, target_os = "macos"))]
-use crate::model_io::{JointOutputs, decode_joint_outputs};
+use crate::model_io::{DecodedJointStep, JointOutputs, decode_joint_outputs};
 use crate::vocab::Vocabulary;
 
 /// Greedy TDT token rule shared by every backend
 ///
 /// Step backends hand each joint output to [`Self::decide`]. Device backends
 /// run the same rule over full joint logits with [`Self::language_mask`];
-/// [`decide_from_logits`] is the host reference for that device rule, and the
-/// tests hold the two forms equal.
+/// `test_support::decide_from_logits` is the host reference for that device rule,
+/// and the tests hold the two forms equal
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DecodePolicy<'a> {
     deployment: &'a ParakeetDeployment,
@@ -38,12 +37,13 @@ impl<'a> DecodePolicy<'a> {
     }
 
     /// Also return the joint top-K candidates for every emitted token
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn with_top_k(mut self) -> Self {
         self.keep_top_k = true;
         self
     }
 
+    #[cfg(any(test, target_os = "macos"))]
     pub(crate) fn blank_id(&self) -> usize {
         self.vocabulary.blank_id()
     }
@@ -51,7 +51,7 @@ impl<'a> DecodePolicy<'a> {
     /// Non-blank tokens one encoder frame may emit before time is forced on
     ///
     /// Matches NeMo's label-looping `max_symbols`: the cap counts tokens
-    /// emitted with duration 0 at one frame, and a blank always advances.
+    /// emitted with duration 0 at one frame, and a blank always advances
     #[cfg(any(test, target_os = "macos"))]
     pub(crate) const fn max_symbols_per_frame(&self) -> usize {
         MAX_TOKENS_PER_STEP
@@ -73,8 +73,14 @@ impl<'a> DecodePolicy<'a> {
     /// Script filter for device backends, or `None` when no filter applies
     ///
     /// A filter applies when the deployment has a top-K language filter and the
-    /// run selected one explicit language.
-    #[cfg_attr(not(any(test, feature = "cuda")), allow(dead_code))]
+    /// run selected one explicit language
+    #[cfg_attr(
+        not(any(test, feature = "cuda")),
+        expect(
+            dead_code,
+            reason = "only the CUDA backend and tests filter on the device"
+        )
+    )]
     pub(crate) fn language_mask(&self) -> Option<LanguageMask> {
         let top_k = self.deployment.language_filter_top_k()?;
         let language = self.language.explicit()?;
@@ -86,7 +92,7 @@ impl<'a> DecodePolicy<'a> {
 ///
 /// A token is allowed when its text matches the language's script, the same
 /// test the host top-K filter applies. The blank and ids past the tokenizer
-/// table are never allowed.
+/// table are never allowed
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LanguageMask {
     script: Script,
@@ -114,6 +120,10 @@ impl LanguageMask {
     }
 
     /// Candidate count the filter searches, ranked by logit
+    #[cfg_attr(
+        not(any(feature = "cuda", test)),
+        expect(dead_code, reason = "only the CUDA backend reads the candidate count")
+    )]
     pub(crate) fn top_k(&self) -> usize {
         self.top_k
     }
@@ -121,111 +131,124 @@ impl LanguageMask {
     /// Whether each token id may be chosen, indexed by id, with `blank_id + 1` entries
     #[cfg_attr(
         not(feature = "cuda"),
-        allow(dead_code, reason = "only the CUDA backend uploads the mask")
+        expect(dead_code, reason = "only the CUDA backend uploads the mask")
     )]
     pub(crate) fn allowed(&self) -> &[bool] {
         &self.allowed
     }
 }
 
-/// Host reference for the device token rule over one joint step's logits
-///
-/// `logits` holds the token logits for ids `0..=blank_id` followed by the
-/// duration logits, the NeMo joint layout. Token and duration are first-max
-/// argmaxes; the confidence is the token softmax at the chosen id. With a
-/// language mask and a non-blank argmax, the highest-logit allowed token
-/// among the top-K replaces it, and its confidence becomes the softmax over
-/// the top-K logits only, which is what the published Core ML joint plus
-/// [`decode_joint_outputs`] compute.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn decide_from_logits(
-    policy: &DecodePolicy<'_>,
-    logits: &[f32],
-    mask: Option<&LanguageMask>,
-) -> Result<DecodedJointStep, TranscriptionError> {
-    let blank_id = policy.blank_id();
-    let bins = policy.deployment.duration_bins();
-    if logits.len() != blank_id + 1 + bins.len() {
-        return Err(TranscriptionError::InvalidModelOutput(format!(
-            "joint logits had {} values, expected {}",
-            logits.len(),
-            blank_id + 1 + bins.len()
-        )));
+/// The host form of the device token rule, which tests hold the device kernels and
+/// the step rule to
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{DecodePolicy, LanguageMask};
+    use crate::error::TranscriptionError;
+    use crate::model_io::DecodedJointStep;
+
+    /// Host reference for the device token rule over one joint step's logits
+    ///
+    /// `logits` holds the token logits for ids `0..=blank_id` followed by the
+    /// duration logits, the NeMo joint layout. Token and duration are first-max
+    /// argmaxes; the confidence is the token softmax at the chosen id. With a
+    /// language mask and a non-blank argmax, the highest-logit allowed token
+    /// among the top-K replaces it, and its confidence becomes the softmax over
+    /// the top-K logits only, which is what the published Core ML joint plus
+    /// [`decode_joint_outputs`](crate::model_io::decode_joint_outputs) compute
+    pub(crate) fn decide_from_logits(
+        policy: &DecodePolicy<'_>,
+        logits: &[f32],
+        mask: Option<&LanguageMask>,
+    ) -> Result<DecodedJointStep, TranscriptionError> {
+        let blank_id = policy.blank_id();
+        let bins = policy.deployment.duration_bins();
+        if logits.len() != blank_id + 1 + bins.len() {
+            return Err(TranscriptionError::InvalidModelOutput(format!(
+                "joint logits had {} values, expected {}",
+                logits.len(),
+                blank_id + 1 + bins.len()
+            )));
+        }
+        if let Some(index) = logits.iter().position(|value| !value.is_finite()) {
+            return Err(TranscriptionError::InvalidLanguageLogit {
+                index,
+                value: logits[index],
+            });
+        }
+
+        let (token_logits, duration_logits) = logits.split_at(blank_id + 1);
+        let duration_frames = policy
+            .deployment
+            .map_duration_bin(first_argmax(duration_logits))?;
+        let token_id = first_argmax(token_logits);
+        let mut step = DecodedJointStep {
+            token_id,
+            duration_frames,
+            confidence: softmax_at(token_logits, token_logits.iter().copied(), token_id),
+        };
+
+        let Some(mask) = mask.filter(|_| token_id != blank_id) else {
+            return Ok(step);
+        };
+
+        let top = top_k_ids(token_logits, mask.top_k());
+        // first strict maximum in rank order, as the host filter picks it
+        let mut filtered: Option<usize> = None;
+        for id in top.iter().copied().filter(|id| mask.allowed[*id]) {
+            if filtered.is_none_or(|best| token_logits[id] > token_logits[best]) {
+                filtered = Some(id);
+            }
+        }
+        if let Some(filtered) = filtered {
+            step.token_id = filtered;
+            step.confidence = softmax_at(
+                token_logits,
+                top.iter().map(|id| token_logits[*id]),
+                filtered,
+            );
+        }
+
+        Ok(step)
     }
-    if let Some(index) = logits.iter().position(|value| !value.is_finite()) {
-        return Err(TranscriptionError::InvalidLanguageLogit {
-            index,
-            value: logits[index],
+
+    pub(super) fn first_argmax(values: &[f32]) -> usize {
+        let mut best = 0;
+        for (index, value) in values.iter().enumerate() {
+            if *value > values[best] {
+                best = index;
+            }
+        }
+        best
+    }
+
+    /// Ids of the `k` largest logits, ties broken by lower id
+    pub(super) fn top_k_ids(logits: &[f32], k: usize) -> Vec<usize> {
+        let mut ids: Vec<usize> = (0..logits.len()).collect();
+        ids.sort_by(|left, right| {
+            logits[*right]
+                .total_cmp(&logits[*left])
+                .then(left.cmp(right))
         });
+        ids.truncate(k);
+        ids
     }
 
-    let (token_logits, duration_logits) = logits.split_at(blank_id + 1);
-    let duration_frames = policy
-        .deployment
-        .map_duration_bin(first_argmax(duration_logits))?;
-    let token_id = first_argmax(token_logits);
-    let mut step = DecodedJointStep {
-        token_id,
-        duration_frames,
-        confidence: softmax_at(token_logits, token_logits.iter().copied(), token_id),
-    };
-
-    let Some(mask) = mask.filter(|_| token_id != blank_id) else {
-        return Ok(step);
-    };
-
-    let top = top_k_ids(token_logits, mask.top_k());
-    // first strict maximum in rank order, as the host filter picks it
-    let mut filtered: Option<usize> = None;
-    for id in top.iter().copied().filter(|id| mask.allowed[*id]) {
-        if filtered.is_none_or(|best| token_logits[id] > token_logits[best]) {
-            filtered = Some(id);
-        }
+    /// Softmax of `logits[id]` over the `support` logits
+    pub(super) fn softmax_at(
+        logits: &[f32],
+        support: impl Iterator<Item = f32> + Clone,
+        id: usize,
+    ) -> f32 {
+        let max = support.clone().fold(f32::NEG_INFINITY, f32::max);
+        let sum: f32 = support.map(|value| (value - max).exp()).sum();
+        ((logits[id] - max).exp() / sum).clamp(0.0, 1.0)
     }
-    if let Some(filtered) = filtered {
-        step.token_id = filtered;
-        step.confidence = softmax_at(
-            token_logits,
-            top.iter().map(|id| token_logits[*id]),
-            filtered,
-        );
-    }
-
-    Ok(step)
-}
-
-fn first_argmax(values: &[f32]) -> usize {
-    let mut best = 0;
-    for (index, value) in values.iter().enumerate() {
-        if *value > values[best] {
-            best = index;
-        }
-    }
-    best
-}
-
-/// Ids of the `k` largest logits, ties broken by lower id
-fn top_k_ids(logits: &[f32], k: usize) -> Vec<usize> {
-    let mut ids: Vec<usize> = (0..logits.len()).collect();
-    ids.sort_by(|left, right| {
-        logits[*right]
-            .total_cmp(&logits[*left])
-            .then(left.cmp(right))
-    });
-    ids.truncate(k);
-    ids
-}
-
-/// Softmax of `logits[id]` over the `support` logits
-fn softmax_at(logits: &[f32], support: impl Iterator<Item = f32> + Clone, id: usize) -> f32 {
-    let max = support.clone().fold(f32::NEG_INFINITY, f32::max);
-    let sum: f32 = support.map(|value| (value - max).exp()).sum();
-    ((logits[id] - max).exp() / sum).clamp(0.0, 1.0)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DecodePolicy, decide_from_logits, top_k_ids};
+    use super::DecodePolicy;
+    use super::test_support::{decide_from_logits, first_argmax, softmax_at, top_k_ids};
     use crate::deployment::ParakeetDeployment;
     use crate::language::{LanguageSelection, ParakeetLanguage, TopKCandidates};
     use crate::model_io::JointOutputs;
@@ -249,12 +272,12 @@ mod tests {
     /// Joint outputs as the published Core ML joint computes them from logits
     fn coreml_joint(logits: &[f32], blank_id: usize, top_k: usize) -> JointOutputs {
         let (tokens, durations) = logits.split_at(blank_id + 1);
-        let token_id = super::first_argmax(tokens);
+        let token_id = first_argmax(tokens);
         let ids = top_k_ids(tokens, top_k);
         JointOutputs {
             token_id,
-            token_prob: super::softmax_at(tokens, tokens.iter().copied(), token_id),
-            duration_bin: super::first_argmax(durations),
+            token_prob: softmax_at(tokens, tokens.iter().copied(), token_id),
+            duration_bin: first_argmax(durations),
             top_k: Some(
                 TopKCandidates::from_parallel(
                     ids.clone(),
