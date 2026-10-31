@@ -16,8 +16,8 @@ categories = ["multimedia::audio"]
 
 [features]
 default = ["online"]
-# Hugging Face downloads over ureq's rustls, so nothing links against the system OpenSSL
-online = ["dep:ureq"]
+# blocking Hub downloads through hf-fetch, with rustls and no async runtime
+online = ["dep:hf-fetch", "hf-fetch/online"]
 long-form = []
 vad = ["long-form"]
 # CUDA backend on native weights (ModelBundle::from_native_dir)
@@ -38,7 +38,7 @@ safetensors = { version = "0.8", optional = true }
 serde_json = "1"
 thiserror = "2.0.21"
 tracing = "0.1.44"
-ureq = { version = "3.5.0", optional = true, default-features = false, features = ["rustls"] }
+hf-fetch = { version = "0.1.2", default-features = false, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

@@ -8,7 +8,7 @@ use super::VAD_DIR;
 use crate::deployment::ParakeetDeployment;
 #[cfg(feature = "cuda")]
 use crate::deployment::ParakeetVersion;
-use crate::hf::{Hub, HubError, HubRepo};
+use hf_fetch::{Hub, HubError, HubRepo};
 
 const SCRIPTRS_MODELS_DIR_ENV: &str = "SCRIPTRS_MODELS_DIR";
 

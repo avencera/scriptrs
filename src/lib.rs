@@ -152,8 +152,6 @@ mod decode;
 mod deployment;
 mod error;
 mod frontend;
-#[cfg(feature = "online")]
-mod hf;
 mod language;
 mod model;
 mod model_io;
@@ -186,7 +184,7 @@ pub use deployment::{
 };
 pub use error::TranscriptionError;
 #[cfg(feature = "online")]
-pub use hf::HubError;
+pub use hf_fetch::HubError;
 pub use language::{
     FilteredToken, LanguageSelection, ParakeetLanguage, Script, TopKCandidates, TopKPair,
     V3_LANGUAGES, detect_language_from_tokens, filter_top_k_language, select_language_from_logits,

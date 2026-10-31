@@ -258,6 +258,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "hf-fetch"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bba9248a593ffd8a4c126cd0d7d10d21fd1d9c1a0e8f94ac2ddaac4d41c1240b"
+dependencies = [
+ "thiserror",
+ "ureq",
+]
+
+[[package]]
 name = "http"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -749,6 +759,7 @@ version = "0.5.0"
 dependencies = [
  "block2",
  "cudakit",
+ "hf-fetch",
  "memmap2",
  "ndarray",
  "objc2",
@@ -759,7 +770,6 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
- "ureq",
 ]
 
 [[package]]

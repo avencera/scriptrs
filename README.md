@@ -342,6 +342,10 @@ and INT8 only halve the download at FP16's WER, and NVFP4 is faster only in larg
 batches on Blackwell GPUs, at a WER cost. The `Precision` docs give the GPU
 requirements and measurements.
 
+Model downloads use [`hf-fetch`](https://github.com/avencera/hf-fetch), a small
+blocking client with rustls and the shared Python Hugging Face cache. The `online`
+feature enables downloads; local model loading works without it.
+
 ## Usage
 
 ### Short audio
