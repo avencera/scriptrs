@@ -28,7 +28,6 @@ use crate::decode::RawTranscription;
 use crate::error::TranscriptionError;
 use crate::model::{BatcherShape, Bucket, ModelBatcher};
 use crate::pipeline::{ChunkSpec, PreparedChunk, TranscriptionPipeline};
-use crate::preprocessing::TranscriptionControlError;
 use crate::types::TranscriptionResult;
 
 /// Options for a [`TranscriptionScheduler`]
@@ -529,7 +528,7 @@ impl TranscriptionScheduler {
         }
         if request.windows.is_empty() {
             drop(state);
-            request.finish(Ok(()));
+            request.finish(Outcome::Done);
             return Ok(pending);
         }
 
@@ -591,8 +590,7 @@ impl PendingTranscription {
 impl Drop for PendingTranscription {
     fn drop(&mut self) {
         if !self.waited && self.request.progress().outcome.is_none() {
-            self.request
-                .finish(Err(TranscriptionControlError::Cancelled.into()));
+            self.request.finish(Outcome::Abandoned);
             self.shared.forget(self.request.id);
         }
     }
@@ -614,7 +612,18 @@ struct Progress {
     remaining: usize,
     plan: Option<Plan>,
     /// Set once every window is done, or at the first failure
-    outcome: Option<Result<(), TranscriptionError>>,
+    outcome: Option<Outcome>,
+}
+
+/// How a request ended
+enum Outcome {
+    /// Every window delivered its output
+    Done,
+    /// A window or the plan failed, or the scheduler stopped
+    Failed(TranscriptionError),
+    /// Nothing will read the outcome: the caller dropped its handle, or took the
+    /// error already
+    Abandoned,
 }
 
 impl Request {
@@ -627,7 +636,7 @@ impl Request {
     }
 
     /// Records the end of the request, unless it already ended
-    fn finish(&self, outcome: Result<(), TranscriptionError>) {
+    fn finish(&self, outcome: Outcome) {
         let mut progress = self.progress();
         if progress.outcome.is_none() {
             progress.outcome = Some(outcome);
@@ -645,13 +654,10 @@ impl Request {
                 .wait(progress)
                 .unwrap_or_else(PoisonError::into_inner);
         }
-        if let Some(Err(error)) = progress.outcome.as_mut() {
-            // the outcome stays set, so the request's windows still waiting see it
-            // has ended and never start
-            return Err(std::mem::replace(
-                error,
-                TranscriptionControlError::Cancelled.into(),
-            ));
+        // the outcome stays set, so the request's windows still waiting see it has
+        // ended and never start
+        if let Some(Outcome::Failed(error)) = progress.outcome.replace(Outcome::Abandoned) {
+            return Err(error);
         }
 
         let plan = progress.plan.take().ok_or_else(|| {
@@ -680,7 +686,7 @@ impl Request {
         if progress.remaining > 0 {
             return false;
         }
-        progress.outcome = Some(Ok(()));
+        progress.outcome = Some(Outcome::Done);
         self.done.notify_all();
         true
     }
@@ -772,7 +778,7 @@ impl Shared {
 
     /// Fails `request` with `error` and forgets it
     fn fail(&self, request: &Request, error: TranscriptionError) {
-        request.finish(Err(error));
+        request.finish(Outcome::Failed(error));
         self.forget(request.id);
     }
 }
@@ -801,7 +807,9 @@ impl Drop for StopOnExit<'_> {
         state.buckets.clear();
         drop(state);
         for request in live {
-            request.finish(Err(TranscriptionError::SchedulerStopped(reason.clone())));
+            request.finish(Outcome::Failed(TranscriptionError::SchedulerStopped(
+                reason.clone(),
+            )));
         }
         self.0.wake_all();
     }
@@ -1075,7 +1083,7 @@ mod tests {
     #[test]
     fn a_waited_error_leaves_the_request_ended() {
         let request = request(3);
-        request.finish(Err(TranscriptionError::EmptyAudio));
+        request.finish(Outcome::Failed(TranscriptionError::EmptyAudio));
 
         let waited = request.wait_windows();
         assert!(matches!(waited, Err(TranscriptionError::EmptyAudio)));
