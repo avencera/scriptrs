@@ -6,13 +6,12 @@ use std::sync::Mutex;
 use pyo3::prelude::*;
 use scriptrs::{
     LanguageSelection, LongFormConfig, LongFormMode, LongFormTranscriptionPipeline, ModelBundle,
-    ParakeetDeployment, ParakeetLanguage, ParakeetVersion, QueueConfig, QueueError,
-    QueuedTranscriptionRequest, QueuedTranscriptionResult, TranscriptionError,
-    TranscriptionPipeline, TranscriptionResult,
+    ParakeetDeployment, ParakeetLanguage, ParakeetVersion, PendingTranscription, SchedulerConfig,
+    TranscriptionError, TranscriptionResult,
 };
 
 use crate::results::PyTranscriptionResult;
-use crate::{deployment, lock, queue_err, samples, scriptrs_err, transcription_code};
+use crate::{deployment, lock, samples, scriptrs_err, transcription_code};
 
 /// Native pipeline; `scriptrs.Pipeline` wraps it
 #[pyclass(name = "_Pipeline", module = "scriptrs._native", frozen)]
@@ -140,7 +139,7 @@ impl PyPipeline {
         self.run(py, &audio, &config)
     }
 
-    #[pyo3(signature = (inputs, language=None, max_batch=QueueConfig::DEFAULT_MAX_BATCH))]
+    #[pyo3(signature = (inputs, language=None, max_batch=SchedulerConfig::DEFAULT_MAX_BATCH))]
     fn transcribe_many(
         &self,
         py: Python<'_>,
@@ -148,15 +147,12 @@ impl PyPipeline {
         language: Option<&str>,
         max_batch: usize,
     ) -> PyResult<Vec<PyTranscriptionResult>> {
-        // a batch can never fill past the queue's capacity, and a larger value
-        // would only size the queue's buffers
-        if !(1..=QueueConfig::DEFAULT_CAPACITY).contains(&max_batch) {
+        // an encoder batch can never fill past the decoder's rows
+        let max_rows = SchedulerConfig::DEFAULT_DECODER_ROWS;
+        if !(1..=max_rows).contains(&max_batch) {
             return Err(scriptrs_err(
                 "configuration",
-                format!(
-                    "max_batch must be between 1 and {}, got {max_batch}",
-                    QueueConfig::DEFAULT_CAPACITY
-                ),
+                format!("max_batch must be between 1 and {max_rows}, got {max_batch}"),
             ));
         }
 
@@ -165,14 +161,17 @@ impl PyPipeline {
             .iter()
             .map(samples::extract)
             .collect::<PyResult<Vec<_>>>()?;
-        let queue = QueueConfig {
-            capacity: QueueConfig::DEFAULT_CAPACITY,
+        let scheduler = SchedulerConfig {
             max_batch,
+            min_batch: SchedulerConfig::DEFAULT_MIN_BATCH.min(max_batch),
+            ..SchedulerConfig::default()
         };
 
         let results = py.detach(|| {
+            // held for the whole call, so the scheduler's copy of the model is the
+            // only one running, as Core ML needs
             let pipeline = lock(&self.inner);
-            run_many(&pipeline, audios, &config, queue)
+            run_many(&pipeline, audios, config, scheduler)
         })?;
         results
             .into_iter()
@@ -189,8 +188,8 @@ impl PyPipeline {
     }
 }
 
-/// Transcribe every input, short ones through a batching queue on a clone of the
-/// pipeline's model, and inputs longer than one window through long-form
+/// Transcribe every input through a scheduler on a clone of the pipeline, which
+/// batches the windows of every input, short or long, together
 ///
 /// The cutoff is the one long-form uses for a single window, so each input runs
 /// as the same windows `transcribe` would run it as
@@ -200,76 +199,23 @@ impl PyPipeline {
 fn run_many(
     pipeline: &LongFormTranscriptionPipeline,
     audios: Vec<Vec<f32>>,
-    config: &LongFormConfig,
-    queue: QueueConfig,
+    config: LongFormConfig,
+    scheduler: SchedulerConfig,
 ) -> PyResult<Vec<Result<TranscriptionResult, TranscriptionError>>> {
-    let max_samples = config.single_window_samples();
-    let mut results: Vec<Option<Result<TranscriptionResult, TranscriptionError>>> =
-        audios.iter().map(|_| None).collect();
-    let mut short = Vec::new();
-    let mut long = Vec::new();
-    for (index, audio) in audios.into_iter().enumerate() {
-        // the queue only rejects empty and oversized input, so non-finite samples
-        // are caught here, as the single-input path catches them
-        if let Some(sample) = audio.iter().position(|sample| !sample.is_finite()) {
-            results[index] = Some(Err(TranscriptionError::InvalidAudioSample {
-                index: sample,
-            }));
-        } else if audio.len() <= max_samples {
-            short.push((index, audio));
-        } else {
-            long.push((index, audio));
-        }
-    }
-
-    if !short.is_empty() {
-        let base: TranscriptionPipeline = pipeline.base_pipeline().clone();
-        for queued in run_queue(base, short, config, queue).map_err(queue_err)? {
-            let index: usize = queued.id.parse().expect("queue ids are input indexes");
-            results[index] = Some(queued.result);
-        }
-    }
-
-    for (index, audio) in long {
-        results[index] = Some(pipeline.run_with_config(&audio, config));
-    }
-
-    Ok(results
+    let scheduler = pipeline
+        .clone()
+        .into_scheduler_with_config(config, scheduler)
+        .map_err(crate::transcription_err)?;
+    // every input is submitted before the first wait, so the scheduler sees them
+    // all and fills its batches
+    let pending: Vec<Result<PendingTranscription, TranscriptionError>> = audios
         .into_iter()
-        .map(|result| result.expect("every input gets a result"))
+        .map(|audio| scheduler.submit(audio))
+        .collect();
+    Ok(pending
+        .into_iter()
+        .map(|pending| pending.and_then(PendingTranscription::wait))
         .collect())
-}
-
-fn run_queue(
-    pipeline: TranscriptionPipeline,
-    inputs: Vec<(usize, Vec<f32>)>,
-    config: &LongFormConfig,
-    queue: QueueConfig,
-) -> Result<Vec<QueuedTranscriptionResult>, QueueError> {
-    let (sender, mut receiver) = pipeline.into_queued_with_config(config.transcription, queue)?;
-    let mut finished = Vec::with_capacity(inputs.len());
-
-    for (index, audio) in inputs {
-        let mut request = QueuedTranscriptionRequest::new(index.to_string(), audio);
-        loop {
-            match sender.try_push(request) {
-                Ok(_) => break,
-                // the queue is at capacity; taking a result makes room
-                Err(QueueError::Full(rejected)) => {
-                    request = rejected;
-                    finished.push(receiver.recv()?);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
-
-    // dropping the sender closes the queue, so the receiver ends after the last result
-    drop(sender);
-    for queued in receiver {
-        finished.push(queued?);
-    }
-    Ok(finished)
 }
 
 /// Download a model for this platform's backend, then load it

@@ -316,8 +316,8 @@ impl LongFormTranscriptionPipeline {
 
     /// Return the single-chunk pipeline this pipeline wraps
     ///
-    /// Clones share the loaded model, so a clone can move onto a background queue
-    /// with [`TranscriptionPipeline::into_queued`] without loading the model again
+    /// Clones share the loaded model, so a clone can move behind a scheduler
+    /// with [`TranscriptionPipeline::into_scheduler`] without loading the model again
     pub fn base_pipeline(&self) -> &TranscriptionPipeline {
         &self.inner
     }
@@ -467,6 +467,104 @@ impl LongFormTranscriptionPipeline {
             .inner
             .decode_raw(&merged, duration_seconds(audio_len))
             .tokens)
+    }
+}
+
+/// A long-form request planned for the scheduler: its windows, and how their
+/// outputs merge into one result
+#[derive(Debug)]
+pub(crate) enum ScheduledPlan {
+    /// Audio that fits one model input, transcribed as the base pipeline does
+    Single,
+    /// Overlap or VAD windows, merged as [`LongFormTranscriptionPipeline::run`]
+    /// merges them
+    Windows(LongFormExecutionPlan),
+}
+
+impl ScheduledPlan {
+    /// The planned windows in order
+    pub(crate) fn windows(&self, audio_len: usize) -> Vec<crate::scheduler::WindowSpan> {
+        match self {
+            Self::Single => vec![crate::scheduler::WindowSpan {
+                start: 0,
+                end: audio_len,
+                global_sample_offset: 0,
+                context_samples: 0,
+            }],
+            Self::Windows(plan) => plan
+                .tasks
+                .iter()
+                .map(|task| crate::scheduler::WindowSpan {
+                    start: task.audio_start,
+                    end: task.audio_end,
+                    global_sample_offset: task.global_sample_offset,
+                    context_samples: task.context_samples,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl LongFormTranscriptionPipeline {
+    /// The single-chunk pipeline inside
+    pub(crate) fn inner(&self) -> &TranscriptionPipeline {
+        &self.inner
+    }
+
+    /// Plans `audio` as [`Self::run_with_config`] would, without running a window
+    pub(crate) fn plan_scheduled(
+        &self,
+        audio: &[f32],
+        config: &LongFormConfig,
+    ) -> Result<ScheduledPlan, TranscriptionError> {
+        if audio.is_empty() {
+            return Err(TranscriptionError::EmptyAudio);
+        }
+        validate_finite_samples(audio, 0)?;
+
+        let plan = match config.run_path(audio.len()) {
+            RunPath::SingleWindow => return Ok(ScheduledPlan::Single),
+            RunPath::Planned(LongFormMode::Fast) => build_fast_execution_plan(audio.len(), config),
+            #[cfg(feature = "vad")]
+            RunPath::Planned(LongFormMode::Vad) => {
+                let control = TranscriptionControl::internal_unbounded();
+                let vad = self
+                    .vad
+                    .as_ref()
+                    .ok_or_else(|| self.inner.bundle().missing_vad_error())?;
+                let probabilities = vad.process(audio, &control)?;
+                let regions =
+                    detect_speech_regions(&probabilities, audio.len(), &config.segmentation);
+                build_vad_execution_plan(&regions, &probabilities, config)
+            }
+        };
+        Ok(ScheduledPlan::Windows(plan))
+    }
+
+    /// Merges the outputs of a plan's windows, in plan order, into its result
+    pub(crate) fn merge_scheduled(
+        &self,
+        audio_len: usize,
+        plan: ScheduledPlan,
+        raws: Vec<RawTranscription>,
+    ) -> Result<TranscriptionResult, TranscriptionError> {
+        match plan {
+            ScheduledPlan::Single => {
+                let raw = raws.into_iter().next().ok_or_else(|| {
+                    TranscriptionError::InvalidModelOutput(
+                        "a scheduled window went missing".to_owned(),
+                    )
+                })?;
+                Ok(self.inner.decode_raw(&raw, duration_seconds(audio_len)))
+            }
+            ScheduledPlan::Windows(plan) => {
+                if plan.tasks.is_empty() {
+                    return Ok(TranscriptionResult::empty(duration_seconds(audio_len)));
+                }
+                let raws = raws.into_iter().map(Some).collect();
+                self.build_plan_result(audio_len, plan, raws)
+            }
+        }
     }
 }
 

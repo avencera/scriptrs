@@ -496,7 +496,7 @@ pub(super) fn build_fast_execution_plan(
 }
 
 #[derive(Debug)]
-pub(super) struct LongFormExecutionPlan {
+pub(crate) struct LongFormExecutionPlan {
     pub(super) tasks: Vec<ChunkTask>,
     pub(super) regions: Vec<RegionTask>,
 }

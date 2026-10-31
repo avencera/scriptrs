@@ -4,7 +4,7 @@ use crate::decode::{ParakeetTdtDecoder, RawTranscription};
 use crate::deployment::{FrontendSpec, ParakeetDeployment};
 use crate::error::TranscriptionError;
 use crate::frontend::ParakeetFeatureExtractor;
-use crate::model::ParakeetModel;
+use crate::model::{BatcherShape, ModelBatcher, ParakeetModel};
 use crate::models::ModelBundle;
 use crate::types::TranscriptionResult;
 use ndarray::Array2;
@@ -175,10 +175,33 @@ impl TranscriptionPipeline {
             .zip(windows)
             .map(|(decoded, window)| {
                 let mut raw = decoded.raw;
-                raw.place_on_timeline(window.context_samples, window.global_sample_offset);
+                Self::place_window(
+                    &mut raw,
+                    window.global_sample_offset,
+                    window.context_samples,
+                );
                 raw
             })
             .collect())
+    }
+
+    /// A batcher on the pipeline's model; see [`ParakeetModel::batcher`]
+    pub(crate) fn batcher(
+        &self,
+        language: crate::language::LanguageSelection,
+        shape: BatcherShape,
+    ) -> Result<ModelBatcher, TranscriptionError> {
+        self.model.batcher(language, shape)
+    }
+
+    /// Places a window's tokens on its recording's timeline, dropping those in its
+    /// left context, as [`Self::transcribe_prepared_batch`] does
+    pub(crate) fn place_window(
+        raw: &mut RawTranscription,
+        global_sample_offset: usize,
+        context_samples: usize,
+    ) {
+        raw.place_on_timeline(context_samples, global_sample_offset);
     }
 
     /// The deployment's frontend and single-chunk limit
@@ -211,6 +234,11 @@ impl ChunkSpec {
             chunk: self,
             extractor: ParakeetFeatureExtractor::new(self.frontend),
         }
+    }
+
+    /// Mel frames of the longest single input
+    pub(crate) fn max_feature_frames(self) -> usize {
+        self.max_samples / self.frontend.hop_length() + 1
     }
 
     /// Duration of `samples` at the deployment's sample rate
@@ -250,6 +278,16 @@ pub(crate) struct PreparedWindow {
 }
 
 impl PreparedChunk {
+    /// Log-mel features, `[frames, features]`
+    pub(crate) fn features(&self) -> &Array2<f32> {
+        &self.features
+    }
+
+    /// Mel frames
+    pub(crate) fn frames(&self) -> usize {
+        self.features.nrows()
+    }
+
     fn from_audio(
         audio: &[f32],
         chunk: ChunkSpec,
