@@ -6,7 +6,7 @@
 //! batch runs as a replayed graph of steps, and the host only reads the cursors back
 //! between replays to see whether every row has reached its last frame
 
-use cudakit::cudarc::driver::CudaSlice;
+use cudakit::cudarc::driver::{CudaSlice, CudaView, CudaViewMut};
 use cudakit::{DeviceTensor, Math};
 
 use crate::backend::LanguageMask;
@@ -17,6 +17,7 @@ use crate::cuda::kernels::{
 use crate::cuda::{Direction, HostStaging, linear, upload, upload_host, zeros};
 use crate::decode::{RawToken, RawTranscription};
 use crate::error::TranscriptionError;
+use crate::model::FinishedRows;
 use crate::native::spec::TransducerSpec;
 use crate::native::weights::WeightFile;
 
@@ -535,11 +536,31 @@ impl CudaDecoder {
         }
 
         let stream = runtime.stream();
-        let rows = ws.batch * ws.frames;
-        self.encoder_kernels.fill_rows(
-            stream,
-            &self.joint_enc.bias.data().slice(..),
+        self.project_frames(
+            runtime,
+            &encoder_out.slice(..),
             &mut ws.enc_proj.slice_mut(..),
+        )?;
+
+        ws.host_lens.copy_from_slice(lens);
+        let lens: Vec<u32> = lens.iter().map(|len| *len as u32).collect();
+        stream.memcpy_htod(&lens, &mut ws.lens)?;
+        Ok(())
+    }
+
+    /// Projects encoder frames (`[rows, d_model]`) for the joint into `out`
+    /// (`[rows, joint_hidden]`)
+    pub(crate) fn project_frames(
+        &self,
+        runtime: &CudaRuntime,
+        encoder_out: &CudaView<'_, f32>,
+        out: &mut CudaViewMut<'_, f32>,
+    ) -> Result<(), TranscriptionError> {
+        let rows = out.len() / self.joint_hidden;
+        self.encoder_kernels.fill_rows(
+            runtime.stream(),
+            &self.joint_enc.bias.data().slice(..),
+            out,
         )?;
         runtime.sgemm(
             linear(
@@ -552,13 +573,14 @@ impl CudaDecoder {
             ),
             encoder_out,
             self.joint_enc.weight.data(),
-            &mut ws.enc_proj,
+            out,
         )?;
-
-        ws.host_lens.copy_from_slice(lens);
-        let lens: Vec<u32> = lens.iter().map(|len| *len as u32).collect();
-        stream.memcpy_htod(&lens, &mut ws.lens)?;
         Ok(())
+    }
+
+    /// Joint width of [`Self::project_frames`]'s output
+    pub(crate) fn joint_hidden(&self) -> usize {
+        self.joint_hidden
     }
 
     /// Feeds each emitting row's label through the LSTM and projects the top layer
@@ -570,8 +592,23 @@ impl CudaDecoder {
         runtime: &CudaRuntime,
         ws: &mut DecodeWorkspace,
     ) -> Result<(), TranscriptionError> {
+        let rows = ws.batch;
+        self.predict_rows(runtime, ws, rows)
+    }
+
+    /// [`Self::predict`] over the workspace's first `rows` rows; the rest keep
+    /// their state
+    fn predict_rows(
+        &self,
+        runtime: &CudaRuntime,
+        ws: &mut DecodeWorkspace,
+        rows: usize,
+    ) -> Result<(), TranscriptionError> {
         let stream = runtime.stream();
-        let n = ws.batch * self.hidden;
+        // each layer's state is `[batch, hidden]`, one after another, and the rows
+        // run are the first `rows` of each
+        let stride = ws.batch * self.hidden;
+        let n = rows * self.hidden;
         for (index, layer) in self.lstm.iter().enumerate() {
             let weights = LstmWeights {
                 weight_ih: layer.weight_ih.data().slice(..),
@@ -579,48 +616,51 @@ impl CudaDecoder {
                 bias: layer.bias.data().slice(..),
             };
             // the layer below's new state sits just before this layer's in `h_next`
-            let (below, mut rest) = ws.h_next.split_at_mut(index * n);
+            let (below, mut rest) = ws.h_next.split_at_mut(index * stride);
             let input = match index {
                 0 => LstmInput::Embedded {
                     table: self.embed.data().slice(..),
-                    label: ws.label.slice(..),
+                    label: ws.label.slice(..rows),
                 },
-                _ => LstmInput::Below(below.slice((index - 1) * n..)),
+                _ => LstmInput::Below(below.slice((index - 1) * stride..(index - 1) * stride + n)),
             };
+            let layer_rows = index * stride..index * stride + n;
             let mut state = LstmState {
-                h: ws.h.slice(index * n..(index + 1) * n),
+                h: ws.h.slice(layer_rows.clone()),
                 h_next: rest.slice_mut(..n),
-                c: ws.c.slice_mut(index * n..(index + 1) * n),
+                c: ws.c.slice_mut(layer_rows),
             };
             self.kernels.lstm(
                 stream,
                 &weights,
                 &input,
-                &ws.emit.slice(..),
+                &ws.emit.slice(..rows),
                 &mut state,
                 self.hidden,
             )?;
         }
 
-        let top = (self.lstm.len() - 1) * n;
+        let top = (self.lstm.len() - 1) * stride;
+        let joint = rows * self.joint_hidden;
         let mut buffers = Projection {
             weight: self.joint_pred.weight.data().slice(..),
             bias: self.joint_pred.bias.data().slice(..),
-            top: ws.h_next.slice(top..),
-            enc_proj: ws.enc_proj.slice(..),
-            frame: ws.frame.slice(..),
-            lens: ws.lens.slice(..),
+            top: ws.h_next.slice(top..top + n),
+            enc_proj: ws.enc_proj.slice(..joint * ws.frames),
+            frame: ws.frame.slice(..rows),
+            lens: ws.lens.slice(..rows),
             joint_bias: self.joint_out.bias.data().slice(..),
+            // the copy back covers every row; rows past `rows` get back what they hold
             h_next: ws.h_next.slice(..),
             h: ws.h.slice_mut(..),
-            pred_proj: ws.pred_proj.slice_mut(..),
-            joint_in: ws.joint_in.slice_mut(..),
-            logits: ws.logits.slice_mut(..),
+            pred_proj: ws.pred_proj.slice_mut(..joint),
+            joint_in: ws.joint_in.slice_mut(..joint),
+            logits: ws.logits.slice_mut(..rows * self.outputs),
         };
         self.kernels.project(
             stream,
             &mut buffers,
-            &ws.emit.slice(..),
+            &ws.emit.slice(..rows),
             ws.frames,
             self.hidden,
         )?;
@@ -637,58 +677,65 @@ impl CudaDecoder {
         runtime: &CudaRuntime,
         ws: &mut DecodeWorkspace,
     ) -> Result<(), TranscriptionError> {
-        runtime.sgemm(
-            linear(
-                ws.batch,
-                self.outputs,
-                self.joint_hidden,
-                1.0,
-                1.0,
-                Math::Fp32,
-            ),
-            &ws.joint_in,
-            self.joint_out.weight.data(),
-            &mut ws.logits,
-        )?;
-        self.decide(runtime, ws)?;
-        self.predict(runtime, ws)
+        let rows = ws.batch;
+        self.step_rows(runtime, ws, rows)
     }
 
-    /// Decides every unfinished row's token from the joint logits in `ws` and
-    /// advances its frame cursor
+    /// [`Self::step`] over the workspace's first `rows` rows; the rest keep their
+    /// state
+    pub(crate) fn step_rows(
+        &self,
+        runtime: &CudaRuntime,
+        ws: &mut DecodeWorkspace,
+        rows: usize,
+    ) -> Result<(), TranscriptionError> {
+        runtime.sgemm(
+            linear(rows, self.outputs, self.joint_hidden, 1.0, 1.0, Math::Fp32),
+            &ws.joint_in.slice(..rows * self.joint_hidden),
+            self.joint_out.weight.data(),
+            &mut ws.logits.slice_mut(..rows * self.outputs),
+        )?;
+        self.decide(runtime, ws, rows)?;
+        self.predict_rows(runtime, ws, rows)
+    }
+
+    /// Decides the token of every unfinished row of the first `rows` from the
+    /// joint logits in `ws` and advances its frame cursor
     fn decide(
         &self,
         runtime: &CudaRuntime,
         ws: &mut DecodeWorkspace,
+        rows: usize,
     ) -> Result<(), TranscriptionError> {
         let shape = DecodeShape {
-            batch: ws.batch,
+            batch: rows,
             classes: self.classes,
             max_symbols: self.max_symbols,
             capacity: ws.capacity,
         };
+        let slots = rows * ws.capacity;
         self.kernels.decide(
             runtime.stream(),
-            &ws.logits.slice(..),
-            &ws.lens.slice(..),
+            &ws.logits.slice(..rows * self.outputs),
+            &ws.lens.slice(..rows),
             &self.durations.slice(..),
             &DecodeFilter {
                 allowed: ws.allowed.slice(..),
                 top_k: ws.filter_top_k.slice(..),
             },
             &mut DecodeState {
-                frame: ws.frame.slice_mut(..),
-                emitted: ws.emitted.slice_mut(..),
-                label: ws.label.slice_mut(..),
-                emit: ws.emit.slice_mut(..),
-                counts: ws.counts.slice_mut(..),
-                faults: ws.faults.slice_mut(..),
+                frame: ws.frame.slice_mut(..rows),
+                emitted: ws.emitted.slice_mut(..rows),
+                label: ws.label.slice_mut(..rows),
+                emit: ws.emit.slice_mut(..rows),
+                counts: ws.counts.slice_mut(..rows),
+                faults: ws.faults.slice_mut(..rows),
             },
             &mut DecodeOutput {
-                tokens: ws.tokens.slice_mut(..),
-                frames: ws.token_frames.slice_mut(..),
-                durations: ws.token_durations.slice_mut(..),
-                confidences: ws.confidences.slice_mut(..),
+                tokens: ws.tokens.slice_mut(..slots),
+                frames: ws.token_frames.slice_mut(..slots),
+                durations: ws.token_durations.slice_mut(..slots),
+                confidences: ws.confidences.slice_mut(..slots),
             },
             shape,
         )?;
@@ -817,6 +864,378 @@ impl CudaDecoder {
                 RawTranscription { tokens }
             })
             .collect())
+    }
+}
+
+/// A decode workspace whose rows start and finish one at a time
+///
+/// [`CudaDecoder::admit`] starts windows in the lowest free rows and
+/// [`CudaDecoder::advance`] runs steps until some row may have finished, then
+/// retires the rows that have. Every row only reads its own slots. A step runs
+/// only the lane's [span](DecodeLane::span), the rows up to the last active one
+/// rounded up to a power of two, so a lone window does not pay for idle rows; the
+/// joint GEMM's shape follows the span, which can change a token's last bits
+///
+/// The host keeps a mirror of each row's decode state, read back at every check.
+/// No step runs between a check and an admission, so an admission can upload whole
+/// state arrays: the other rows' entries are what the device already holds
+pub(crate) struct DecodeLane {
+    ws: DecodeWorkspace,
+    mirror: RowMirror,
+    readback: LaneReadback,
+    upload: LaneUpload,
+    /// Whether each row holds a window that has not been retired
+    active: Vec<bool>,
+    /// Steps run since each active row started, against its step bound
+    steps: Vec<usize>,
+    /// The mirror matches the device: nothing was queued since the last check
+    synced: bool,
+}
+
+/// Host copies of the per-row decode state, `[rows]` each
+struct RowMirror {
+    lens: Vec<u32>,
+    frame: Vec<u32>,
+    emitted: Vec<u32>,
+    label: Vec<u32>,
+    counts: Vec<u32>,
+    faults: Vec<u32>,
+}
+
+/// Pinned downloads a check needs beyond the workspace's own
+struct LaneReadback {
+    emitted: HostStaging<u32>,
+    label: HostStaging<u32>,
+}
+
+/// Pinned uploads of the per-row state an admission writes
+struct LaneUpload {
+    lens: HostStaging<u32>,
+    frame: HostStaging<u32>,
+    emitted: HostStaging<u32>,
+    label: HostStaging<u32>,
+    emit: HostStaging<u32>,
+    counts: HostStaging<u32>,
+    faults: HostStaging<u32>,
+}
+
+/// A window to start in a lane row: its rows of a joint projection
+pub(crate) struct Admission<'a> {
+    /// The window's encoder frames projected for the joint, `[frames, joint_hidden]`
+    /// with at least `frames` rows
+    pub projected: CudaView<'a, f32>,
+    /// Valid encoder frames
+    pub frames: usize,
+}
+
+impl DecodeLane {
+    /// Rows the lane decodes at once
+    pub(crate) fn rows(&self) -> usize {
+        self.ws.batch
+    }
+
+    /// Longest window, in encoder frames, a row takes
+    pub(crate) fn frames(&self) -> usize {
+        self.ws.frames
+    }
+
+    pub(crate) fn active_rows(&self) -> usize {
+        self.active.iter().filter(|active| **active).count()
+    }
+
+    pub(crate) fn free_rows(&self) -> usize {
+        self.rows() - self.active_rows()
+    }
+
+    /// Rows a step runs: every active row lies below it, and powers of two keep
+    /// the shapes a caller captures graphs for few
+    pub(crate) fn span(&self) -> usize {
+        let end = self
+            .active
+            .iter()
+            .rposition(|active| *active)
+            .map_or(0, |row| row + 1);
+        end.next_power_of_two().min(self.rows())
+    }
+
+    /// The workspace, for the graph capture of [`CudaDecoder::step_rows`]
+    pub(crate) fn workspace(&mut self) -> &mut DecodeWorkspace {
+        &mut self.ws
+    }
+
+    /// Forgets every row, after an error left the device state unknown
+    pub(crate) fn reset(&mut self) {
+        self.active.fill(false);
+        self.synced = false;
+    }
+}
+
+impl CudaDecoder {
+    /// A lane of `rows` rows for windows of up to `frames` encoder frames, decoding
+    /// under the language filter `mask`
+    pub(crate) fn lane(
+        &self,
+        runtime: &CudaRuntime,
+        rows: usize,
+        frames: usize,
+        mask: Option<&LanguageMask>,
+    ) -> Result<DecodeLane, TranscriptionError> {
+        let stream = runtime.stream();
+        let mut ws = self.workspace(runtime, rows, frames)?;
+        self.set_language(runtime, &mut ws, mask)?;
+        let download = |len: usize| HostStaging::<u32>::new(stream, len, Direction::Download);
+        let upload = |len: usize| HostStaging::<u32>::new(stream, len, Direction::Upload);
+        // a fresh workspace is all zeros: every row has length 0, so steps skip it
+        Ok(DecodeLane {
+            ws,
+            mirror: RowMirror {
+                lens: vec![0; rows],
+                frame: vec![0; rows],
+                emitted: vec![0; rows],
+                label: vec![0; rows],
+                counts: vec![0; rows],
+                faults: vec![0; rows],
+            },
+            readback: LaneReadback {
+                emitted: download(rows)?,
+                label: download(rows)?,
+            },
+            upload: LaneUpload {
+                lens: upload(rows)?,
+                frame: upload(rows)?,
+                emitted: upload(rows)?,
+                label: upload(rows)?,
+                emit: upload(rows)?,
+                counts: upload(rows)?,
+                faults: upload(rows)?,
+            },
+            active: vec![false; rows],
+            steps: vec![0; rows],
+            synced: true,
+        })
+    }
+
+    /// Starts each window in a free row and runs the predictor on its start symbol,
+    /// returning the rows in order
+    ///
+    /// Fails without starting any if there are fewer free rows than windows or a
+    /// window is longer than the lane's rows
+    pub(crate) fn admit(
+        &self,
+        runtime: &CudaRuntime,
+        lane: &mut DecodeLane,
+        windows: &[Admission<'_>],
+    ) -> Result<Vec<usize>, TranscriptionError> {
+        if windows.len() > lane.free_rows() {
+            return Err(TranscriptionError::InvalidConfiguration(format!(
+                "{} windows for {} free decoder rows",
+                windows.len(),
+                lane.free_rows()
+            )));
+        }
+        let (frames, joint_hidden) = (lane.frames(), self.joint_hidden);
+        if let Some(window) = windows.iter().find(|window| {
+            window.frames == 0
+                || window.frames > frames
+                || window.projected.len() < window.frames * joint_hidden
+        }) {
+            return Err(TranscriptionError::InvalidConfiguration(format!(
+                "a window of {} encoder frames does not fit decoder rows of {frames}",
+                window.frames
+            )));
+        }
+        if !lane.synced {
+            self.check(runtime, lane)?;
+        }
+
+        let stream = runtime.stream();
+        let rows: Vec<usize> = (0..lane.rows())
+            .filter(|row| !lane.active[*row])
+            .take(windows.len())
+            .collect();
+        let state = self.hidden * lane.rows();
+        let blank = (self.classes - 1) as u32;
+        let mut emit = vec![0u32; lane.rows()];
+        for (row, window) in rows.iter().copied().zip(windows) {
+            let len = window.frames * joint_hidden;
+            let at = row * frames * joint_hidden;
+            stream.memcpy_dtod(
+                &window.projected.slice(..len),
+                &mut lane.ws.enc_proj.slice_mut(at..at + len),
+            )?;
+            // each layer's state is `[rows, hidden]`, one after another
+            for layer in 0..self.lstm.len() {
+                let slots =
+                    layer * state + row * self.hidden..layer * state + (row + 1) * self.hidden;
+                stream.memset_zeros(&mut lane.ws.h.slice_mut(slots.clone()))?;
+                stream.memset_zeros(&mut lane.ws.c.slice_mut(slots))?;
+            }
+
+            let mirror = &mut lane.mirror;
+            mirror.lens[row] = window.frames as u32;
+            mirror.frame[row] = 0;
+            mirror.emitted[row] = 0;
+            // the blank is NeMo's start symbol, and each new row feeds it once
+            mirror.label[row] = blank;
+            mirror.counts[row] = 0;
+            mirror.faults[row] = 0;
+            emit[row] = 1;
+            lane.active[row] = true;
+            lane.steps[row] = 0;
+        }
+
+        let span = lane.span();
+        let (mirror, upload, ws) = (&lane.mirror, &mut lane.upload, &mut lane.ws);
+        for (staging, values, device) in [
+            (&mut upload.lens, &mirror.lens, &mut ws.lens),
+            (&mut upload.frame, &mirror.frame, &mut ws.frame),
+            (&mut upload.emitted, &mirror.emitted, &mut ws.emitted),
+            (&mut upload.label, &mirror.label, &mut ws.label),
+            (&mut upload.emit, &emit, &mut ws.emit),
+            (&mut upload.counts, &mirror.counts, &mut ws.counts),
+            (&mut upload.faults, &mirror.faults, &mut ws.faults),
+        ] {
+            staging.write()?.copy_from_slice(values);
+            staging.upload(stream, device)?;
+        }
+        ws.host_lens = mirror.lens.iter().map(|len| *len as usize).collect();
+        // only the new rows emit, so the others keep their predictor state
+        self.predict_rows(runtime, ws, span)?;
+        lane.synced = false;
+        Ok(rows)
+    }
+
+    /// Runs `advance` (which must run `steps` decode steps over the lane's first
+    /// `span` rows) until some active row may have finished, then retires every
+    /// row that has, with its tokens or why it failed
+    ///
+    /// The cursors bound how soon a row can finish ([`Self::steps_left`]), so the
+    /// GPU runs that many steps back to back before the host checks
+    pub(crate) fn advance(
+        &self,
+        runtime: &CudaRuntime,
+        lane: &mut DecodeLane,
+        steps: usize,
+        mut advance: impl FnMut(&mut DecodeWorkspace, usize) -> Result<(), TranscriptionError>,
+    ) -> Result<FinishedRows, TranscriptionError> {
+        let steps = steps.max(1);
+        if !lane.synced {
+            self.check(runtime, lane)?;
+        }
+        let soonest = (0..lane.rows())
+            .filter(|row| lane.active[*row])
+            .map(|row| {
+                let mirror = &lane.mirror;
+                self.steps_left(&[mirror.lens[row] as usize], [mirror.frame[row] as usize])
+            })
+            .min();
+        let Some(soonest) = soonest else {
+            return Ok(Vec::new());
+        };
+
+        let launches = soonest.max(1).div_ceil(steps);
+        let span = lane.span();
+        for _ in 0..launches {
+            advance(&mut lane.ws, span)?;
+        }
+        lane.synced = false;
+        self.check(runtime, lane)?;
+
+        let mut finished = Vec::new();
+        for row in 0..lane.rows() {
+            if !lane.active[row] {
+                continue;
+            }
+            lane.steps[row] += launches * steps;
+            let len = lane.mirror.lens[row] as usize;
+            // as in `run_with`, plus the steps of the last launch, which may overrun
+            let bound = len * (self.max_symbols + 1) + steps;
+            let outcome = if lane.mirror.frame[row] >= lane.mirror.lens[row] {
+                self.row_output(runtime, lane, row)
+            } else if lane.steps[row] > bound {
+                Err(TranscriptionError::InvalidModelOutput(format!(
+                    "decode did not finish within {bound} steps"
+                )))
+            } else {
+                continue;
+            };
+            lane.active[row] = false;
+            finished.push((row, outcome));
+        }
+        Ok(finished)
+    }
+
+    /// Reads every row's state into the mirror; waits for the stream
+    fn check(
+        &self,
+        runtime: &CudaRuntime,
+        lane: &mut DecodeLane,
+    ) -> Result<(), TranscriptionError> {
+        let stream = runtime.stream();
+        let (ws, readback) = (&mut lane.ws, &mut lane.readback);
+        ws.host.frame.download(stream, &ws.frame)?;
+        ws.host.counts.download(stream, &ws.counts)?;
+        ws.host.faults.download(stream, &ws.faults)?;
+        readback.emitted.download(stream, &ws.emitted)?;
+        readback.label.download(stream, &ws.label)?;
+        // the copies run in order, so once the last has landed the rest have too
+        let mirror = &mut lane.mirror;
+        mirror.label.copy_from_slice(readback.label.read()?);
+        mirror.emitted.copy_from_slice(readback.emitted.read()?);
+        mirror.frame.copy_from_slice(ws.host.frame.read()?);
+        mirror.counts.copy_from_slice(ws.host.counts.read()?);
+        mirror.faults.copy_from_slice(ws.host.faults.read()?);
+        lane.synced = true;
+        Ok(())
+    }
+
+    /// A finished row's tokens, read from the device; the stream must be idle
+    fn row_output(
+        &self,
+        runtime: &CudaRuntime,
+        lane: &DecodeLane,
+        row: usize,
+    ) -> Result<RawTranscription, TranscriptionError> {
+        let ws = &lane.ws;
+        if lane.mirror.faults[row] != 0 {
+            return Err(TranscriptionError::InvalidModelOutput(
+                "joint logits for a decoder row were not finite".to_owned(),
+            ));
+        }
+        let count = lane.mirror.counts[row] as usize;
+        if count > ws.capacity {
+            return Err(TranscriptionError::InvalidModelOutput(format!(
+                "decode emitted {count} tokens for {} output slots",
+                ws.capacity
+            )));
+        }
+
+        let stream = runtime.stream();
+        let slots = row * ws.capacity..row * ws.capacity + count;
+        let mut token_ids = vec![0u32; count];
+        let mut frames = vec![0u32; count];
+        let mut durations = vec![0u32; count];
+        let mut confidences = vec![0f32; count];
+        if count > 0 {
+            // each copy into pageable memory waits for itself, on an idle stream
+            stream.memcpy_dtoh(&ws.tokens.slice(slots.clone()), &mut token_ids)?;
+            stream.memcpy_dtoh(&ws.token_frames.slice(slots.clone()), &mut frames)?;
+            stream.memcpy_dtoh(&ws.token_durations.slice(slots.clone()), &mut durations)?;
+            stream.memcpy_dtoh(&ws.confidences.slice(slots), &mut confidences)?;
+        }
+        let tokens = token_ids
+            .into_iter()
+            .zip(frames)
+            .zip(durations)
+            .zip(confidences)
+            .map(|(((id, frame), duration), confidence)| RawToken {
+                id,
+                frame: frame as usize,
+                duration: duration as usize,
+                confidence,
+            })
+            .collect();
+        Ok(RawTranscription { tokens })
     }
 }
 
@@ -1223,7 +1642,8 @@ mod tests {
             stream.memset_zeros(buffer).expect("reset");
         }
         decoder.set_language(runtime, ws, mask).expect("filter");
-        decoder.decide(runtime, ws).expect("decide");
+        let batch = ws.batch;
+        decoder.decide(runtime, ws, batch).expect("decide");
 
         let read = |buffer: &CudaSlice<u32>| stream.clone_dtoh(buffer).expect("read back");
         Decided {

@@ -62,7 +62,7 @@ mod download {
     use std::io;
     use std::path::{Component, Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use ureq::Agent;
     use ureq::http::Response;
@@ -73,6 +73,11 @@ mod download {
 
     // the Hub redirects renamed repos to their new name, so a few hops are legitimate
     const MAX_REDIRECTS: usize = 5;
+
+    // bounds on a stalled connection; there is no cap on a whole download, since a
+    // multi-gigabyte file on a slow link can legitimately take hours
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+    const STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
     /// Why a Hub download failed
     #[derive(Debug, thiserror::Error)]
@@ -179,6 +184,9 @@ mod download {
                 .http_status_as_error(false)
                 // redirects are followed by hand so the token never leaves the Hub
                 .max_redirects(0)
+                .timeout_connect(Some(CONNECT_TIMEOUT))
+                .timeout_recv_response(Some(STALL_TIMEOUT))
+                .timeout_per_read(Some(STALL_TIMEOUT))
                 .user_agent(concat!(
                     env!("CARGO_PKG_NAME"),
                     "/",

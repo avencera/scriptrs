@@ -27,7 +27,7 @@ use crate::native::weights::WeightFile;
 
 /// Mel frames a batch is padded up to a multiple of: 0.64 s, so padding costs a
 /// 10 s utterance at most 6 % more encoder work
-const MEL_BUCKET: usize = 64;
+pub(super) const MEL_BUCKET: usize = 64;
 
 /// Decode steps per replay of the decode graph, between host checks of the frame
 /// cursors
@@ -36,7 +36,7 @@ pub(crate) const STEPS_PER_CHECK: usize = 16;
 /// Cached shapes may hold up to this fraction (1 / divisor) of the device memory
 /// free once the weights are loaded; the rest stays free for other work on the same
 /// GPU, such as diarization
-const CACHE_SHARE_DIVISOR: usize = 2;
+pub(super) const CACHE_SHARE_DIVISOR: usize = 2;
 
 /// Device buffers and graphs for one `(batch, padded mel frames)` shape
 struct Shape {
@@ -152,13 +152,24 @@ impl<T> Drop for ExclusiveTeardown<T> {
     }
 }
 
-struct Engine {
+pub(super) struct Engine {
     // fields drop in order: graphs and buffers, then weights, then the context
+    /// Also the lock every user of the runtime holds while it queues work, so no
+    /// thread queues onto the stream while another captures it
     shapes: Mutex<ShapeCache>,
-    encoder: CudaEncoder,
-    decoder: CudaDecoder,
-    features: usize,
-    runtime: CudaRuntime,
+    pub(super) encoder: CudaEncoder,
+    pub(super) decoder: CudaDecoder,
+    pub(super) features: usize,
+    pub(super) runtime: CudaRuntime,
+}
+
+impl Engine {
+    /// Holds the runtime for this thread's device work; see [`Engine::shapes`]
+    pub(super) fn lock_runtime(&self) -> Result<MutexGuard<'_, impl Sized>, TranscriptionError> {
+        self.shapes.lock().map_err(|_| {
+            TranscriptionError::InvalidModelOutput("the CUDA model lock was poisoned".to_owned())
+        })
+    }
 }
 
 /// Parakeet encoder and greedy decode on CUDA device 0, shared by clones
@@ -186,6 +197,10 @@ impl fmt::Debug for CudaModel {
 }
 
 impl CudaModel {
+    pub(super) fn engine(&self) -> &Engine {
+        &self.0
+    }
+
     /// Loads native weights for `deployment` onto CUDA device 0, with the encoder
     /// GEMMs at `precision`
     pub(crate) fn load(
