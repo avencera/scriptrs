@@ -10,7 +10,7 @@ class ScriptrsError(Exception):
     without parsing messages: ``configuration``, ``unsupported_language``,
     ``unsupported_platform``, ``model_download``, ``missing_model``,
     ``invalid_model``, ``empty_audio``, ``audio_too_long``, ``invalid_audio``,
-    ``audio_decode``, ``io``, ``cuda``, ``coreml``, ``queue``, ``transcription``.
+    ``audio_decode``, ``io``, ``cuda``, ``coreml``, ``scheduler``, ``transcription``.
     """
 
     def __init__(self, code: str, message: str) -> None:
