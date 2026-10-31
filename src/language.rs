@@ -236,23 +236,32 @@ impl LanguageSelection {
 /// Select the highest-logit language that is inside `allowlist`
 ///
 /// `languages` and `logits` are parallel. Entries whose language is not in the
-/// allowlist are ignored, so automatic detection cannot leave the typed set.
-/// Non-finite logits are rejected
+/// allowlist are ignored, so automatic detection cannot leave the typed set
+///
+/// # Errors
+///
+/// Returns [`TranscriptionError::InvalidModelOutput`] when the slices have
+/// different lengths, and [`TranscriptionError::InvalidLanguageLogit`] for a
+/// non-finite logit
 pub fn select_language_from_logits(
     languages: &[ParakeetLanguage],
     logits: &[f32],
     allowlist: &[ParakeetLanguage],
 ) -> Result<Option<ParakeetLanguage>, TranscriptionError> {
-    validate_candidate_logits(logits)?;
-    let count = languages.len().min(logits.len());
+    if languages.len() != logits.len() {
+        return Err(TranscriptionError::InvalidModelOutput(format!(
+            "language/logit length mismatch: languages={} logits={}",
+            languages.len(),
+            logits.len()
+        )));
+    }
+    validate_candidate_logits(logits.iter().copied())?;
     let mut best_language = None;
     let mut best_logit = f32::NEG_INFINITY;
-    for index in 0..count {
-        let language = languages[index];
+    for (&language, &logit) in languages.iter().zip(logits) {
         if !allowlist.contains(&language) {
             continue;
         }
-        let logit = logits[index];
         if best_language.is_none() || logit > best_logit {
             best_logit = logit;
             best_language = Some(language);
@@ -343,13 +352,13 @@ pub fn filter_top_k_language(
     language: ParakeetLanguage,
     blank_id: usize,
 ) -> Result<Option<FilteredToken>, TranscriptionError> {
-    let logits: Vec<f32> = top_k.pairs().iter().map(|pair| pair.logit).collect();
-    validate_candidate_logits(&logits)?;
+    let logits = || top_k.pairs().iter().map(|pair| pair.logit);
+    validate_candidate_logits(logits())?;
 
     let preferred_script = language.script();
-    let mut best_idx = None;
+    let mut best = None;
     let mut best_logit = f32::NEG_INFINITY;
-    for (index, pair) in top_k.pairs().iter().enumerate() {
+    for pair in top_k.pairs() {
         if pair.token_id == blank_id {
             continue;
         }
@@ -359,48 +368,29 @@ pub fn filter_top_k_language(
         if !token_matches_script(token_text, preferred_script) {
             continue;
         }
-        if best_idx.is_none() || pair.logit > best_logit {
+        if best.is_none() || pair.logit > best_logit {
             best_logit = pair.logit;
-            best_idx = Some(index);
+            best = Some(pair);
         }
     }
-    let Some(best_idx) = best_idx else {
+    let Some(best) = best else {
         return Ok(None);
     };
 
-    let mut max_logit = f32::NEG_INFINITY;
-    for pair in top_k.pairs() {
-        if pair.logit > max_logit {
-            max_logit = pair.logit;
-        }
-    }
-    if !max_logit.is_finite() {
-        return Ok(Some(FilteredToken {
-            token_id: top_k.pairs()[best_idx].token_id,
-            probability: 0.0,
-        }));
-    }
-
-    let mut sum_exp = 0.0f32;
-    for pair in top_k.pairs() {
-        sum_exp += (pair.logit - max_logit).exp();
-    }
-    if sum_exp <= 0.0 {
-        return Ok(Some(FilteredToken {
-            token_id: top_k.pairs()[best_idx].token_id,
-            probability: 0.0,
-        }));
-    }
-
-    let probability = ((top_k.pairs()[best_idx].logit - max_logit).exp() / sum_exp).clamp(0.0, 1.0);
+    // the logits are finite and nonempty, so the maximum is finite and its own
+    // term makes the sum at least 1
+    let max_logit = logits().fold(f32::NEG_INFINITY, f32::max);
+    let sum_exp: f32 = logits().map(|logit| (logit - max_logit).exp()).sum();
     Ok(Some(FilteredToken {
-        token_id: top_k.pairs()[best_idx].token_id,
-        probability,
+        token_id: best.token_id,
+        probability: ((best.logit - max_logit).exp() / sum_exp).clamp(0.0, 1.0),
     }))
 }
 
-pub(crate) fn validate_candidate_logits(logits: &[f32]) -> Result<(), TranscriptionError> {
-    for (index, value) in logits.iter().copied().enumerate() {
+pub(crate) fn validate_candidate_logits(
+    logits: impl IntoIterator<Item = f32>,
+) -> Result<(), TranscriptionError> {
+    for (index, value) in logits.into_iter().enumerate() {
         if !value.is_finite() {
             return Err(TranscriptionError::InvalidLanguageLogit { index, value });
         }
@@ -520,6 +510,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selected, Some(ParakeetLanguage::Polish));
+    }
+
+    /// Mismatched slices mean the caller paired the wrong arrays, so no
+    /// language is picked from the shorter prefix
+    #[test]
+    fn language_logits_of_another_length_are_rejected() {
+        let languages = [ParakeetLanguage::English, ParakeetLanguage::Polish];
+        for logits in [&[0.1][..], &[0.1, 0.2, 4.0][..]] {
+            assert!(
+                matches!(
+                    select_language_from_logits(&languages, logits, V3_LANGUAGES),
+                    Err(TranscriptionError::InvalidModelOutput(_))
+                ),
+                "{} logits for {} languages were accepted",
+                logits.len(),
+                languages.len()
+            );
+        }
     }
 
     #[test]

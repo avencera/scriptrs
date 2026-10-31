@@ -125,6 +125,24 @@ impl LongFormConfig {
         config
     }
 
+    /// Longest audio, in samples, transcribed as one window without planning
+    ///
+    /// This is the planner's own window, `overlap.max_model_samples`, rather than
+    /// the deployment's input limit: longer audio is split into windows of this
+    /// size in either mode, and in VAD mode only longer audio is scanned for speech
+    pub fn single_window_samples(&self) -> usize {
+        self.overlap.max_model_samples
+    }
+
+    /// How a run transcribes `audio_len` samples
+    fn run_path(&self, audio_len: usize) -> RunPath {
+        if audio_len <= self.single_window_samples() {
+            return RunPath::SingleWindow;
+        }
+
+        RunPath::Planned(self.mode)
+    }
+
     /// Validate all settings against the deployment that owns the pipeline
     pub fn validate_for(&self, deployment: &ParakeetDeployment) -> Result<(), TranscriptionError> {
         if self.batch_size == 0 {
@@ -142,6 +160,15 @@ impl LongFormConfig {
     }
 }
 
+/// How a run transcribes its audio
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunPath {
+    /// As one window, without planning
+    SingleWindow,
+    /// As the windows this mode plans
+    Planned(LongFormMode),
+}
+
 /// Long-form planning mode
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LongFormMode {
@@ -149,6 +176,8 @@ pub enum LongFormMode {
     #[default]
     Fast,
     /// Detect speech with VAD before chunk planning
+    ///
+    /// Audio that fits one window is transcribed whole without a VAD scan
     #[cfg(feature = "vad")]
     Vad,
 }
@@ -209,9 +238,9 @@ impl LongFormTranscriptionPipeline {
 
     /// Transcribe audio with the default long-form config
     ///
-    /// Short clips still go through the base single-chunk path. Longer clips use
-    /// overlap chunking by default, with optional VAD planning when
-    /// `vad` is enabled
+    /// Clips up to [`LongFormConfig::single_window_samples`] run as one window, and
+    /// longer clips use overlap chunking by default, with optional VAD planning
+    /// when `vad` is enabled
     pub fn run(&self, audio: &[f32]) -> Result<TranscriptionResult, TranscriptionError> {
         self.run_with_config(audio, &self.default_config)
     }
@@ -254,12 +283,15 @@ impl LongFormTranscriptionPipeline {
             control,
             preprocessor,
         };
-        if audio.len() <= self.inner.chunk_spec().max_samples() {
-            control.check_plan(1)?;
-            return self.run_single_task(request);
+        match config.run_path(audio.len()) {
+            RunPath::SingleWindow => {
+                control.check_plan(1)?;
+                self.run_single_task(request)
+            }
+            RunPath::Planned(LongFormMode::Fast) => self.run_fast_long_form(request),
+            #[cfg(feature = "vad")]
+            RunPath::Planned(LongFormMode::Vad) => self.run_vad_long_form(request),
         }
-
-        self.run_long_form(request)
     }
 
     /// Run the inner single-chunk pipeline directly
@@ -293,17 +325,6 @@ impl LongFormTranscriptionPipeline {
     /// Return the default long-form config
     pub fn config(&self) -> &LongFormConfig {
         &self.default_config
-    }
-
-    fn run_long_form<P: WindowPreprocessor + ?Sized>(
-        &self,
-        request: RunRequest<'_, P>,
-    ) -> Result<TranscriptionResult, PreprocessedTranscriptionError<P::Error>> {
-        match request.config.mode {
-            LongFormMode::Fast => self.run_fast_long_form(request),
-            #[cfg(feature = "vad")]
-            LongFormMode::Vad => self.run_vad_long_form(request),
-        }
     }
 
     #[cfg(feature = "vad")]
@@ -441,11 +462,7 @@ impl LongFormTranscriptionPipeline {
         task_indices: &[usize],
         raw_tasks: &mut [Option<RawTranscription>],
     ) -> Result<Vec<TimedToken>, TranscriptionError> {
-        let mut windows = Vec::with_capacity(task_indices.len());
-        for task_idx in task_indices {
-            windows.push(take_raw_task(raw_tasks, *task_idx)?);
-        }
-        let merged = merge_overlapping_windows(windows);
+        let merged = merge_overlap_region(task_indices, raw_tasks)?;
         Ok(self
             .inner
             .decode_raw(&merged, duration_seconds(audio_len))
@@ -504,14 +521,12 @@ impl LongFormTranscriptionPipeline {
             return Err(TranscriptionError::EmptyAudio);
         }
         validate_finite_samples(audio, 0)?;
-        if audio.len() <= self.inner.chunk_spec().max_samples() {
-            return Ok(ScheduledPlan::Single);
-        }
 
-        let plan = match config.mode {
-            LongFormMode::Fast => build_fast_execution_plan(audio.len(), config),
+        let plan = match config.run_path(audio.len()) {
+            RunPath::SingleWindow => return Ok(ScheduledPlan::Single),
+            RunPath::Planned(LongFormMode::Fast) => build_fast_execution_plan(audio.len(), config),
             #[cfg(feature = "vad")]
-            LongFormMode::Vad => {
+            RunPath::Planned(LongFormMode::Vad) => {
                 let control = TranscriptionControl::internal_unbounded();
                 let vad = self
                     .vad
@@ -577,6 +592,18 @@ fn identity_error(
         PreprocessedTranscriptionError::Transcription(error) => error,
         PreprocessedTranscriptionError::Preprocessing(error) => match error {},
     }
+}
+
+/// Merges the windows of one overlap region into one transcription
+fn merge_overlap_region(
+    task_indices: &[usize],
+    raw_tasks: &mut [Option<RawTranscription>],
+) -> Result<RawTranscription, TranscriptionError> {
+    let mut windows = Vec::with_capacity(task_indices.len());
+    for task_idx in task_indices {
+        windows.push(take_raw_task(raw_tasks, *task_idx)?);
+    }
+    Ok(merge_overlapping_windows(windows))
 }
 
 fn take_raw_task(
@@ -649,17 +676,27 @@ mod tests {
     use std::fmt::{Display, Formatter};
     use std::sync::{Arc, Mutex};
 
-    #[cfg(all(feature = "cuda", feature = "vad"))]
-    use super::planner::{SampleRange, build_region_plan};
-    use super::{LongFormConfig, LongFormMode, WindowPreprocessor};
     #[cfg(feature = "cuda")]
-    use super::{LongFormTranscriptionPipeline, build_fast_execution_plan};
+    use super::LongFormTranscriptionPipeline;
     #[cfg(all(feature = "cuda", feature = "vad"))]
-    use super::{SileroVad, detect_speech_regions};
+    use super::SileroVad;
+    #[cfg(feature = "vad")]
+    use super::planner::{RegionTaskKind, SampleRange, build_vad_execution_plan};
+    use super::{
+        LongFormConfig, LongFormMode, RunPath, WindowPreprocessor, build_fast_execution_plan,
+    };
+    #[cfg(feature = "vad")]
+    use super::{detect_speech_regions, merge_overlap_region};
     #[cfg(all(feature = "cuda", feature = "vad"))]
     use crate::constants::SAMPLE_RATE;
+    #[cfg(feature = "vad")]
+    use crate::constants::{SAMPLES_PER_ENCODER_FRAME, VAD_WINDOW_SAMPLES};
     #[cfg(feature = "cuda")]
     use crate::cuda::test_support::nemo_parity_bundle;
+    #[cfg(feature = "vad")]
+    use crate::decode::RawTranscription;
+    #[cfg(feature = "vad")]
+    use crate::decode::test_support::raw_from_columns;
     use crate::deployment::ParakeetDeployment;
     #[cfg(feature = "cuda")]
     use crate::error::TranscriptionError;
@@ -759,6 +796,143 @@ mod tests {
         config.overlap.max_model_samples = 0;
 
         assert!(config.validate_for(&deployment).is_err());
+    }
+
+    /// Every deployment's defaults validate, and so do a native bundle's, until the
+    /// context leaves no room in a window for one frame of audio
+    #[test]
+    fn default_configs_validate_until_context_fills_the_window() {
+        let check = |mut config: LongFormConfig, deployment: &ParakeetDeployment| {
+            config
+                .validate_for(deployment)
+                .expect("the defaults should validate");
+
+            let frame = deployment.frontend().samples_per_encoder_frame();
+            let window = config.overlap.max_model_samples;
+            config.overlap.context_samples = (window - frame) / frame * frame;
+            config
+                .validate_for(deployment)
+                .expect("a context leaving room for one frame should validate");
+            config.overlap.context_samples += frame;
+            assert!(config.validate_for(deployment).is_err());
+        };
+
+        for deployment in [ParakeetDeployment::v2(), ParakeetDeployment::v3()] {
+            check(LongFormConfig::from_deployment(&deployment), &deployment);
+
+            #[cfg(feature = "cuda")]
+            {
+                let bundle = crate::models::ModelBundle::from_native_dir("models", deployment);
+                check(LongFormConfig::for_bundle(&bundle), bundle.deployment());
+            }
+        }
+    }
+
+    /// The planner's own window, not the model's input limit, decides when audio
+    /// is planned, so lowering it plans clips the model could take whole
+    #[test]
+    #[cfg_attr(
+        not(feature = "vad"),
+        expect(
+            clippy::single_element_loop,
+            reason = "VAD mode exists only with `vad`"
+        )
+    )]
+    fn audio_past_the_planner_window_is_planned() {
+        let deployment = ParakeetDeployment::v3();
+        let mut config = LongFormConfig::from_deployment(&deployment);
+        config.overlap.max_model_samples = 48_000;
+        let window = config.single_window_samples();
+
+        assert_eq!(window, 48_000);
+        for mode in [
+            LongFormMode::Fast,
+            #[cfg(feature = "vad")]
+            LongFormMode::Vad,
+        ] {
+            config.mode = mode;
+            assert_eq!(config.run_path(window - 1), RunPath::SingleWindow);
+            assert_eq!(config.run_path(window), RunPath::SingleWindow);
+            assert_eq!(config.run_path(window + 1), RunPath::Planned(mode));
+        }
+
+        let plan = build_fast_execution_plan(deployment.hard_sample_max(), &config);
+        assert!(plan.tasks.len() > 1);
+        assert!(
+            plan.tasks
+                .iter()
+                .all(|task| task.audio_end - task.audio_start <= window)
+        );
+    }
+
+    /// A token belongs to the region it starts in, or to the next region when it
+    /// starts in the gap before one: VAD regions under a frame apart transcribe
+    /// the frame both hear once, and the frame a region starts inside is kept
+    #[cfg(feature = "vad")]
+    #[test]
+    fn vad_regions_keep_each_frame_once() {
+        let mut config = LongFormConfig::default();
+        config.overlap.max_model_samples = 48_000;
+        config.segmentation.speech_padding = 0.01;
+        config.segmentation.min_silence_duration = 0.02;
+        config.segmentation.min_silence_at_max_speech = 10.0;
+
+        let mut probabilities = vec![0.0; 8];
+        probabilities.extend(std::iter::repeat_n(0.9, 300));
+        probabilities.extend(std::iter::repeat_n(0.0, 2));
+        probabilities.extend(std::iter::repeat_n(0.9, 300));
+        probabilities.extend(std::iter::repeat_n(0.0, 40));
+        probabilities.extend(std::iter::repeat_n(0.9, 300));
+        let audio_len = probabilities.len() * VAD_WINDOW_SAMPLES;
+        let regions = detect_speech_regions(&probabilities, audio_len, &config.segmentation);
+        assert_eq!(
+            regions,
+            vec![
+                SampleRange {
+                    start: 3_936,
+                    end: 157_856,
+                },
+                SampleRange {
+                    start: 158_560,
+                    end: 312_480,
+                },
+                SampleRange {
+                    start: 332_640,
+                    end: 486_400,
+                },
+            ]
+        );
+        let plan = build_vad_execution_plan(&regions, &probabilities, &config);
+
+        // one token on every frame a window hears, named by its recording frame
+        let mut raw_tasks: Vec<Option<RawTranscription>> = plan
+            .tasks
+            .iter()
+            .map(|task| {
+                let first = task.audio_start / SAMPLES_PER_ENCODER_FRAME;
+                let frames =
+                    (task.audio_end - task.audio_start).div_ceil(SAMPLES_PER_ENCODER_FRAME);
+                let ids: Vec<u32> = (first..first + frames).map(|frame| frame as u32).collect();
+                let window_frames: Vec<usize> = (0..frames).collect();
+                let mut raw =
+                    raw_from_columns(&ids, &window_frames, &vec![1; frames], &vec![0.9; frames]);
+                raw.place_on_timeline(task.context_samples, task.global_sample_offset);
+                Some(raw)
+            })
+            .collect();
+        let mut ids = Vec::new();
+        for region in &plan.regions {
+            assert!(matches!(region.kind, RegionTaskKind::Overlap));
+            let merged = merge_overlap_region(&region.task_indices, &mut raw_tasks)
+                .expect("every window has a transcription");
+            ids.extend(merged.ids());
+        }
+
+        // frame 3 starts before the first region and frame 259 in the gap before
+        // the third, so each is the next region's; frame 123 starts inside the
+        // first region, so the second, which hears it too, drops it
+        let expected: Vec<u32> = (3..=244).chain(259..=379).collect();
+        assert_eq!(ids, expected);
     }
 
     /// Silence past the native single-input limit, so it takes the long-form path
@@ -869,6 +1043,28 @@ mod tests {
             .expect("short audio should transcribe");
 
         assert_eq!(observed_hooks(&hook), vec![(0, 0, audio.len())]);
+    }
+
+    /// Audio the model could take whole but longer than the configured window runs
+    /// as the planned windows, not one
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs a CUDA GPU and the native weights; `just gpu-parity` runs it on gpu0"]
+    fn gpu_audio_past_the_window_runs_the_planned_windows() {
+        let (pipeline, config) = native_pipeline();
+        let audio = vec![0.0; 100_000];
+        let planned = planned_windows(audio.len(), &config);
+        assert!(planned.len() > 1);
+        assert!(audio.len() < pipeline.base_pipeline().deployment().hard_sample_max());
+        let hook = RecordingHook(Arc::new(Mutex::new(Vec::new())));
+
+        pipeline
+            .run_with_preprocessor(&audio, &config, &recording_control(planned.len()), &hook)
+            .expect("audio past the window should transcribe");
+
+        let mut observed = observed_hooks(&hook);
+        observed.sort_unstable();
+        assert_eq!(observed, planned);
     }
 
     /// Every path preprocesses each planned window exactly once, with its index and
@@ -1030,7 +1226,8 @@ mod tests {
     }
 
     /// A preprocessor error stops the parallel and batched workers, which join and
-    /// return that error rather than finishing the plan
+    /// return that error rather than finishing the plan, and leaves the caller's
+    /// control uncancelled
     #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "needs a CUDA GPU and the native weights; `just gpu-parity` runs it on gpu0"]
@@ -1063,9 +1260,10 @@ mod tests {
             let config = path.config(&base);
             let planned = planned_windows(audio.len(), &config).len();
             let hook = FailingHook(RecordingHook(Arc::new(Mutex::new(Vec::new()))));
+            let control = recording_control(planned);
 
             let error = pipeline
-                .run_with_preprocessor(&audio, &config, &recording_control(planned), &hook)
+                .run_with_preprocessor(&audio, &config, &control, &hook)
                 .expect_err("a preprocessor failure should join every worker");
 
             assert!(
@@ -1081,6 +1279,8 @@ mod tests {
                 observed < planned,
                 "{path:?} preprocessed all {planned} windows after the first error"
             );
+            // stopping the workers must not cancel the caller's control
+            assert_eq!(control.check(), Ok(()), "{path:?} cancelled the caller");
         }
     }
 
@@ -1166,11 +1366,8 @@ mod tests {
         config: &LongFormConfig,
     ) -> (Vec<SampleRange>, Vec<(usize, usize)>) {
         let regions = detect_speech_regions(probabilities, audio_len, &config.segmentation);
-        let mut tasks = Vec::new();
-        for region in &regions {
-            build_region_plan(*region, probabilities, config, &mut tasks);
-        }
-        let windows = tasks
+        let windows = build_vad_execution_plan(&regions, probabilities, config)
+            .tasks
             .iter()
             .map(|task| (task.audio_start, task.audio_end))
             .collect();

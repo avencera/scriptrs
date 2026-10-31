@@ -110,7 +110,7 @@ impl PyPipeline {
 
     #[getter]
     fn max_chunk_seconds(&self) -> f64 {
-        self.deployment.hard_sample_max() as f64 / self.deployment.frontend().sample_rate() as f64
+        self.config.single_window_samples() as f64 / self.deployment.frontend().sample_rate() as f64
     }
 
     #[pyo3(signature = (samples, language=None))]
@@ -190,6 +190,9 @@ impl PyPipeline {
 
 /// Transcribe every input through a scheduler on a clone of the pipeline, which
 /// batches the windows of every input, short or long, together
+///
+/// The cutoff is the one long-form uses for a single window, so each input runs
+/// as the same windows `transcribe` would run it as
 ///
 /// Results keep input order. A failure stops nothing: each input gets its own
 /// result, and the caller decides what to raise

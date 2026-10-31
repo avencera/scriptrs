@@ -105,6 +105,10 @@ pub struct OverlapChunkConfig {
     /// Desired overlap between adjacent fallback windows
     pub overlap_seconds: f64,
     /// Left-context samples prepended to non-first fallback windows
+    ///
+    /// Must be a whole number of encoder frames (1280 samples), so each window's
+    /// tokens map onto the recording timeline exactly, and leave room in
+    /// `max_model_samples` for at least one frame of audio after it
     pub context_samples: usize,
     /// Maximum samples accepted by the base Parakeet model
     pub max_model_samples: usize,
@@ -147,6 +151,24 @@ impl OverlapChunkConfig {
                 deployment.hard_sample_max()
             )));
         }
+        let frame_samples = deployment.frontend().samples_per_encoder_frame();
+        if !self.context_samples.is_multiple_of(frame_samples) {
+            return Err(TranscriptionError::InvalidConfiguration(format!(
+                "overlap context_samples={} must be a multiple of the {frame_samples}-sample encoder frame",
+                self.context_samples
+            )));
+        }
+        // the chunk never shrinks below one frame, so a large context can push
+        // a window past the limit; a first window rounded down to a frame moves
+        // earlier but keeps its length, so this is the longest window planned
+        if self.max_window_samples() > self.max_model_samples {
+            return Err(TranscriptionError::InvalidConfiguration(format!(
+                "overlap windows of context_samples={} plus at least one encoder frame of audio are {} samples, past max_model_samples={}",
+                self.context_samples,
+                self.max_window_samples(),
+                self.max_model_samples
+            )));
+        }
         if !self.overlap_seconds.is_finite() || self.overlap_seconds < 0.0 {
             return Err(TranscriptionError::InvalidConfiguration(format!(
                 "overlap overlap_seconds={} must be finite and non-negative",
@@ -174,6 +196,14 @@ impl OverlapChunkConfig {
         raw / SAMPLES_PER_ENCODER_FRAME * SAMPLES_PER_ENCODER_FRAME
     }
 
+    /// Longest overlap window the planner builds, left context included
+    ///
+    /// VAD segments and the single-window path are capped at `max_model_samples`
+    /// on their own
+    fn max_window_samples(&self) -> usize {
+        self.context_samples + self.chunk_samples()
+    }
+
     pub(crate) fn overlap_samples(&self) -> usize {
         let requested = (self.overlap_seconds * SAMPLE_RATE as f64) as usize;
         let capped = requested.min(self.chunk_samples() / 2);
@@ -185,9 +215,17 @@ impl OverlapChunkConfig {
         raw.max(SAMPLES_PER_ENCODER_FRAME) / SAMPLES_PER_ENCODER_FRAME * SAMPLES_PER_ENCODER_FRAME
     }
 
+    /// Splits `range` into overlapping windows that all start on encoder frame
+    /// boundaries
+    ///
+    /// Tokens are placed on the timeline by whole frames, so a window starting
+    /// mid-frame would land every token up to a frame early. The first window
+    /// starts at `range.start` rounded down to a frame instead, so the model hears
+    /// under 80 ms before the range; `push_overlap_task` drops that frame's tokens
+    /// only when the previous range kept them
     pub(crate) fn plan(&self, range: SampleRange) -> Vec<SampleRange> {
         let mut chunks = Vec::new();
-        let mut start = range.start;
+        let mut start = range.start / SAMPLES_PER_ENCODER_FRAME * SAMPLES_PER_ENCODER_FRAME;
         while start < range.end {
             let end = (start + self.chunk_samples()).min(range.end);
             chunks.push(SampleRange { start, end });
@@ -418,8 +456,16 @@ pub(super) fn build_vad_execution_plan(
 ) -> LongFormExecutionPlan {
     let mut tasks = Vec::new();
     let mut region_tasks = Vec::with_capacity(regions.len());
+    let mut previous_end = 0;
     for region in regions.iter().copied() {
-        region_tasks.push(build_region_plan(region, probabilities, config, &mut tasks));
+        region_tasks.push(build_region_plan(
+            region,
+            previous_end,
+            probabilities,
+            config,
+            &mut tasks,
+        ));
+        previous_end = region.end;
     }
     LongFormExecutionPlan {
         tasks,
@@ -440,7 +486,7 @@ pub(super) fn build_fast_execution_plan(
         .overlap
         .plan(full_audio)
         .into_iter()
-        .map(|chunk| push_overlap_task(&mut tasks, chunk, config))
+        .map(|chunk| push_overlap_task(&mut tasks, chunk, 0, config))
         .collect();
     let regions = vec![RegionTask {
         task_indices,
@@ -476,9 +522,12 @@ pub(super) enum RegionTaskKind {
     Overlap,
 }
 
+/// Plans the windows of one speech region, the first after `previous_end`, the
+/// previous region's end or 0
 #[cfg(feature = "vad")]
 pub(super) fn build_region_plan(
     region: SampleRange,
+    previous_end: usize,
     probabilities: &[f32],
     config: &LongFormConfig,
     tasks: &mut Vec<ChunkTask>,
@@ -512,7 +561,7 @@ pub(super) fn build_region_plan(
             .overlap
             .plan(region)
             .into_iter()
-            .map(|chunk| push_overlap_task(tasks, chunk, config))
+            .map(|chunk| push_overlap_task(tasks, chunk, previous_end, config))
             .collect(),
         kind: RegionTaskKind::Overlap,
     }
@@ -530,31 +579,50 @@ fn push_segment_task(tasks: &mut Vec<ChunkTask>, segment: SampleRange) -> usize 
     task_idx
 }
 
+/// Adds the task for overlap window `chunk` of a range that follows
+/// `previous_end`, the previous range's end or 0
+///
+/// A token belongs to the range it starts in, or to the next range when it starts
+/// in the gap between them. The previous range keeps every token that starts
+/// before its end, whether its windows were overlap windows or VAD segments, so
+/// a window keeps only frames starting at or after the first frame boundary past
+/// that end. A first window rounded down to a frame that reaches into the
+/// previous range drops that frame as context, and one that reaches only into
+/// the gap keeps it
 fn push_overlap_task(
     tasks: &mut Vec<ChunkTask>,
     chunk: SampleRange,
+    previous_end: usize,
     config: &LongFormConfig,
 ) -> usize {
     let task_idx = tasks.len();
+    let own_start = chunk
+        .start
+        .max(previous_end.next_multiple_of(SAMPLES_PER_ENCODER_FRAME));
     let context_start = chunk.start.saturating_sub(config.overlap.context_samples);
     tasks.push(ChunkTask {
         audio_start: context_start,
         audio_end: chunk.end,
-        global_sample_offset: chunk.start,
-        context_samples: chunk.start - context_start,
+        global_sample_offset: own_start,
+        context_samples: own_start - context_start,
     });
     task_idx
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "vad")]
+    use super::{LongFormExecutionPlan, build_vad_execution_plan};
     use super::{OverlapChunkConfig, RegionTaskKind, SampleRange, build_fast_execution_plan};
     #[cfg(feature = "vad")]
     use super::{
         VadSegmentationConfig, build_region_plan, detect_speech_regions, plan_region_subsegments,
     };
+    use crate::constants::SAMPLES_PER_ENCODER_FRAME;
     #[cfg(feature = "vad")]
     use crate::constants::VAD_WINDOW_SAMPLES;
+    #[cfg(feature = "vad")]
+    use crate::decode::test_support::raw_from_columns;
     use crate::deployment::ParakeetDeployment;
     use crate::long_form::{LongFormConfig, LongFormMode};
 
@@ -817,6 +885,68 @@ mod tests {
     }
 
     #[test]
+    fn overlap_rejects_context_that_is_not_whole_encoder_frames() {
+        let deployment = ParakeetDeployment::v3();
+        let mut config = OverlapChunkConfig::from_deployment(&deployment);
+        config.context_samples = 2_000;
+        assert!(config.validate_for(&deployment).is_err());
+
+        config.context_samples = 2 * SAMPLES_PER_ENCODER_FRAME;
+        assert!(config.validate_for(&deployment).is_ok());
+    }
+
+    /// Longest window, context included, of a fast plan for `audio_len` samples
+    /// and, with `vad`, of a speech region as long that starts mid-frame
+    fn longest_planned_window(config: &LongFormConfig, audio_len: usize) -> usize {
+        let tasks = build_fast_execution_plan(audio_len, config).tasks;
+        #[cfg(feature = "vad")]
+        let tasks = {
+            let mut tasks = tasks;
+            let region = SampleRange {
+                start: 896,
+                end: 896 + audio_len,
+            };
+            let probabilities = vec![0.9; region.end.div_ceil(VAD_WINDOW_SAMPLES)];
+            build_region_plan(region, 0, &probabilities, config, &mut tasks);
+            tasks
+        };
+        tasks
+            .iter()
+            .map(|task| task.audio_end - task.audio_start)
+            .max()
+            .expect("the plans have windows")
+    }
+
+    /// Validation accepts exactly the contexts whose planned windows all fit the
+    /// window limit, including a VAD region's first window rounded down to a frame
+    #[test]
+    fn overlap_validation_accepts_exactly_the_contexts_whose_windows_fit() {
+        let deployment = ParakeetDeployment::v3();
+        let hard_max = deployment.hard_sample_max();
+        let mut config = LongFormConfig::from_deployment(&deployment);
+        #[cfg(feature = "vad")]
+        {
+            config.segmentation.min_silence_at_max_speech = 10.0;
+        }
+        let mut rejected = 0;
+        for max_model_samples in [hard_max, 48_000, 2_000, 1_000] {
+            config.overlap.max_model_samples = max_model_samples;
+            for frames in 0..=max_model_samples / SAMPLES_PER_ENCODER_FRAME + 2 {
+                config.overlap.context_samples = frames * SAMPLES_PER_ENCODER_FRAME;
+                let longest = longest_planned_window(&config, 2 * hard_max);
+                let fits = longest <= max_model_samples;
+                assert_eq!(
+                    config.overlap.validate_for(&deployment).is_ok(),
+                    fits,
+                    "max_model_samples={max_model_samples} context frames {frames}: longest window {longest}"
+                );
+                rejected += usize::from(!fits);
+            }
+        }
+        assert!(rejected > 0);
+    }
+
+    #[test]
     fn overlap_rejects_a_duration_above_the_deployment_hard_limit() {
         let deployment = ParakeetDeployment::v3();
         let mut config = OverlapChunkConfig::from_deployment(&deployment);
@@ -835,7 +965,7 @@ mod tests {
             end: 32_000,
         };
 
-        let plan = build_region_plan(region, &[], &config, &mut tasks);
+        let plan = build_region_plan(region, 0, &[], &config, &mut tasks);
 
         assert!(matches!(plan.kind, RegionTaskKind::Segments));
         assert_eq!(plan.task_indices, vec![0]);
@@ -857,7 +987,7 @@ mod tests {
         };
         let probabilities = vec![1.0; region.end.div_ceil(512)];
 
-        let plan = build_region_plan(region, &probabilities, &config, &mut tasks);
+        let plan = build_region_plan(region, 0, &probabilities, &config, &mut tasks);
 
         assert!(matches!(plan.kind, RegionTaskKind::Overlap));
         assert_eq!(plan.task_indices.len(), tasks.len());
@@ -871,6 +1001,69 @@ mod tests {
                 .iter()
                 .all(|task| task.context_samples <= task.global_sample_offset)
         );
+    }
+
+    /// Places a token on every encoder frame of each overlap window the way the
+    /// pipeline does, and checks each kept token sits where its frame was heard
+    /// and that exactly the left-context frames were dropped
+    #[cfg(feature = "vad")]
+    fn assert_overlap_tokens_land_where_heard(plan: &LongFormExecutionPlan) {
+        let overlap_tasks = plan
+            .regions
+            .iter()
+            .filter(|region| matches!(region.kind, RegionTaskKind::Overlap))
+            .flat_map(|region| region.task_indices.iter().map(|index| plan.tasks[*index]));
+        let mut checked = 0;
+        for task in overlap_tasks {
+            let frames = (task.audio_end - task.audio_start) / SAMPLES_PER_ENCODER_FRAME;
+            let ids: Vec<u32> = (0..frames as u32).collect();
+            let window_frames: Vec<usize> = (0..frames).collect();
+            let mut raw =
+                raw_from_columns(&ids, &window_frames, &vec![1; frames], &vec![0.9; frames]);
+            raw.place_on_timeline(task.context_samples, task.global_sample_offset);
+
+            let heard_at = |frame: usize| task.audio_start + frame * SAMPLES_PER_ENCODER_FRAME;
+            let expected: Vec<(u32, usize)> = (0..frames)
+                .filter(|frame| heard_at(*frame) >= task.global_sample_offset)
+                .map(|frame| (frame as u32, heard_at(frame)))
+                .collect();
+            let placed: Vec<(u32, usize)> = raw
+                .tokens
+                .iter()
+                .map(|token| (token.id, token.frame * SAMPLES_PER_ENCODER_FRAME))
+                .collect();
+            assert_eq!(placed, expected, "window {task:?}");
+            checked += 1;
+        }
+        assert!(checked > 1, "the plan needs several overlap windows");
+    }
+
+    #[cfg(feature = "vad")]
+    #[test]
+    fn overlap_fallback_tokens_keep_their_exact_time() {
+        let mut config = LongFormConfig::default();
+        config.overlap.max_model_samples = 48_000;
+        config.segmentation.min_silence_at_max_speech = 10.0;
+
+        // two long speech runs with no silence to split them; after 3_200 samples of
+        // padding they start 896 and 174_976 samples in, neither on a frame boundary
+        let mut probabilities = vec![0.0; 8];
+        probabilities.extend(std::iter::repeat_n(0.9, 300));
+        probabilities.extend(std::iter::repeat_n(0.0, 40));
+        probabilities.extend(std::iter::repeat_n(0.9, 300));
+        let audio_len = probabilities.len() * VAD_WINDOW_SAMPLES;
+        let regions = detect_speech_regions(&probabilities, audio_len, &config.segmentation);
+        assert_eq!(
+            regions
+                .iter()
+                .map(|region| region.start)
+                .collect::<Vec<_>>(),
+            vec![896, 174_976]
+        );
+
+        let vad_plan = build_vad_execution_plan(&regions, &probabilities, &config);
+        assert_overlap_tokens_land_where_heard(&vad_plan);
+        assert_overlap_tokens_land_where_heard(&build_fast_execution_plan(audio_len, &config));
     }
 
     #[test]
@@ -897,6 +1090,7 @@ mod tests {
                 start: 16_000,
                 end: 32_000,
             },
+            0,
             &[],
             &config,
             &mut tasks,

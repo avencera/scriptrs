@@ -55,6 +55,13 @@ pub(super) fn execute_plan<P: WindowPreprocessor + ?Sized>(
     request: RunRequest<'_, P>,
     tasks: &[ChunkTask],
 ) -> Result<Vec<Option<RawTranscription>>, PreprocessedTranscriptionError<P::Error>> {
+    // workers stop each other on this run's own signal, so a failed run leaves
+    // the caller's control usable for its next run
+    let control = request.control.run_scope();
+    let request = RunRequest {
+        control: &control,
+        ..request
+    };
     // a host-loop backend runs a batch one window at a time with no control
     // checks between them, so it stays on the per-window paths
     if request.config.batch_size > 1 && pipeline.batches_on_device() {
@@ -181,7 +188,7 @@ fn run_batched_plan<P: WindowPreprocessor + ?Sized>(
             if let Err(error) = &result
                 && !is_interruption(error)
             {
-                control.cancel();
+                control.stop_run();
             }
             lookahead.stop();
             drop(receiver);
@@ -216,7 +223,7 @@ fn run_parallel_plan<P: WindowPreprocessor + ?Sized>(
                 let pipeline = match TranscriptionPipeline::from_bundle(bundle) {
                     Ok(pipeline) => pipeline,
                     Err(error) => {
-                        control.cancel();
+                        control.stop_run();
                         let _ = sender.send(Err(PreprocessedTranscriptionError::from(error)));
                         return;
                     }
@@ -237,7 +244,7 @@ fn run_parallel_plan<P: WindowPreprocessor + ?Sized>(
                     if let Err(error) = &result
                         && !is_interruption(error)
                     {
-                        control.cancel();
+                        control.stop_run();
                     }
                     if sender.send(result).is_err() {
                         break;

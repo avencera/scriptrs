@@ -186,9 +186,11 @@ class Pipeline:
 
     @property
     def max_chunk_seconds(self) -> float:
-        """Longest input the model takes in one window.
+        """Longest input transcribed as one window.
 
-        Longer audio still works through :meth:`transcribe`, which splits it.
+        Longer audio still works through :meth:`transcribe`, which splits it into
+        windows of this length: 15 s on Core ML, and 30 s on CUDA, where the
+        model accepts 40 s but shorter windows are more accurate.
         """
         return self._native.max_chunk_seconds
 

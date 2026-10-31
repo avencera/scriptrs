@@ -93,6 +93,18 @@ scriptrs = { version = "0.5", features = ["vad"] }
   SentencePiece constructors. `VocabKind`,
   `ModelLayout::vocab_kind` and `ParakeetDeployment::vocab_kind` are gone; the
   deployment's version picks the tokenizer format.
+- Long-form transcription runs audio as one window only up to
+  `config.overlap.max_model_samples` (`LongFormConfig::single_window_samples`),
+  not up to the model's input limit. On native CUDA bundles, clips from 30 to
+  40 s are now split into windows, and in VAD mode scanned for speech. The
+  Python `max_chunk_seconds` is 30 on CUDA.
+- `LongFormConfig::validate_for` rejects `config.overlap.context_samples` that
+  is not a whole number of encoder frames (1280 samples), or that leaves no room
+  for one frame of audio in `config.overlap.max_model_samples`. Round the
+  context to a multiple of 1280 below that limit.
+- `select_language_from_logits` returns `TranscriptionError::InvalidModelOutput`
+  when `languages` and `logits` differ in length, instead of reading only the
+  shorter prefix. Pass one logit per language.
 
 ## Python
 
@@ -203,8 +215,9 @@ let bundle = ModelBundle::from_native_dir("models", ParakeetDeployment::v3());
 
 A native bundle accepts single inputs up to 40 s; longer audio goes through
 `LongFormTranscriptionPipeline`. For native bundles, long-form defaults to 30 s
-windows with 8 s overlap, run 16 at a time through one model. Longer windows or
-shorter overlaps lose accuracy on long recordings.
+windows with 8 s overlap, run 16 at a time through one model, so it splits clips
+over 30 s too. Longer windows or shorter overlaps lose accuracy on long
+recordings.
 
 On an RTX 5090, Parakeet v3 on LibriSpeech test-clean (5.4 h), one utterance at a
 time:
@@ -396,7 +409,7 @@ fn load_mono_16khz_audio() -> Vec<f32> {
 }
 ```
 
-`LongFormConfig` defaults to the fast overlap-chunking path with `4` workers, each loading its own model. On native CUDA bundles, windows instead run `batch_size` at a time (16 by default) through the pipeline's one model, and the workers prepare windows on the CPU ahead of it; Core ML bundles ignore `batch_size`. `LongFormConfig::for_bundle(&bundle)` gives a bundle's defaults to start from when you change one setting. You can tune the worker count when you want less or more parallelism:
+`LongFormConfig` defaults to the fast overlap-chunking path with `4` workers, each loading its own model. On native CUDA bundles, windows instead run `batch_size` at a time (16 by default) through the pipeline's one model, and the workers prepare windows on the CPU ahead of it; Core ML bundles ignore `batch_size`. `LongFormConfig::for_bundle(&bundle)` gives a bundle's defaults to start from when you change one setting. Audio up to `config.overlap.max_model_samples` (`LongFormConfig::single_window_samples`) runs as one window, and longer audio is split into windows of that size, in both modes; VAD mode scans only the longer audio for speech. `config.overlap.context_samples`, the audio each window hears before its own, must be a whole number of encoder frames (1280 samples) and leave room in `config.overlap.max_model_samples` for at least one frame of audio. You can tune the worker count when you want less or more parallelism:
 
 ```rust
 use scriptrs::{LongFormConfig, LongFormTranscriptionPipeline};

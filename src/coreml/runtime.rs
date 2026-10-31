@@ -39,11 +39,9 @@ pub(super) fn insert_cached_input(
 ) -> Result<Retained<MLMultiArray>, TranscriptionError> {
     let (cached, array) = match input {
         CachedCoreMlInput::F32 { cached, values } => {
-            debug_assert_eq!(values.len(), cached.total_elements);
             (cached, multi_array_f32(values, cached, deallocator)?)
         }
         CachedCoreMlInput::I32 { cached, values } => {
-            debug_assert_eq!(values.len(), cached.total_elements);
             (cached, multi_array_i32(values, cached, deallocator)?)
         }
     };

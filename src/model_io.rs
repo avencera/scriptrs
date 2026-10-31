@@ -125,13 +125,7 @@ pub fn decode_joint_outputs(
     let mut confidence = outputs.token_prob.clamp(0.0, 1.0);
 
     if let Some(top_k) = &outputs.top_k {
-        validate_candidate_logits(
-            &top_k
-                .pairs()
-                .iter()
-                .map(|pair| pair.logit)
-                .collect::<Vec<_>>(),
-        )?;
+        validate_candidate_logits(top_k.pairs().iter().map(|pair| pair.logit))?;
     }
 
     if token_id != blank_id

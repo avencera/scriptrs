@@ -1,6 +1,5 @@
 use crate::backend::EncoderChunk;
 use crate::config::TranscriptionConfig;
-use crate::constants::SAMPLES_PER_ENCODER_FRAME;
 use crate::decode::{ParakeetTdtDecoder, RawTranscription};
 use crate::deployment::{FrontendSpec, ParakeetDeployment};
 use crate::error::TranscriptionError;
@@ -202,10 +201,7 @@ impl TranscriptionPipeline {
         global_sample_offset: usize,
         context_samples: usize,
     ) {
-        raw.drop_context_frames(
-            context_samples / SAMPLES_PER_ENCODER_FRAME,
-            global_sample_offset / SAMPLES_PER_ENCODER_FRAME,
-        );
+        raw.place_on_timeline(context_samples, global_sample_offset);
     }
 
     /// The deployment's frontend and single-chunk limit
@@ -238,12 +234,6 @@ impl ChunkSpec {
             chunk: self,
             extractor: ParakeetFeatureExtractor::new(self.frontend),
         }
-    }
-
-    /// Longest input one model call takes, in samples
-    #[cfg(feature = "long-form")]
-    pub(crate) fn max_samples(self) -> usize {
-        self.max_samples
     }
 
     /// Mel frames of the longest single input
