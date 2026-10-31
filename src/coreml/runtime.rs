@@ -1,11 +1,10 @@
-use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::Path;
 use std::ptr::NonNull;
 
 use block2::RcBlock;
 use objc2::AnyThread;
-use objc2::rc::{Retained, autoreleasepool};
+use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2_core_ml::{
     MLComputeUnits, MLDictionaryFeatureProvider, MLFeatureProvider, MLFeatureValue, MLModel,
@@ -13,11 +12,8 @@ use objc2_core_ml::{
 };
 use objc2_foundation::{NSCopying, NSMutableDictionary, NSString, NSURL};
 
-use crate::coreml::array::{
-    extract_output, multi_array_f32, multi_array_f32_cached, multi_array_i32,
-    multi_array_i32_cached,
-};
-use crate::coreml::{CachedCoreMlInput, CoreMlInput, CoreMlTensor};
+use crate::coreml::CachedCoreMlInput;
+use crate::coreml::array::{multi_array_f32, multi_array_i32};
 use crate::error::TranscriptionError;
 
 pub(super) fn load_model(
@@ -27,58 +23,13 @@ pub(super) fn load_model(
     let path_str = NSString::from_str(&path.to_string_lossy());
     let url = NSURL::fileURLWithPath_isDirectory(&path_str, true);
     // SAFETY: the URL and configuration are valid Objective-C objects for the duration
-    // SAFETY: of this call, and CoreML retains anything it needs internally
+    // of this call, and CoreML retains anything it needs internally
     unsafe {
         let config = MLModelConfiguration::new();
         config.setComputeUnits(compute_units);
         MLModel::modelWithContentsOfURL_configuration_error(&url, &config)
     }
     .map_err(|error| TranscriptionError::CoreMl(format!("failed to load model: {error}")))
-}
-
-pub(super) fn predict(
-    model: &MLModel,
-    input_dict: &NSMutableDictionary<NSString, AnyObject>,
-    deallocator: &RcBlock<dyn Fn(NonNull<c_void>)>,
-    inputs: &[CoreMlInput<'_>],
-    output_names: &[&str],
-) -> Result<HashMap<String, CoreMlTensor>, TranscriptionError> {
-    autoreleasepool(|_| {
-        let mut arrays = Vec::with_capacity(inputs.len());
-
-        for input in inputs {
-            let (name, array) = match input {
-                CoreMlInput::F32 {
-                    name,
-                    values,
-                    shape,
-                } => (*name, multi_array_f32(values, shape, deallocator)?),
-                CoreMlInput::I32 {
-                    name,
-                    values,
-                    shape,
-                } => (*name, multi_array_i32(values, shape, deallocator)?),
-            };
-            let key = NSString::from_str(name);
-            let key_copy: &ProtocolObject<dyn NSCopying> = ProtocolObject::from_ref(&*key);
-            insert_input_feature(input_dict, key_copy, &array);
-            arrays.push(array);
-        }
-
-        let output_provider = predict_features(
-            model,
-            ProtocolObject::from_ref(&*build_feature_provider(input_dict)?),
-        )?;
-        let mut outputs = HashMap::with_capacity(output_names.len());
-        for output_name in output_names {
-            let key = NSString::from_str(output_name);
-            let array = output_multi_array(&output_provider, &key, output_name)?;
-            let (data, shape) = extract_output(&array)?;
-            outputs.insert((*output_name).to_owned(), CoreMlTensor { data, shape });
-        }
-
-        Ok(outputs)
-    })
 }
 
 pub(super) fn insert_cached_input(
@@ -89,11 +40,11 @@ pub(super) fn insert_cached_input(
     let (cached, array) = match input {
         CachedCoreMlInput::F32 { cached, values } => {
             debug_assert_eq!(values.len(), cached.total_elements);
-            (cached, multi_array_f32_cached(values, cached, deallocator)?)
+            (cached, multi_array_f32(values, cached, deallocator)?)
         }
         CachedCoreMlInput::I32 { cached, values } => {
             debug_assert_eq!(values.len(), cached.total_elements);
-            (cached, multi_array_i32_cached(values, cached, deallocator)?)
+            (cached, multi_array_i32(values, cached, deallocator)?)
         }
     };
     let key_copy: &ProtocolObject<dyn NSCopying> = ProtocolObject::from_ref(&*cached.name);
@@ -101,13 +52,13 @@ pub(super) fn insert_cached_input(
     Ok(array)
 }
 
-pub(super) fn insert_input_feature(
+fn insert_input_feature(
     input_dict: &NSMutableDictionary<NSString, AnyObject>,
     key_copy: &ProtocolObject<dyn NSCopying>,
     multi_array: &MLMultiArray,
 ) {
     // SAFETY: multi_array is a live CoreML object for this prediction call, and setObject retains
-    // SAFETY: the inserted feature value before the temporary Retained<MLFeatureValue> is dropped
+    // the inserted feature value before the temporary Retained<MLFeatureValue> is dropped
     unsafe {
         let feature_value = MLFeatureValue::featureValueWithMultiArray(multi_array);
         input_dict.setObject_forKey(feature_value_as_any_object(&feature_value), key_copy);
@@ -153,6 +104,6 @@ pub(super) fn output_multi_array(
 
 fn feature_value_as_any_object(feature_value: &MLFeatureValue) -> &AnyObject {
     // SAFETY: MLFeatureValue is an Objective-C object and shares pointer representation
-    // SAFETY: with AnyObject for APIs that erase the concrete class type
+    // with AnyObject for APIs that erase the concrete class type
     unsafe { &*(feature_value as *const MLFeatureValue).cast::<AnyObject>() }
 }
