@@ -260,7 +260,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 [[package]]
 name = "hf-fetch"
 version = "0.1.0"
-source = "git+https://github.com/avencera/hf-fetch?rev=d72ac792f5247544af89e00fea7b51010244b1e2#d72ac792f5247544af89e00fea7b51010244b1e2"
+source = "git+https://github.com/avencera/hf-fetch?rev=c25499dba7251db791e17812ab65391c1b44cd0b#c25499dba7251db791e17812ab65391c1b44cd0b"
 dependencies = [
  "thiserror",
  "ureq",
