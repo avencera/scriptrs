@@ -228,9 +228,9 @@ dependencies = [
 
 [[package]]
 name = "hf-fetch"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a9abb87eb199e1f7fdfedfc22b7c9fc0e99f43dcd92177dfd6826993628bb58"
+checksum = "bba9248a593ffd8a4c126cd0d7d10d21fd1d9c1a0e8f94ac2ddaac4d41c1240b"
 dependencies = [
  "thiserror",
  "ureq",
