@@ -227,6 +227,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hf-fetch"
+version = "0.1.0"
+source = "git+https://github.com/avencera/hf-fetch?rev=d72ac792f5247544af89e00fea7b51010244b1e2#d72ac792f5247544af89e00fea7b51010244b1e2"
+dependencies = [
+ "thiserror",
+ "ureq",
+]
+
+[[package]]
 name = "hound"
 version = "3.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -648,6 +657,7 @@ dependencies = [
  "cudakit",
  "cudarc",
  "eyre",
+ "hf-fetch",
  "hound",
  "memmap2",
  "ndarray",
@@ -660,7 +670,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
- "ureq",
 ]
 
 [[package]]
