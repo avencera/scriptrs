@@ -1,4 +1,4 @@
-//! Greedy TDT decode on the device: the joint's GEMMs on cuBLAS, and the LSTM
+//! Greedy TDT decode on the device: the joint's GEMMs on cuBLAS or cuBLASLt, and the LSTM
 //! predictor and the token decision in the `decode` kernel area
 //!
 //! A step decides one token for every unfinished batch row and advances its frame
@@ -6,14 +6,15 @@
 //! batch runs as a replayed graph of steps, and the host only reads the cursors back
 //! between replays to see whether every row has reached its last frame
 
-use cudakit::cudarc::driver::CudaSlice;
-use cudakit::{DeviceTensor, Math};
+use cudakit::cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use cudakit::{DeviceTensor, Math, Operands, Sgemm};
 
 use crate::backend::LanguageMask;
 use crate::cuda::kernels::{
     CudaRuntime, DecodeFilter, DecodeKernels, DecodeOutput, DecodeShape, DecodeState,
     EncoderKernels, LstmInput, LstmState, LstmWeights, MAX_FILTER_TOP_K, Projection,
 };
+use crate::cuda::linears::Linears;
 use crate::cuda::{Direction, HostStaging, linear, upload, upload_host, zeros};
 use crate::decode::RawTranscription;
 use crate::error::TranscriptionError;
@@ -45,6 +46,11 @@ pub(crate) struct CudaDecoder {
     /// Joint outputs: classes, then one logit per duration
     outputs: usize,
     max_symbols: usize,
+    /// Math of the joint's GEMMs: FP32 under [`Precision::Fp32`](crate::Precision)
+    /// for NeMo parity, TF32 under the faster precisions
+    math: Math,
+    /// The joint's cuBLASLt plans under TF32
+    linears: Option<Linears>,
     /// Most frames one step moves a cursor: the longest duration, or 1, which a
     /// blank or a frame's last symbol always moves
     max_advance: usize,
@@ -145,11 +151,13 @@ impl DecodeWorkspace {
 }
 
 impl CudaDecoder {
-    /// Uploads the predictor and joint weights and loads the kernels
+    /// Uploads the predictor and joint weights and loads the kernels; the joint's
+    /// GEMMs run at `math`
     pub(crate) fn load(
         runtime: &CudaRuntime,
         file: &WeightFile,
         spec: &ParakeetSpec,
+        math: Math,
     ) -> Result<Self, TranscriptionError> {
         let hidden = spec.predictor.hidden;
         let classes = spec.predictor.vocab_size + 1;
@@ -200,6 +208,11 @@ impl CudaDecoder {
             classes,
             outputs: spec.joint.outputs,
             max_symbols: spec.max_symbols,
+            math,
+            linears: match math {
+                Math::Fp32 => None,
+                Math::Tf32 => Some(Linears::load(runtime)?),
+            },
             max_advance,
             embed: upload(
                 runtime,
@@ -326,14 +339,15 @@ impl CudaDecoder {
             &self.joint_enc.bias.data().slice(..),
             &mut ws.enc_proj.slice_mut(..),
         )?;
-        runtime.sgemm(
+        self.linear(
+            runtime,
             linear(
                 rows,
                 self.joint_hidden,
                 self.encoder_hidden,
                 1.0,
                 1.0,
-                Math::Fp32,
+                self.math,
             ),
             encoder_out,
             self.joint_enc.weight.data(),
@@ -426,6 +440,27 @@ impl CudaDecoder {
         Ok(())
     }
 
+    /// Runs `spec`, a [`linear`] product, on cuBLASLt under TF32 and cuBLAS under FP32
+    fn linear<A, W, C>(
+        &self,
+        runtime: &CudaRuntime,
+        spec: Sgemm,
+        a: &A,
+        w: &W,
+        c: &mut C,
+    ) -> Result<(), TranscriptionError>
+    where
+        A: DevicePtr<f32>,
+        W: DevicePtr<f32>,
+        C: DevicePtrMut<f32>,
+    {
+        match &self.linears {
+            Some(linears) => linears.run(runtime, spec, Operands::F32(self.math), a, w, c)?,
+            None => runtime.sgemm(spec, a, w, c)?,
+        }
+        Ok(())
+    }
+
     /// One greedy step for every unfinished row; capturable in a CUDA graph
     ///
     /// The previous step (or [`Self::start`]) left the joint input and the joint
@@ -436,14 +471,15 @@ impl CudaDecoder {
         runtime: &CudaRuntime,
         ws: &mut DecodeWorkspace,
     ) -> Result<(), TranscriptionError> {
-        runtime.sgemm(
+        self.linear(
+            runtime,
             linear(
                 ws.batch,
                 self.outputs,
                 self.joint_hidden,
                 1.0,
                 1.0,
-                Math::Fp32,
+                self.math,
             ),
             &ws.joint_in,
             self.joint_out.weight.data(),
@@ -726,7 +762,7 @@ mod tests {
         for version in [ParakeetVersion::V2, ParakeetVersion::V3] {
             let file = weights(version);
             let spec = file.parakeet_spec(&deployment(version)).expect("spec");
-            let decoder = CudaDecoder::load(&runtime, &file, &spec).expect("decoder");
+            let decoder = CudaDecoder::load(&runtime, &file, &spec, Math::Fp32).expect("decoder");
             let encoder = CudaEncoder::load(
                 &runtime,
                 &file,
@@ -796,7 +832,7 @@ mod tests {
         let version = ParakeetVersion::V3;
         let file = weights(version);
         let spec = file.parakeet_spec(&deployment(version)).expect("spec");
-        let decoder = CudaDecoder::load(&runtime, &file, &spec).expect("decoder");
+        let decoder = CudaDecoder::load(&runtime, &file, &spec, Math::Fp32).expect("decoder");
 
         for set in SETS {
             let reference = NemoReference::open(version, set);
@@ -1050,7 +1086,7 @@ mod tests {
         let deployment = ParakeetDeployment::v3();
         let file = weights(ParakeetVersion::V3);
         let spec = file.parakeet_spec(&deployment).expect("spec");
-        let decoder = CudaDecoder::load(&runtime, &file, &spec).expect("decoder");
+        let decoder = CudaDecoder::load(&runtime, &file, &spec, Math::Fp32).expect("decoder");
         let vocab = ModelBundle::from_native_dir(native_root(), deployment.clone())
             .vocabulary()
             .expect("vocabulary");

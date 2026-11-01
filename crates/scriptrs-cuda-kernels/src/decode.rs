@@ -27,7 +27,11 @@ const LSTM_GATES: usize = 4;
 
 /// Batch rows [`decode_lstm`] and [`decode_project`] carry through one pass, so
 /// each weight a thread holds serves this many rows per pass
-const PASS_ROWS: usize = 8;
+///
+/// Four rather than eight keeps `decode_lstm` at 119 registers, under the 128
+/// that let four blocks share an SM: the 640 unit blocks then fit the GPU in one
+/// wave instead of spilling 130 into a second. Batch 16 measured no slower
+const PASS_ROWS: usize = 4;
 
 /// Warps per block of [`decode_lstm`] and [`decode_project`], which split each
 /// weight row between them
@@ -35,7 +39,10 @@ pub const ROW_WARPS: usize = 4;
 
 /// Weight columns each thread of those blocks holds in registers, so `hidden` is
 /// at most `ROW_WARPS * 32 * ROW_STEPS`
-pub const ROW_STEPS: usize = 8;
+///
+/// Exactly Parakeet's 640-wide predictor, the only width the native spec accepts:
+/// slots past `hidden` would still hold registers
+pub const ROW_STEPS: usize = 5;
 
 /// Encoder frame the next joint step reads for row `b`, clamped so finished rows
 /// still read inside their own frames

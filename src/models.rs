@@ -45,10 +45,13 @@ pub(crate) enum RuntimeBundle {
     Native(NativeLayout),
 }
 
-/// Arithmetic precision of the CUDA backend's encoder matrix multiplies
+/// Arithmetic precision of the CUDA backend's matrix multiplies
 ///
 /// The residual stream, the matrix multiplies' outputs and their accumulation stay
-/// FP32 at every precision, and decoding always runs in FP32
+/// FP32 at every precision. Under [`Precision::Fp16`] and [`Precision::Tf32`] the
+/// decoder's joint multiplies run as TF32 and the rest of decoding as FP32. Linear
+/// layers run the cuBLASLt algorithm a checked-in table names for the GPU, or cuBLAS's
+/// default without one; a fixed algorithm keeps transcripts the same from run to run
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Precision {

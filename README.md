@@ -8,12 +8,12 @@ Fast [NVIDIA Parakeet TDT](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) s
 - Long-form transcription of hour-long recordings, with optional VAD
 - Token-level timestamps and confidences
 
-On an RTX 5090, the CUDA backend transcribes LibriSpeech test-clean at 1534x real
-time, 3.2x as fast as NVIDIA NeMo and 6.1x as fast as parakeet-rs, at the same
-word error rate. Through the batching queue it runs at 4770x. On 31.6 h of
+On an RTX 5090, the CUDA backend transcribes LibriSpeech test-clean at 1702x real
+time, 3.6x as fast as NVIDIA NeMo and 6.7x as fast as parakeet-rs, at the same
+word error rate. Through the batching queue it runs at 5390x. On 31.6 h of
 multilingual speech the default FP16 mode scores the same WER as the FP32 mode,
 which matches NeMo. On six harder English sets it has a lower WER than Whisper
-large-v3 at about 18x its speed. See [CUDA](#cuda) for the numbers.
+large-v3 at about 20x its speed. See [CUDA](#cuda) for the numbers.
 
 `scriptrs` is early: the public API is still moving.
 
@@ -155,14 +155,14 @@ time:
 
 | | Speed (x real time) | vs NeMo | WER |
 |---|---|---|---|
-| scriptrs | 1534x | 3.2x | 1.93 % |
+| scriptrs | 1702x | 3.6x | 1.93 % |
 | NVIDIA NeMo | 477x | 1x | 1.93 % |
 | parakeet-rs 0.4.3 (ONNX Runtime) | 253x | 0.53x | 1.93 % |
 
 Through the [queue](#many-short-inputs), which prepares the next inputs on the CPU
-while the GPU runs, the same set runs at 1761x one at a time with identical
-transcripts, and at 4770x in batches of up to 16 (the default). Batching changes 2
-of the 2620 transcripts by one word or punctuation mark, and WER stays 1.93 %.
+while the GPU runs, the same set runs at 1904x one at a time with identical
+transcripts, and at 5390x in batches of up to 16 (the default). Batching changes 1
+of the 2620 transcripts by one word, and WER is 1.92 %.
 
 The multilingual check is nearly 6 times the size of LibriSpeech: FLEURS and MLS,
 31.6 h over ten language sets in six languages (de, es, fr, it, nl, pt), one
@@ -172,26 +172,26 @@ default scores the same WER as FP32. Speed is for the FP16 default:
 
 | Set | Speed (x real time) | WER, FP16 | WER, FP32 |
 |---|---|---|---|
-| FLEURS de, es, fr, it, nl, pt (15.8 h) | 1839x | 4.57 % | 4.57 % |
-| MLS es, fr, it, pt (15.8 h) | 1921x | 6.25 % | 6.26 % |
+| FLEURS de, es, fr, it, nl, pt (15.8 h) | 2163x | 4.57 % | 4.57 % |
+| MLS es, fr, it, pt (15.8 h) | 2191x | 6.25 % | 6.26 % |
 
-On all 44 Earnings-21 calls (39 h), long-form with the defaults runs at 3541x with
+On all 44 Earnings-21 calls (39 h), long-form with the defaults runs at 3961x with
 8.24 % pooled WER; NeMo transcribing each whole call with local attention scores
 9.58 %.
 
 On harder English audio, long-form with the defaults and English selected has a
 lower WER than Whisper large-v3 (run through WhisperX 3.8.6 in float16) on every
-set, and runs 14x to 20x as fast:
+set, and runs 16x to 22x as fast:
 
 | Set | Recordings | Hours | scriptrs WER | Whisper WER | scriptrs speed | Whisper speed | vs Whisper |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Earnings-21 earnings calls | 44 | 39.3 | **8.2 %** | 9.7 % | **3541x** | 186x | 19.0x |
-| AMI meetings, headset mix | 34 | 18.7 | **21.5 %** | 23.8 % | **3458x** | 182x | 19.0x |
-| AMI meetings, far-field microphone | 34 | 18.7 | **23.2 %** | 28.3 % | **3447x** | 199x | 17.3x |
-| EdAcc accented conversations | 40 | 18.2 | **16.0 %** | 19.2 % | **3472x** | 201x | 17.3x |
-| CHiME-6 dinner parties | 4 | 9.7 | **44.0 %** | 44.7 % | **3474x** | 176x | 19.7x |
-| AppTek call-center calls, 14 accents | 56 | 9.4 | **11.2 %** | 12.6 % | **3108x** | 224x | 13.9x |
-| Mean over sets | 212 | 114 | **20.7 %** | 23.1 % | **3456x** | 191x | 18.0x |
+| Earnings-21 earnings calls | 44 | 39.3 | **8.2 %** | 9.7 % | **3961x** | 186x | 21.3x |
+| AMI meetings, headset mix | 34 | 18.7 | **21.5 %** | 23.8 % | **3903x** | 182x | 21.4x |
+| AMI meetings, far-field microphone | 34 | 18.7 | **23.2 %** | 28.3 % | **3903x** | 199x | 19.6x |
+| EdAcc accented conversations | 40 | 18.2 | **16.0 %** | 19.2 % | **3934x** | 201x | 19.6x |
+| CHiME-6 dinner parties | 4 | 9.7 | **44.0 %** | 44.7 % | **3906x** | 176x | 22.1x |
+| AppTek call-center calls, 14 accents | 56 | 9.4 | **11.2 %** | 12.6 % | **3619x** | 224x | 16.1x |
+| Mean over sets | 212 | 114 | **20.7 %** | 23.1 % | **3903x** | 191x | 20.4x |
 
 WER is pooled over each set's recordings, both sides through Whisper's English
 normalizer. Speed is x real time for transcription alone on one RTX 5090, with
@@ -205,11 +205,11 @@ accuracy and speed on dense or far-field speech:
 
 | Set | Overlap WER | VAD WER | Overlap speed | VAD speed |
 |---|---:|---:|---:|---:|
-| Sparse speech, 24 % speech (4.2 h) | 14.8 % | **3.1 %** | 3430x | **3990x** |
-| Earnings-21 earnings calls | **8.2 %** | 8.6 % | **3630x** | 2030x |
-| AMI meetings, headset mix | 21.5 % | **21.2 %** | **3480x** | 1800x |
-| AMI meetings, far-field microphone | **23.2 %** | 26.6 % | **3480x** | 1790x |
-| CHiME-6 dinner parties | **44.0 %** | 54.8 % | **3490x** | 1970x |
+| Sparse speech, 24 % speech (4.2 h) | 14.8 % | **3.1 %** | 3930x | **3990x** |
+| Earnings-21 earnings calls | **8.2 %** | 8.6 % | **4100x** | 2160x |
+| AMI meetings, headset mix | 21.5 % | **21.2 %** | **3920x** | 1890x |
+| AMI meetings, far-field microphone | **23.2 %** | 26.6 % | **3910x** | 1870x |
+| CHiME-6 dinner parties | **44.0 %** | 54.8 % | **3920x** | 2080x |
 
 The sparse set is LibriSpeech test-clean utterances separated by 15 to 75 s of
 film music, effects, ambience and low-level noise. VAD runs use the default 0.5
@@ -218,8 +218,9 @@ speech threshold.
 By default the encoder layers' linear weights are stored in FP16, which has TF32's
 10-bit mantissa, and their matrix multiplies run on FP16 tensor cores with FP32
 accumulation. `Precision::Tf32` keeps the weights in FP32 and uses TF32 tensor
-cores on Ampere and newer GPUs, or FP32 on older ones. `Precision::Fp32` matches
-NeMo's FP32 decode token for token on any GPU:
+cores on Ampere and newer GPUs, or FP32 on older ones. In both modes the decoder's
+joint network multiplies in TF32. `Precision::Fp32` matches NeMo's FP32 decode
+token for token on any GPU:
 
 ```rust,ignore
 use scriptrs::{ModelBundle, ParakeetDeployment, Precision};
@@ -232,17 +233,24 @@ On an RTX 5090 with Parakeet v3 (speed in x real time, then WER):
 
 | | FP16 (default) | TF32 | FP32 |
 |---|---|---|---|
-| LibriSpeech test-clean, one utterance at a time | 1534x, 1.93 % | 1179x, 1.93 % | — |
-| LibriSpeech test-clean, queue in batches of 16 | 4767x, 1.93 % | 3364x, 1.92 % | — |
-| Earnings-21, long-form | 3633x, 8.24 % | 2633x, 8.24 % | — |
-| FLEURS de, es, fr, it, nl, pt (15.8 h) | 1839x, 4.57 % | 1450x, 4.57 % | 966x, 4.57 % |
-| MLS es, fr, it, pt (15.8 h) | 1921x, 6.25 % | 1524x, 6.26 % | 996x, 6.26 % |
+| LibriSpeech test-clean, one utterance at a time | 1702x, 1.93 % | 1373x, 1.92 % | 887x, 1.93 % |
+| LibriSpeech test-clean, queue in batches of 16 | 5388x, 1.92 % | 3868x, 1.92 % | 2307x, 1.93 % |
+| Earnings-21, long-form | 4119x, 8.24 % | 3045x, 8.24 % | 1761x, 8.25 % |
+| FLEURS de, es, fr, it, nl, pt (15.8 h) | 2163x, 4.57 % | 1768x, 4.57 % | 1042x, 4.57 % |
+| MLS es, fr, it, pt (15.8 h) | 2191x, 6.25 % | 1795x, 6.25 % | 1055x, 6.26 % |
+
+On an RTX 5090, the linear layers run the cuBLASLt algorithms that
+`examples/cuda_tune.rs` measured fastest for each layer shape and row count on
+that GPU, which are up to 1.7x faster than cuBLAS's own choice at small batches.
+Other GPUs run cuBLAS's choice. Either way the choice is fixed rather than timed
+when the model loads, so it adds no run-to-run variation to transcripts.
 
 FLEURS and MLS run one utterance at a time with automatic language selection and
 are scored with Whisper's basic normalizer. On each of their ten language sets,
-FP16 is within one word error of TF32. On LibriSpeech one utterance at a time,
-FP16 gives the same transcripts as TF32. Batching changes a few transcripts in
-either precision, so the queued FP16 and TF32 transcripts differ slightly.
+FP16 is within two word errors of TF32. On LibriSpeech one utterance at a time,
+FP16 and TF32 differ in 2 of the 2620 transcripts, by one word each. Batching
+changes a few transcripts in either precision, so the queued FP16 and TF32
+transcripts differ slightly.
 
 ## Usage
 

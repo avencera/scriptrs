@@ -9,13 +9,15 @@
 //! [`EncoderMath::Fp16`] stores the Conformer layers' linear weights in FP16 and has
 //! the kernels before each of those GEMMs write an FP16 copy of their output, so the
 //! GEMMs read half the bytes and run at the FP16 tensor-core rate. The residual
-//! stream, the GEMM outputs and their accumulation stay FP32
+//! stream, the GEMM outputs and their accumulation stay FP32. Under FP16 and TF32 the
+//! linear layers run on cuBLASLt with the algorithms [`Linears`] tunes per GPU; FP32
+//! keeps cuBLAS's own choice, which the NeMo parity tests hold
 
 use cudakit::cudarc::driver::{CudaSlice, CudaView, DevicePtrMut};
-use cudakit::{DeviceTensor, Math, Sgemm, SgemmBatched};
+use cudakit::{DeviceTensor, Math, Operands, Sgemm, SgemmBatched};
 
-use crate::cuda::fp16::linear_fp16;
 use crate::cuda::kernels::{CudaRuntime, EncoderKernels, FeatureMap, GemmOperand, Heads};
+use crate::cuda::linears::Linears;
 use crate::cuda::{Direction, HostStaging, linear, upload, upload_host, zeros};
 use crate::error::TranscriptionError;
 use crate::native::spec::EncoderSpec;
@@ -44,7 +46,7 @@ pub(crate) enum EncoderMath {
 
 impl EncoderMath {
     /// The math of the GEMMs that keep FP32 operands
-    fn single(self) -> Math {
+    pub(crate) fn single(self) -> Math {
         match self {
             Self::Single(math) => math,
             Self::Fp16 => Math::Tf32,
@@ -125,6 +127,8 @@ pub(crate) struct CudaEncoder {
     subsampling: Subsampling,
     layers: Vec<Layer>,
     kernels: EncoderKernels,
+    /// The linear layers' cuBLASLt plans, under every math but FP32
+    linears: Option<Linears>,
 }
 
 /// Device buffers for one `(batch, mel frames)` input shape
@@ -278,12 +282,17 @@ impl CudaEncoder {
             )?);
         }
 
+        let linears = match math {
+            EncoderMath::Single(Math::Fp32) => None,
+            EncoderMath::Single(Math::Tf32) | EncoderMath::Fp16 => Some(Linears::load(runtime)?),
+        };
         Ok(Self {
             spec,
             math,
             subsampling,
             layers,
             kernels,
+            linears,
         })
     }
 
@@ -571,19 +580,26 @@ impl CudaEncoder {
         let rows = ws.batch * ws.frames;
         let (weight, bias) = &sub.out;
         kernels.fill_rows(stream, &bias.data().slice(..), &mut ws.x.slice_mut(..))?;
-        runtime.sgemm(
-            linear(
-                rows,
-                self.spec.d_model,
-                channels * third.features,
-                1.0,
-                1.0,
-                self.math.single(),
-            ),
-            &ws.flat,
-            weight.data(),
-            &mut ws.x,
-        )?;
+        let spec = linear(
+            rows,
+            self.spec.d_model,
+            channels * third.features,
+            1.0,
+            1.0,
+            self.math.single(),
+        );
+        // the flattened subsampling output is FP32 under every math
+        match &self.linears {
+            Some(linears) => linears.run(
+                runtime,
+                spec,
+                Operands::F32(Math::Tf32),
+                &ws.flat,
+                weight.data(),
+                &mut ws.x,
+            )?,
+            None => runtime.sgemm(spec, &ws.flat, weight.data(), &mut ws.x)?,
+        }
         Ok(())
     }
 
@@ -736,12 +752,15 @@ impl CudaEncoder {
         weight: &Linear,
         c: &mut C,
     ) -> Result<(), TranscriptionError> {
-        match (a, weight, self.math) {
-            (Operand::Single(a), Linear::Single(w), EncoderMath::Single(_)) => {
+        match (a, weight, self.math, &self.linears) {
+            (Operand::Single(a), Linear::Single(w), EncoderMath::Single(math), Some(linears)) => {
+                linears.run(runtime, spec, Operands::F32(math), &a, w.data(), c)?;
+            }
+            (Operand::Single(a), Linear::Single(w), EncoderMath::Single(_), None) => {
                 runtime.sgemm(spec, &a, w.data(), c)?;
             }
-            (Operand::Fp16(a), Linear::Fp16(w), EncoderMath::Fp16) => {
-                linear_fp16(runtime, spec, &a, w, c)?;
+            (Operand::Fp16(a), Linear::Fp16(w), EncoderMath::Fp16, Some(linears)) => {
+                linears.run(runtime, spec, Operands::F16, &a, w, c)?;
             }
             _ => return Err(mixed_precision()),
         }

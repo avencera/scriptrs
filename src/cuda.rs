@@ -1,12 +1,12 @@
 //! Native CUDA backend
 //!
-//! Host code runs on cudakit (driver-only loading, cuBLAS, graph capture); the
+//! Host code runs on cudakit (driver-only loading, cuBLAS and cuBLASLt, graph capture); the
 //! device code is `crates/scriptrs-cuda-kernels`, compiled to the PTX in `src/cuda/ptx`
 
 pub(crate) mod decoder;
 pub(crate) mod encoder;
-pub(crate) mod fp16;
 pub(crate) mod kernels;
+pub(crate) mod linears;
 pub(crate) mod model;
 #[cfg(test)]
 pub(crate) mod test_support;

@@ -628,13 +628,19 @@ pub fn encoder_fill_rows(bias: &[f32], mut out: DisjointSlice<f32>, width: u32) 
     }
 }
 
+/// Output channels each `encoder_subsample_conv_in` thread computes from one 3x3
+/// input window: a thread per element spent most of its time on index arithmetic and
+/// reloading the window
+pub const CONV_IN_CHANNELS: usize = 16;
+
 /// First subsampling convolution: 1 to `channels`, 3x3, stride 2, padding 1, with
 /// bias, then the time mask and ReLU
 ///
 /// `mel` is `[batch, in_frames, in_features]` (time-major, as NeMo transposes the
 /// featurizer output) and frames at or past `in_lens[b]` count as 0. Writes `[batch,
 /// channels, out_frames, out_features]` with frames at or past `out_lens[b]` zeroed.
-/// One thread per output element
+/// One thread per output position and group of [`CONV_IN_CHANNELS`] channels, which
+/// `channels` must be a multiple of
 #[kernel]
 pub fn encoder_subsample_conv_in(
     mel: &[f32],
@@ -650,42 +656,63 @@ pub fn encoder_subsample_conv_in(
     out_frames: u32,
     out_features: u32,
 ) {
-    let (batch, channels) = (batch as usize, channels as usize);
-    let (in_frames, in_features) = (in_frames as usize, in_features as usize);
-    let (out_frames, out_features) = (out_frames as usize, out_features as usize);
-    let idx = thread::index_1d();
-    let i = idx.get();
-    if i >= batch * channels * out_frames * out_features {
+    let groups = channels / CONV_IN_CHANNELS as u32;
+    let i = thread::index_1d().get();
+    if i >= (batch * groups * out_frames * out_features) as usize {
         return;
     }
 
-    let f = i % out_features;
-    let t = (i / out_features) % out_frames;
-    let c = (i / (out_features * out_frames)) % channels;
-    let b = i / (out_features * out_frames * channels);
-    let mut value = 0.0f32;
-    if t < out_lens[b] as usize {
+    // 32-bit index math: 64-bit division is a long software sequence on the GPU
+    let i = i as u32;
+    let f = (i % out_features) as usize;
+    let t = ((i / out_features) % out_frames) as usize;
+    let group = ((i / (out_features * out_frames)) % groups) as usize;
+    let b = (i / (out_features * out_frames * groups)) as usize;
+    let (in_frames, in_features) = (in_frames as usize, in_features as usize);
+    let (out_frames, out_features) = (out_frames as usize, out_features as usize);
+    let plane = out_frames * out_features;
+    let first = b * channels as usize + group * CONV_IN_CHANNELS;
+    let position = t * out_features + f;
+    let valid = t < out_lens[b] as usize;
+
+    // the window, with padding and frames past the input's length as 0
+    let mut window = [0.0f32; 9];
+    let mut inside = [false; 9];
+    if valid {
         let in_len = (in_lens[b] as usize).min(in_frames);
-        let mut acc = bias[c];
-        let mut kt = 0;
-        while kt < 3 {
-            let mut kf = 0;
-            while kf < 3 {
-                // input index 2t - 1 + k, with padding 1 on both sides
-                let (ti, fi) = (2 * t + kt, 2 * f + kf);
-                if ti >= 1 && ti - 1 < in_len && fi >= 1 && fi - 1 < in_features {
-                    let sample = mel[(b * in_frames + ti - 1) * in_features + fi - 1];
-                    acc += weight[(c * 3 + kt) * 3 + kf] * sample;
-                }
-                kf += 1;
+        let mut k = 0;
+        while k < 9 {
+            // input index 2t - 1 + k, with padding 1 on both sides
+            let (ti, fi) = (2 * t + k / 3, 2 * f + k % 3);
+            if ti >= 1 && ti - 1 < in_len && fi >= 1 && fi - 1 < in_features {
+                window[k] = mel[(b * in_frames + ti - 1) * in_features + fi - 1];
+                inside[k] = true;
             }
-            kt += 1;
+            k += 1;
         }
-        value = acc.max(0.0);
     }
 
-    if let Some(slot) = out.get_mut(idx) {
-        *slot = value;
+    let mut n = 0;
+    while n < CONV_IN_CHANNELS {
+        let c = group * CONV_IN_CHANNELS + n;
+        let mut value = 0.0f32;
+        if valid {
+            // skipped taps stay out of the sum, so it rounds as NeMo's padded conv
+            // and the per-element kernel this replaced did
+            let mut acc = bias[c];
+            let mut k = 0;
+            while k < 9 {
+                if inside[k] {
+                    acc += weight[c * 9 + k] * window[k];
+                }
+                k += 1;
+            }
+            value = acc.max(0.0);
+        }
+        // SAFETY: `(first + n) * plane + position` is this thread's own output for
+        // channel `c`: threads differ in batch row, channel group or position
+        unsafe { *out.get_unchecked_mut((first + n) * plane + position) = value };
+        n += 1;
     }
 }
 
@@ -709,19 +736,20 @@ pub fn encoder_subsample_depthwise(
     out_frames: u32,
     out_features: u32,
 ) {
-    let (batch, channels) = (batch as usize, channels as usize);
-    let (in_frames, in_features) = (in_frames as usize, in_features as usize);
-    let (out_frames, out_features) = (out_frames as usize, out_features as usize);
     let idx = thread::index_1d();
     let i = idx.get();
-    if i >= batch * channels * out_frames * out_features {
+    if i >= (batch * channels * out_frames * out_features) as usize {
         return;
     }
 
-    let f = i % out_features;
-    let t = (i / out_features) % out_frames;
+    // 32-bit index math, as in `encoder_subsample_conv_in`
+    let i = i as u32;
+    let f = (i % out_features) as usize;
+    let t = ((i / out_features) % out_frames) as usize;
     let plane = i / (out_features * out_frames);
-    let (b, c) = (plane / channels, plane % channels);
+    let (b, c) = ((plane / channels) as usize, (plane % channels) as usize);
+    let plane = plane as usize;
+    let (in_frames, in_features) = (in_frames as usize, in_features as usize);
     let mut value = 0.0f32;
     if t < out_lens[b] as usize {
         let input = plane * in_frames * in_features;
@@ -761,14 +789,15 @@ pub fn encoder_subsample_bias_relu(
     frames: u32,
     features: u32,
 ) {
-    let (channels, frames, features) = (channels as usize, frames as usize, features as usize);
     let idx = thread::index_1d();
-    let i = idx.get();
+    // 32-bit index math, as in `encoder_subsample_conv_in`; the launcher keeps the map
+    // under 2^32 elements
+    let i = idx.get() as u32;
     let t = (i / features) % frames;
-    let c = (i / (features * frames)) % channels;
-    let b = i / (features * frames * channels);
+    let c = ((i / (features * frames)) % channels) as usize;
+    let b = (i / (features * frames * channels)) as usize;
     if let Some(slot) = x.get_mut(idx) {
-        *slot = if t < lens[b] as usize {
+        *slot = if t < lens[b] {
             (*slot + bias[c]).max(0.0)
         } else {
             0.0

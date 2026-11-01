@@ -13,7 +13,7 @@ pub(crate) struct ParakeetFeatureExtractor {
     mel_filterbank: MelFilterbank,
     window: Vec<f32>,
     r2c: Arc<dyn RealToComplex<f32>>,
-    stft_workspace: RefCell<StftWorkspace>,
+    workspace: RefCell<Workspace>,
 }
 
 impl std::fmt::Debug for ParakeetFeatureExtractor {
@@ -31,61 +31,31 @@ impl Clone for ParakeetFeatureExtractor {
             mel_filterbank: self.mel_filterbank.clone(),
             window: self.window.clone(),
             r2c: self.r2c.clone(),
-            stft_workspace: RefCell::new(StftWorkspace::new(&self.r2c)),
+            workspace: RefCell::new(Workspace::new(&self.r2c)),
         }
     }
 }
 
-#[derive(Debug, Clone)]
-struct StftWorkspace {
-    preemphasized: Vec<f32>,
+/// Buffers reused across extractions
+struct Workspace {
+    /// The pre-emphasized audio with the STFT's centering pad
     padded: Vec<f32>,
-    /// Power spectrum, frame-major `[frames, freq_bins]`
-    power: Vec<f32>,
     input: Vec<f32>,
     output: Vec<Complex<f32>>,
-    scratch: Vec<Complex<f32>>,
+    fft: Vec<Complex<f32>>,
+    /// The current frame's power spectrum, used while it is still in cache
+    power: Vec<f32>,
 }
 
-impl StftWorkspace {
+impl Workspace {
     fn new(r2c: &Arc<dyn RealToComplex<f32>>) -> Self {
         Self {
-            preemphasized: Vec::new(),
             padded: Vec::new(),
-            power: Vec::new(),
             input: r2c.make_input_vec(),
             output: r2c.make_output_vec(),
-            scratch: r2c.make_scratch_vec(),
+            fft: r2c.make_scratch_vec(),
+            power: Vec::new(),
         }
-    }
-
-    fn prepare_padded_audio(&mut self, pad_amount: usize) {
-        self.padded.clear();
-        self.padded.resize(pad_amount, 0.0);
-        self.padded.extend_from_slice(&self.preemphasized);
-        self.padded
-            .resize(self.preemphasized.len() + pad_amount * 2, 0.0);
-    }
-
-    fn process_frame(
-        &mut self,
-        r2c: &Arc<dyn RealToComplex<f32>>,
-        window: &[f32],
-        start: usize,
-    ) -> Result<(), TranscriptionError> {
-        // torch.stft centers a window shorter than n_fft inside the frame
-        let offset = (self.input.len() - window.len()) / 2;
-        self.input.fill(0.0);
-        for (window_idx, window_value) in window.iter().copied().enumerate() {
-            self.input[offset + window_idx] =
-                self.padded[start + offset + window_idx] * window_value;
-        }
-
-        let input = &mut self.input;
-        let output = &mut self.output;
-        let scratch = &mut self.scratch;
-        r2c.process_with_scratch(input, output, scratch)
-            .map_err(|error| TranscriptionError::InvalidModelOutput(format!("fft failed: {error}")))
     }
 }
 
@@ -101,7 +71,7 @@ impl ParakeetFeatureExtractor {
                 config.sample_rate,
             )),
             window: hann_window(config.win_length),
-            stft_workspace: RefCell::new(StftWorkspace::new(&r2c)),
+            workspace: RefCell::new(Workspace::new(&r2c)),
             r2c,
         }
     }
@@ -111,20 +81,26 @@ impl ParakeetFeatureExtractor {
             return Err(TranscriptionError::EmptyAudio);
         }
 
-        let mut workspace = self.stft_workspace.borrow_mut();
-        let num_frames = self.power_spectrum(&mut workspace, audio)?;
-        let freq_bins = self.config.n_fft / 2 + 1;
+        let mut workspace = self.workspace.borrow_mut();
+        preemphasize_padded(
+            audio,
+            self.config.preemphasis,
+            self.config.n_fft / 2,
+            &mut workspace.padded,
+        );
+
+        // NeMo counts `len / hop` valid frames; the STFT's extra trailing frame is
+        // padding that NeMo masks out and leaves out of normalization. One frame
+        // is kept for audio shorter than a hop so the encoder has an input
+        let num_frames = (audio.len() / self.config.hop_length).max(1);
         let mut features = Array2::<f32>::zeros((num_frames, self.mel_filterbank.mels()));
-        let rows = workspace
-            .power
-            .chunks_exact(freq_bins)
-            .zip(features.rows_mut());
         let log_zero_guard = 2.0f32.powi(-24);
-        for (power, mut mels) in rows {
+        for (frame, mut mels) in features.rows_mut().into_iter().enumerate() {
+            self.power(&mut workspace, frame * self.config.hop_length)?;
             let mels = mels
                 .as_slice_mut()
                 .expect("a fresh standard-layout array has contiguous rows");
-            self.mel_filterbank.apply(power, mels);
+            self.mel_filterbank.apply(&workspace.power, mels);
             for value in mels {
                 *value = (*value + log_zero_guard).ln();
             }
@@ -133,56 +109,65 @@ impl ParakeetFeatureExtractor {
         Ok(features)
     }
 
-    /// Fills `workspace.power` with the frame-major power spectrum of `audio` and
-    /// returns its frame count
-    fn power_spectrum(
-        &self,
-        workspace: &mut StftWorkspace,
-        audio: &[f32],
-    ) -> Result<usize, TranscriptionError> {
-        apply_preemphasis_into(audio, self.config.preemphasis, &mut workspace.preemphasized);
-
-        let pad_amount = self.config.n_fft / 2;
-        workspace.prepare_padded_audio(pad_amount);
-
-        // NeMo counts `len / hop` valid frames; the STFT's extra trailing frame is
-        // padding that NeMo masks out and leaves out of normalization. One frame
-        // is kept for audio shorter than a hop so the encoder has an input
-        let num_frames = (audio.len() / self.config.hop_length).max(1);
-        let freq_bins = self.config.n_fft / 2 + 1;
-        workspace.power.clear();
-        workspace.power.reserve(num_frames * freq_bins);
-
-        // reuse the FFT plan and temporary buffers across chunk extractions
-        for frame_idx in 0..num_frames {
-            let start = frame_idx * self.config.hop_length;
-            workspace.process_frame(&self.r2c, &self.window, start)?;
-            let StftWorkspace { output, power, .. } = &mut *workspace;
-            power.extend(output[..freq_bins].iter().map(Complex::norm_sqr));
+    /// Fills `workspace.power` with the power spectrum of the frame at `start` in
+    /// the padded audio
+    fn power(&self, workspace: &mut Workspace, start: usize) -> Result<(), TranscriptionError> {
+        let Workspace {
+            padded,
+            input,
+            output,
+            fft,
+            power,
+        } = workspace;
+        // torch.stft centers a window shorter than n_fft inside the frame
+        let offset = (input.len() - self.window.len()) / 2;
+        input.fill(0.0);
+        let frame = &padded[start + offset..start + offset + self.window.len()];
+        for ((slot, sample), weight) in input[offset..].iter_mut().zip(frame).zip(&self.window) {
+            *slot = sample * weight;
         }
 
-        Ok(num_frames)
+        self.r2c
+            .process_with_scratch(input, output, fft)
+            .map_err(|error| {
+                TranscriptionError::InvalidModelOutput(format!("fft failed: {error}"))
+            })?;
+        // a real FFT of `n_fft` samples gives exactly the `n_fft / 2 + 1` bins
+        power.clear();
+        power.extend(output.iter().map(Complex::norm_sqr));
+        Ok(())
     }
 
+    /// The power spectrum as `[freq_bins, frames]`
     #[cfg(test)]
     fn stft(&self, audio: &[f32]) -> Result<Array2<f32>, TranscriptionError> {
-        let mut workspace = self.stft_workspace.borrow_mut();
-        let num_frames = self.power_spectrum(&mut workspace, audio)?;
+        let mut workspace = self.workspace.borrow_mut();
+        preemphasize_padded(
+            audio,
+            self.config.preemphasis,
+            self.config.n_fft / 2,
+            &mut workspace.padded,
+        );
+        let num_frames = (audio.len() / self.config.hop_length).max(1);
         let freq_bins = self.config.n_fft / 2 + 1;
-        let power = Array2::from_shape_vec((num_frames, freq_bins), workspace.power.clone())
-            .expect("the power spectrum holds frames * bins values");
-        Ok(power.reversed_axes())
+        let mut power = Array2::zeros((freq_bins, num_frames));
+        for (frame, mut column) in power.columns_mut().into_iter().enumerate() {
+            self.power(&mut workspace, frame * self.config.hop_length)?;
+            column.assign(&ndarray::ArrayView1::from(&workspace.power));
+        }
+        Ok(power)
     }
 }
 
-fn apply_preemphasis_into(audio: &[f32], coefficient: f32, output: &mut Vec<f32>) {
-    output.clear();
-    if output.capacity() < audio.len() {
-        output.reserve(audio.len() - output.capacity());
-    }
-    output.push(audio[0]);
-    for index in 1..audio.len() {
-        output.push(audio[index] - coefficient * audio[index - 1]);
+/// `audio` after pre-emphasis, with `pad` zeros on each side as torch.stft's
+/// centered frames read it, in one pass
+fn preemphasize_padded(audio: &[f32], coefficient: f32, pad: usize, padded: &mut Vec<f32>) {
+    padded.clear();
+    padded.resize(audio.len() + 2 * pad, 0.0);
+    let body = &mut padded[pad..pad + audio.len()];
+    body[0] = audio[0];
+    for ((out, current), previous) in body[1..].iter_mut().zip(&audio[1..]).zip(audio) {
+        *out = current - coefficient * previous;
     }
 }
 
@@ -344,10 +329,13 @@ impl MelFilterbank {
 /// values in the same frame order as a column-wise pass, without striding through
 /// memory
 fn normalize_columns(features: &mut Array2<f32>) {
-    let num_frames = features.nrows();
-    let num_features = features.ncols();
+    let (num_frames, num_features) = features.dim();
+    // plain slices rather than ndarray rows let the compiler vectorize each pass
+    let values = features
+        .as_slice_mut()
+        .expect("a fresh standard-layout array is contiguous");
     let mut sums = vec![0.0f32; num_features];
-    for row in features.rows() {
+    for row in values.chunks_exact(num_features) {
         for (sum, value) in sums.iter_mut().zip(row) {
             *sum += *value;
         }
@@ -355,7 +343,7 @@ fn normalize_columns(features: &mut Array2<f32>) {
     let means: Vec<f32> = sums.iter().map(|sum| sum / num_frames as f32).collect();
 
     let mut squares = vec![0.0f32; num_features];
-    for row in features.rows() {
+    for row in values.chunks_exact(num_features) {
         for ((sum, value), mean) in squares.iter_mut().zip(row).zip(&means) {
             *sum += (*value - mean).powi(2);
         }
@@ -366,7 +354,7 @@ fn normalize_columns(features: &mut Array2<f32>) {
         .map(|sum| (sum / num_frames.saturating_sub(1).max(1) as f32).sqrt() + 1e-5)
         .collect();
 
-    for mut row in features.rows_mut() {
+    for row in values.chunks_exact_mut(num_features) {
         for ((value, mean), std) in row.iter_mut().zip(&means).zip(&stds) {
             *value = (*value - mean) / std;
         }

@@ -181,7 +181,7 @@ impl fmt::Debug for CudaModel {
 
 impl CudaModel {
     /// Loads native weights for `deployment` onto CUDA device 0, with the encoder
-    /// GEMMs at `precision`
+    /// GEMMs and the joint at `precision` (the joint runs TF32 under FP16)
     pub(crate) fn load(
         weights: &Path,
         deployment: &ParakeetDeployment,
@@ -194,8 +194,9 @@ impl CudaModel {
         let _exclusive = exclusive_device_work();
         let runtime = CudaRuntime::open(0, Options::default())?;
         runtime.prepare(Library::Cublas)?;
-        let encoder = CudaEncoder::load(&runtime, &file, spec.encoder, math(precision))?;
-        let decoder = CudaDecoder::load(&runtime, &file, &spec)?;
+        let math = math(precision);
+        let encoder = CudaEncoder::load(&runtime, &file, spec.encoder, math)?;
+        let decoder = CudaDecoder::load(&runtime, &file, &spec, math.single())?;
         let (free, _) = runtime.stream().context().mem_get_info()?;
         Ok(Self(Arc::new(ExclusiveTeardown(ManuallyDrop::new(
             Engine {

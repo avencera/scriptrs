@@ -13,11 +13,8 @@ use cudakit::{
     PtxTier, Runtime, TierSet, check_len, element_count,
 };
 
-use crate::cuda::fp16;
-
-/// Build-wide CUDA policy: cuBLAS is allowed while the encoder is library-first, and
-/// only the `sm_75` baseline PTX ships. The FP16 encoder GEMMs call `cublasGemmEx`
-/// directly
+/// Build-wide CUDA policy: cuBLAS and cuBLASLt are allowed while the encoder is
+/// library-first, and only the `sm_75` baseline PTX ships
 pub(crate) static PROFILE: Profile = Profile {
     consumer: "scriptrs",
     compiled: TierSet::of(&[PtxTier::Sm75]),
@@ -26,10 +23,7 @@ pub(crate) static PROFILE: Profile = Profile {
     // user who already enabled `cuda` to enable it, so those get cudakit's generic hint
     tier_features: &[(PtxTier::Sm75, "cuda")],
     libraries: LibraryPolicy::Allowed,
-    extra_symbols: ExtraSymbols {
-        cublas: fp16::CUBLAS_SYMBOLS,
-        ..ExtraSymbols::NONE
-    },
+    extra_symbols: ExtraSymbols::NONE,
 };
 
 /// One PTX module per kernel area
@@ -121,9 +115,13 @@ const DECIDE_VALUES: usize = 12;
 /// the kernels' `ROW_WARPS` warps
 const WEIGHT_ROW_THREADS: u32 = 4 * 32;
 
+/// Output channels per `encoder_subsample_conv_in` thread, the kernels'
+/// `CONV_IN_CHANNELS`
+const CONV_IN_CHANNELS: usize = 16;
+
 /// Weight columns each of those threads holds in registers, the kernels'
 /// `ROW_STEPS`, which bounds the predictor's hidden width
-const WEIGHT_ROW_STEPS: usize = 8;
+const WEIGHT_ROW_STEPS: usize = 5;
 
 /// Fails unless a weight row of `hidden` fits the registers of one
 /// `decode_lstm` or `decode_project` block
@@ -781,7 +779,16 @@ impl EncoderKernels {
             out.len(),
         )?;
         check_len("input lengths", output.batch, out_lens.len())?;
-        let config = elements(output.len())?;
+        if output.channels % CONV_IN_CHANNELS != 0 {
+            return Err(Error::Unsupported {
+                context: "subsampling",
+                reason: format!(
+                    "{} channels is not a multiple of the first convolution's {CONV_IN_CHANNELS}",
+                    output.channels
+                ),
+            });
+        }
+        let config = elements(output.len() / CONV_IN_CHANNELS)?;
         let lens = [
             len(mel),
             len(in_lens),
@@ -816,7 +823,8 @@ impl EncoderKernels {
         for dim in &dims {
             launch.arg(dim);
         }
-        // SAFETY: matches `encoder_subsample_conv_in`; indexing is checked in the kernel
+        // SAFETY: matches `encoder_subsample_conv_in`; the lengths checked above keep
+        // each thread's channel group inside `out`, and reads are checked in the kernel
         unsafe { launch.launch(config) }?;
         Ok(())
     }
