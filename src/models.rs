@@ -12,12 +12,73 @@ use crate::vocab::Vocabulary;
 #[cfg(feature = "online")]
 pub use hub::ModelManager;
 
+/// One of the Silero VAD models a bundle holds
 #[cfg(feature = "vad")]
-const VAD_DIR: &str = "vad/silero-vad.mlmodelc";
-/// Silero v5 weights in a native bundle, as `dev-tools/nemo/export_native.py`
-/// writes them next to the Parakeet directories
-#[cfg(all(feature = "cuda", feature = "vad"))]
-const NATIVE_VAD_PATH: &str = "vad/silero-vad-v5.safetensors";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SileroVersion {
+    /// Silero VAD 5.1.2
+    V5,
+    /// Silero VAD 6.2.3
+    V6,
+}
+
+#[cfg(feature = "vad")]
+impl SileroVersion {
+    pub(crate) const ALL: [Self; 2] = [Self::V5, Self::V6];
+
+    /// Compiled Core ML model in a Core ML bundle; v5 keeps the unversioned name
+    /// published bundles and local layouts already use
+    pub(crate) fn coreml_dir(self) -> &'static str {
+        match self {
+            Self::V5 => "vad/silero-vad.mlmodelc",
+            Self::V6 => "vad/silero-vad-v6.mlmodelc",
+        }
+    }
+
+    /// Weights in a native bundle, as `dev-tools/nemo/export_native.py` writes them
+    /// next to the Parakeet directories
+    #[cfg(feature = "cuda")]
+    pub(crate) fn native_path(self) -> &'static str {
+        match self {
+            Self::V5 => "vad/silero-vad-v5.safetensors",
+            Self::V6 => "vad/silero-vad-v6.safetensors",
+        }
+    }
+
+    /// `model` metadata of the native weights
+    #[cfg(feature = "cuda")]
+    pub(crate) fn model_name(self) -> &'static str {
+        match self {
+            Self::V5 => "silero-vad-v5",
+            Self::V6 => "silero-vad-v6",
+        }
+    }
+}
+
+/// Where each Silero VAD model is in a bundle, whether or not it is there
+#[cfg(feature = "vad")]
+#[derive(Debug, Clone)]
+pub(crate) struct VadPaths {
+    v5: PathBuf,
+    v6: PathBuf,
+}
+
+#[cfg(feature = "vad")]
+impl VadPaths {
+    fn resolve(root: &Path, relative: impl Fn(SileroVersion) -> &'static str) -> Self {
+        Self {
+            v5: root.join(relative(SileroVersion::V5)),
+            v6: root.join(relative(SileroVersion::V6)),
+        }
+    }
+
+    pub(crate) fn get(&self, version: SileroVersion) -> &Path {
+        match version {
+            SileroVersion::V5 => &self.v5,
+            SileroVersion::V6 => &self.v6,
+        }
+    }
+}
 /// Longest single input for native bundles, 40 s at 16 kHz; the CUDA encoder has no
 /// fixed input width, and full attention over 40 s still fits easily in memory
 #[cfg(feature = "cuda")]
@@ -57,13 +118,13 @@ impl RuntimeBundle {
         }
     }
 
-    /// Where the bundle's VAD model is, whether or not it is there
+    /// Where the bundle's Silero VAD models are, whether or not they are there
     #[cfg(feature = "vad")]
-    fn vad_path(&self) -> &Path {
+    pub(crate) fn vad_paths(&self) -> &VadPaths {
         match self {
-            Self::CoreMl(layout) => &layout.vad_dir,
+            Self::CoreMl(layout) => &layout.vad_paths,
             #[cfg(feature = "cuda")]
-            Self::Native(layout) => &layout.vad_path,
+            Self::Native(layout) => &layout.vad_paths,
         }
     }
 }
@@ -203,7 +264,7 @@ pub(crate) struct NativeLayout {
     weights_path: PathBuf,
     vocab_path: PathBuf,
     #[cfg(feature = "vad")]
-    vad_path: PathBuf,
+    vad_paths: VadPaths,
     precision: Precision,
 }
 
@@ -214,7 +275,7 @@ impl NativeLayout {
             weights_path: root.join(deployment.native_weights_path()),
             vocab_path: root.join(deployment.layout().vocab()),
             #[cfg(feature = "vad")]
-            vad_path: root.join(NATIVE_VAD_PATH),
+            vad_paths: VadPaths::resolve(root, SileroVersion::native_path),
             precision: Precision::default(),
         }
     }
@@ -254,11 +315,6 @@ impl NativeLayout {
         own.exists().then_some(own)
     }
 
-    #[cfg(feature = "vad")]
-    pub(crate) fn vad_path(&self) -> &Path {
-        &self.vad_path
-    }
-
     pub(crate) fn precision(&self) -> Precision {
         self.precision
     }
@@ -272,7 +328,7 @@ pub(crate) struct CoreMlLayout {
     joint_decision_dir: PathBuf,
     vocab_path: PathBuf,
     #[cfg(feature = "vad")]
-    vad_dir: PathBuf,
+    vad_paths: VadPaths,
 }
 
 impl CoreMlLayout {
@@ -284,7 +340,7 @@ impl CoreMlLayout {
             joint_decision_dir: root.join(layout.joint_decision()),
             vocab_path: root.join(layout.vocab()),
             #[cfg(feature = "vad")]
-            vad_dir: root.join(VAD_DIR),
+            vad_paths: VadPaths::resolve(root, SileroVersion::coreml_dir),
         }
     }
 
@@ -330,11 +386,6 @@ impl CoreMlLayout {
     pub(crate) fn joint_decision_dir(&self) -> &Path {
         &self.joint_decision_dir
     }
-
-    #[cfg(feature = "vad")]
-    pub(crate) fn vad_dir(&self) -> &Path {
-        &self.vad_dir
-    }
 }
 
 impl ModelBundle {
@@ -364,8 +415,8 @@ impl ModelBundle {
     ///
     /// The directory holds `parakeet-v2/` or `parakeet-v3/` with `model.safetensors`
     /// and the vocabulary, as `dev-tools/nemo/export_native.py` writes them. With
-    /// `vad`, the Silero VAD weights are `vad/silero-vad-v5.safetensors` in the same
-    /// directory. This only resolves paths; [`Self::validate_base`] checks they
+    /// `vad`, the Silero VAD weights are `vad/silero-vad-v5.safetensors` and
+    /// `vad/silero-vad-v6.safetensors` in the same directory. This only resolves paths; [`Self::validate_base`] checks they
     /// exist, and loading checks the weights against the deployment
     ///
     /// The CUDA encoder takes inputs of any length, so a native bundle raises the
@@ -386,14 +437,14 @@ impl ModelBundle {
     /// Native bundle from files resolved one at a time, such as snapshots of the
     /// separate Hugging Face repositories for Parakeet and Silero VAD
     ///
-    /// The root is the weights' directory. Without `vad_path`, the VAD path keeps
-    /// the [`Self::from_native_dir`] layout under that root, so a long-form run
-    /// reports it missing
+    /// The root is the weights' directory. Without `vad_paths`, the VAD paths keep
+    /// the [`Self::from_native_dir`] layout under that root, so a VAD run reports
+    /// them missing
     #[cfg(all(feature = "online", feature = "cuda"))]
     fn from_native_files(
         weights_path: PathBuf,
         vocab_path: PathBuf,
-        vad_path: Option<PathBuf>,
+        #[cfg(feature = "vad")] vad_paths: Option<VadPaths>,
         deployment: ParakeetDeployment,
     ) -> Self {
         let root = weights_path
@@ -401,14 +452,13 @@ impl ModelBundle {
             .map(Path::to_path_buf)
             .unwrap_or_default();
         #[cfg(feature = "vad")]
-        let vad_path = vad_path.unwrap_or_else(|| root.join(NATIVE_VAD_PATH));
-        #[cfg(not(feature = "vad"))]
-        let _ = vad_path;
+        let vad_paths =
+            vad_paths.unwrap_or_else(|| VadPaths::resolve(&root, SileroVersion::native_path));
         let runtime = RuntimeBundle::Native(NativeLayout {
             weights_path,
             vocab_path,
             #[cfg(feature = "vad")]
-            vad_path,
+            vad_paths,
             precision: Precision::default(),
         });
         Self {
@@ -452,14 +502,21 @@ impl ModelBundle {
         }
     }
 
-    /// Validate that the Parakeet and VAD model assets are present
+    /// Validate that the Parakeet assets and both Silero VAD models are present
     #[cfg(feature = "vad")]
     pub fn validate_long_form(&self) -> Result<(), TranscriptionError> {
         self.validate_base()?;
-        if !self.runtime.vad_path().exists() {
-            return Err(self.missing_vad_error());
+        let paths = self.runtime.vad_paths();
+        let missing = SileroVersion::ALL
+            .into_iter()
+            .map(|version| paths.get(version))
+            .find(|path| !path.exists());
+        match missing {
+            Some(path) => Err(TranscriptionError::MissingModelAsset {
+                path: path.to_path_buf(),
+            }),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     pub(crate) fn runtime(&self) -> &RuntimeBundle {
@@ -468,14 +525,6 @@ impl ModelBundle {
 
     pub(crate) fn vocabulary(&self) -> Result<Vocabulary, TranscriptionError> {
         Vocabulary::load(self.runtime.vocab_path(), &self.deployment)
-    }
-
-    /// Error to return when a VAD run is requested but the bundle has no VAD model
-    #[cfg(feature = "vad")]
-    pub(crate) fn missing_vad_error(&self) -> TranscriptionError {
-        TranscriptionError::MissingModelAsset {
-            path: self.runtime.vad_path().to_path_buf(),
-        }
     }
 
     /// Return the root directory that contains the model bundle

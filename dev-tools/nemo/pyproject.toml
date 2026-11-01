@@ -15,7 +15,6 @@ dependencies = [
     "numpy",
     "jiwer",
     "whisper-normalizer",
-    "silero-vad==5.1.2",
     "huggingface-hub",
 ]
 

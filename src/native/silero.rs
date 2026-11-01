@@ -1,4 +1,5 @@
-//! Silero VAD v5 (16 kHz branch) in plain Rust on the CPU
+//! Silero VAD v5 and v6 (16 kHz branch) in plain Rust on the CPU; the two share
+//! one architecture and differ only in their weights
 //!
 //! Everything before the LSTM sees one window and no recurrent state, so the STFT,
 //! the four convolutions and the LSTM input gates run as matrix multiplies over
@@ -19,12 +20,12 @@ use ndarray::{ArrayView2, ArrayViewMut2};
 
 use crate::constants::{VAD_CONTEXT_SAMPLES, VAD_STATE_SIZE, VAD_WINDOW_SAMPLES};
 use crate::error::TranscriptionError;
+use crate::models::SileroVersion;
 use crate::native::weights::WeightFile;
 
 /// Samples in one model input: the carried context plus one chunk
 pub(crate) const VAD_INPUT_SAMPLES: usize = VAD_CONTEXT_SAMPLES + VAD_WINDOW_SAMPLES;
 
-const MODEL: &str = "silero-vad-v5";
 const SAMPLE_RATE: u64 = 16_000;
 
 /// STFT as Silero runs it: a conv1d over a reflect-padded window with a DFT basis
@@ -55,7 +56,7 @@ const TASKS_PER_WORKER: usize = 4;
 /// path, and a few workers already encode faster than it consumes
 const MAX_WORKERS: usize = 6;
 
-/// Silero VAD v5 weights, shared by clones
+/// One Silero VAD version's weights, shared by clones
 #[derive(Debug, Clone)]
 pub(crate) struct SileroModel(Arc<Weights>);
 
@@ -106,10 +107,11 @@ impl SileroState {
 }
 
 impl SileroModel {
-    /// Load `silero-vad-v5.safetensors` as `dev-tools/nemo/export_native.py` writes it
-    pub(crate) fn open(path: &Path) -> Result<Self, TranscriptionError> {
+    /// Load one version's weights, such as `silero-vad-v6.safetensors`, as
+    /// `dev-tools/nemo/export_native.py` writes them
+    pub(crate) fn open(path: &Path, version: SileroVersion) -> Result<Self, TranscriptionError> {
         let file = WeightFile::open(path)?;
-        file.expect_metadata("model", MODEL)?;
+        file.expect_metadata("model", version.model_name())?;
         check_config(&file)?;
 
         let basis = file.tensor("stft.forward_basis_buffer", &[2 * BINS, 1, FILTER])?;
@@ -566,10 +568,11 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     use super::{GATES, lstm_step, lstm_step_avx};
     use crate::cuda::test_support::native_root;
+    use crate::models::SileroVersion;
     use crate::test_support::NemoReference;
 
-    fn model() -> SileroModel {
-        SileroModel::open(&native_root().join("vad/silero-vad-v5.safetensors"))
+    fn model(version: SileroVersion) -> SileroModel {
+        SileroModel::open(&native_root().join(version.native_path()), version)
             .expect("exported Silero weights")
     }
 
@@ -647,15 +650,22 @@ mod tests {
         assert!(baseline_state.h.iter().any(|h| *h != 0.0));
     }
 
-    /// Window 0's STFT magnitude and encoder output match Silero's own modules
+    /// Window 0's STFT magnitude and encoder output match Silero's own modules, for
+    /// each version
     #[test]
     #[ignore = "reads Silero references from /shared/datasets/parakeet-ref"]
     fn nemo_parity_silero_encoder_stages() {
-        let reference = NemoReference::silero();
+        SileroVersion::ALL
+            .into_iter()
+            .for_each(encoder_stages_match);
+    }
+
+    fn encoder_stages_match(version: SileroVersion) {
+        let reference = NemoReference::silero(version);
         let window = reference.f32("window0.in");
         let window = window.as_slice().expect("contiguous window");
         assert_eq!(window.len(), VAD_INPUT_SAMPLES);
-        let model = model();
+        let model = model(version);
 
         // the reference is `[1, BINS, FRAMES]`; ours is frames first
         let stft = reference.f32("window0.stft");
@@ -669,26 +679,31 @@ mod tests {
         let scale = stft.iter().copied().fold(0.0, f32::max);
         assert!(
             diff <= 1e-5 * scale.max(1.0),
-            "STFT max diff {diff} (peak {scale})"
+            "{version:?} STFT max diff {diff} (peak {scale})"
         );
 
         let encoder = reference.f32("window0.encoder");
         let features = model.0.encode(window);
         assert_eq!(features.len(), HIDDEN);
         let diff = max_abs_diff(features, encoder.iter().copied());
-        assert!(diff <= 1e-4, "encoder max diff {diff}");
+        assert!(diff <= 1e-4, "{version:?} encoder max diff {diff}");
     }
 
-    /// Per-window probabilities over a whole file stay within 1e-4 of Silero's, and
-    /// the block size used for the batched encoder does not change them
+    /// For each version, per-window probabilities over a whole file stay within
+    /// 1e-5 of Silero's, and the block size used for the batched encoder does not
+    /// change them
     #[test]
     #[ignore = "reads Silero references from /shared/datasets/parakeet-ref"]
     fn nemo_parity_silero_probabilities() {
-        let reference = NemoReference::silero();
+        SileroVersion::ALL.into_iter().for_each(probabilities_match);
+    }
+
+    fn probabilities_match(version: SileroVersion) {
+        let reference = NemoReference::silero(version);
         let windows = reference.f32("windows");
         let windows = windows.as_slice().expect("contiguous windows");
         let expected = reference.f32("probs");
-        let model = model();
+        let model = model(version);
 
         let run = |block: usize| {
             let mut state = SileroState::new();
@@ -702,10 +717,14 @@ mod tests {
         assert_eq!(whole.len(), expected.len());
         let diff = max_abs_diff(whole.iter().copied(), expected.iter().copied());
         eprintln!(
-            "silero probability max abs diff {diff:e} over {} windows",
+            "silero {version:?} probability max abs diff {diff:e} over {} windows",
             whole.len()
         );
-        assert!(diff <= 1e-5, "probability max diff {diff}");
-        assert_eq!(run(7), whole, "block size changed the probabilities");
+        assert!(diff <= 1e-5, "{version:?} probability max diff {diff}");
+        assert_eq!(
+            run(7),
+            whole,
+            "{version:?}: block size changed the probabilities"
+        );
     }
 }

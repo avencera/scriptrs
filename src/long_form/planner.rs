@@ -11,6 +11,43 @@ pub(crate) struct SampleRange {
     pub end: usize,
 }
 
+/// Silero VAD model that scores each window's speech probability
+///
+/// The default, Silero fusion, is the most accurate on every set measured (README). Silero
+/// v6 alone beats v5 on calls and meetings but loses on sparse speech, where it
+/// takes more music and effects for speech, and on far-field conversation, where it
+/// misses distant speakers
+#[cfg(feature = "vad")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum VadModel {
+    /// Silero VAD 5.1.2
+    SileroV5,
+    /// Silero VAD 6.2.3
+    SileroV6,
+    /// Both Silero models, keeping each window's higher speech probability
+    ///
+    /// Speech either model finds counts, which recovers what v6 misses on far-field
+    /// audio. The two run at once, so it costs little more than one model
+    #[default]
+    SileroFusion,
+}
+
+#[cfg(feature = "vad")]
+impl VadModel {
+    /// Speech threshold this model was measured at, and the one
+    /// [`VadSegmentationConfig::for_model`] sets
+    pub fn default_threshold(self) -> f32 {
+        match self {
+            // Silero's own default; 0.85 dropped low-confidence phone and far-field
+            // speech, raising long-form WER on every set measured (README)
+            Self::SileroV5 | Self::SileroV6 => 0.5,
+            // fusion raises every window's probability, so 0.5 let in more non-speech
+            // and lost accuracy on sparse speech; 0.6 matched or beat v5 everywhere
+            Self::SileroFusion => 0.6,
+        }
+    }
+}
+
 /// Segmentation parameters for converting VAD probabilities into speech regions
 ///
 /// The model hard sample maximum is not stored here. Pass
@@ -18,6 +55,9 @@ pub(crate) struct SampleRange {
 #[cfg(feature = "vad")]
 #[derive(Debug, Clone)]
 pub struct VadSegmentationConfig {
+    /// VAD model that scores speech; build the config with [`Self::for_model`] to
+    /// also take the model's threshold
+    pub model: VadModel,
     /// Speech probability at or above which a VAD window counts as speech
     pub threshold: f32,
     /// Minimum speech span kept in the output
@@ -39,13 +79,20 @@ pub struct VadSegmentationConfig {
 #[cfg(feature = "vad")]
 impl Default for VadSegmentationConfig {
     fn default() -> Self {
+        Self::for_model(VadModel::default())
+    }
+}
+
+#[cfg(feature = "vad")]
+impl VadSegmentationConfig {
+    /// Default segmentation for a VAD model, at its [`VadModel::default_threshold`]
+    pub fn for_model(model: VadModel) -> Self {
         Self {
-            // Silero's own default; 0.85 dropped low-confidence phone and far-field
-            // speech, raising long-form WER on every set measured (README)
-            threshold: 0.5,
+            model,
+            threshold: model.default_threshold(),
             min_speech_duration: 0.15,
             min_silence_duration: 0.75,
-            // Silero crosses the threshold up to ~220 ms into a soft onset, so 0.1 s
+            // Silero v5 crosses the threshold up to ~220 ms into a soft onset, so 0.1 s
             // clipped short first words ("a cold" became "cold"); 0.2 s lowered
             // long-form WER on every set measured, larger values cost AMI headset
             // accuracy (README)
@@ -56,10 +103,7 @@ impl Default for VadSegmentationConfig {
             min_silence_at_max_speech: 0.098,
         }
     }
-}
 
-#[cfg(feature = "vad")]
-impl VadSegmentationConfig {
     pub(crate) fn validate(&self) -> Result<(), TranscriptionError> {
         validate_probability("vad.threshold", self.threshold)?;
         validate_positive_duration("vad.min_speech_duration", self.min_speech_duration)?;
@@ -616,7 +660,8 @@ mod tests {
     use super::{OverlapChunkConfig, RegionTaskKind, SampleRange, build_fast_execution_plan};
     #[cfg(feature = "vad")]
     use super::{
-        VadSegmentationConfig, build_region_plan, detect_speech_regions, plan_region_subsegments,
+        VadModel, VadSegmentationConfig, build_region_plan, detect_speech_regions,
+        plan_region_subsegments,
     };
     use crate::constants::SAMPLES_PER_ENCODER_FRAME;
     #[cfg(feature = "vad")]
@@ -639,7 +684,11 @@ mod tests {
     #[test]
     fn vad_defaults_lock_threshold_and_segmentation() {
         let segmentation = VadSegmentationConfig::default();
-        assert_eq!(segmentation.threshold, 0.5);
+        assert_eq!(segmentation.model, VadModel::SileroFusion);
+        assert_eq!(segmentation.threshold, 0.6);
+        for (model, threshold) in [(VadModel::SileroV5, 0.5), (VadModel::SileroV6, 0.5)] {
+            assert_eq!(VadSegmentationConfig::for_model(model).threshold, threshold);
+        }
         assert_eq!(segmentation.min_speech_duration, 0.15);
         assert_eq!(segmentation.min_silence_duration, 0.75);
         assert_eq!(segmentation.speech_padding, 0.2);

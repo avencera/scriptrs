@@ -5,32 +5,111 @@ use crate::constants::{VAD_CONTEXT_SAMPLES, VAD_WINDOW_SAMPLES};
 #[cfg(target_os = "macos")]
 use crate::coreml::SileroVadCoreMlModel;
 use crate::error::TranscriptionError;
-use crate::models::{ModelBundle, RuntimeBundle};
+use crate::long_form::VadModel;
+use crate::models::{ModelBundle, RuntimeBundle, SileroVersion};
 #[cfg(feature = "cuda")]
 use crate::native::silero::{SileroModel, SileroState};
 use crate::preprocessing::TranscriptionControl;
+use std::path::PathBuf;
 
 /// Silero VAD owner: window chunking, context carry-over, tail padding, and
 /// per-recording recurrent state reset
 ///
-/// Runtimes only classify prepared windows and advance the opaque state
+/// Holds every Silero model the bundle provides and runs the ones a
+/// [`VadModel`] names. Runtimes only classify prepared windows and advance the
+/// opaque state
 #[derive(Debug, Clone)]
 pub(crate) struct SileroVad {
-    model: VadModelInner,
+    v5: Slot,
+    v6: Slot,
+}
+
+/// One Silero version: its model, or where the bundle expected it
+#[derive(Debug, Clone)]
+enum Slot {
+    Loaded(VadModelInner),
+    Missing(PathBuf),
 }
 
 impl SileroVad {
-    /// Load the VAD model a bundle provides, if it provides one
-    pub(crate) fn from_bundle(bundle: &ModelBundle) -> Result<Option<Self>, TranscriptionError> {
-        VadModelInner::from_bundle(bundle).map(|model| model.map(|model| Self { model }))
+    /// Load every Silero model the bundle provides; a missing one fails only the
+    /// runs that need it
+    pub(crate) fn from_bundle(bundle: &ModelBundle) -> Result<Self, TranscriptionError> {
+        let slot = |version| {
+            let path = bundle.runtime().vad_paths().get(version);
+            if !path.exists() {
+                return Ok(Slot::Missing(path.to_path_buf()));
+            }
+            VadModelInner::load(bundle.runtime(), version, path).map(Slot::Loaded)
+        };
+        Ok(Self {
+            v5: slot(SileroVersion::V5)?,
+            v6: slot(SileroVersion::V6)?,
+        })
     }
 
+    /// Speech probability of each window of `audio` under `model`
     pub(crate) fn process(
         &self,
         audio: &[f32],
+        model: VadModel,
         control: &TranscriptionControl,
     ) -> Result<Vec<f32>, TranscriptionError> {
-        self.model.process(audio, control)
+        let models = match model {
+            VadModel::SileroV5 => vec![self.model(SileroVersion::V5)?],
+            VadModel::SileroV6 => vec![self.model(SileroVersion::V6)?],
+            VadModel::SileroFusion => vec![
+                self.model(SileroVersion::V5)?,
+                self.model(SileroVersion::V6)?,
+            ],
+        };
+
+        // each model's recurrence is one thread's critical path, so running both at
+        // once costs little more than running one. Core ML models are `Send` but not
+        // `Sync`, so each thread gets its own clone, which shares the weights
+        let scores = std::thread::scope(|scope| {
+            let scans: Vec<_> = models
+                .into_iter()
+                .map(|model| {
+                    let model = model.clone();
+                    scope.spawn(move || model.process(audio, control))
+                })
+                .collect();
+
+            // the first model's error wins when both fail
+            scans
+                .into_iter()
+                .map(|scan| {
+                    scan.join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+
+        // fusion keeps each window's higher probability
+        let windows = scores.iter().map(Vec::len).min().unwrap_or(0);
+        Ok((0..windows)
+            .map(|index| {
+                scores
+                    .iter()
+                    .map(|model_scores| model_scores[index])
+                    .reduce(f32::max)
+                    .unwrap_or_default()
+            })
+            .collect())
+    }
+
+    fn model(&self, version: SileroVersion) -> Result<&VadModelInner, TranscriptionError> {
+        let slot = match version {
+            SileroVersion::V5 => &self.v5,
+            SileroVersion::V6 => &self.v6,
+        };
+        match slot {
+            Slot::Loaded(model) => Ok(model),
+            Slot::Missing(path) => {
+                Err(TranscriptionError::MissingModelAsset { path: path.clone() })
+            }
+        }
     }
 }
 
@@ -43,36 +122,32 @@ enum VadModelInner {
     // no VAD runtime without Core ML or the native weights; keeps the matches
     // below compiling
     #[cfg(not(any(target_os = "macos", feature = "cuda")))]
-    #[expect(dead_code, reason = "from_bundle never builds a VAD model here")]
+    #[expect(dead_code, reason = "load never builds a VAD model here")]
     Unsupported,
 }
 
 impl VadModelInner {
-    fn from_bundle(bundle: &ModelBundle) -> Result<Option<Self>, TranscriptionError> {
-        match bundle.runtime() {
-            RuntimeBundle::CoreMl(layout) => {
-                if !layout.vad_dir().exists() {
-                    return Ok(None);
-                }
-
+    fn load(
+        runtime: &RuntimeBundle,
+        version: SileroVersion,
+        path: &std::path::Path,
+    ) -> Result<Self, TranscriptionError> {
+        match runtime {
+            RuntimeBundle::CoreMl(_) => {
+                // every Silero version takes the same Core ML inputs and outputs
+                let _ = version;
                 #[cfg(target_os = "macos")]
                 {
-                    Ok(Some(Self::CoreMl(SileroVadCoreMlModel::new(
-                        layout.vad_dir(),
-                    )?)))
+                    Ok(Self::CoreMl(SileroVadCoreMlModel::new(path)?))
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
+                    let _ = path;
                     Err(TranscriptionError::UnsupportedPlatform)
                 }
             }
             #[cfg(feature = "cuda")]
-            RuntimeBundle::Native(layout) => {
-                if !layout.vad_path().exists() {
-                    return Ok(None);
-                }
-                Ok(Some(Self::Native(SileroModel::open(layout.vad_path())?)))
-            }
+            RuntimeBundle::Native(_) => Ok(Self::Native(SileroModel::open(path, version)?)),
         }
     }
 
@@ -109,8 +184,7 @@ impl VadModelInner {
             }
             #[cfg(not(any(target_os = "macos", feature = "cuda")))]
             Self::Unsupported => {
-                let _ = audio;
-                let _ = control;
+                let _ = (audio, control);
                 Err(TranscriptionError::UnsupportedPlatform)
             }
         }

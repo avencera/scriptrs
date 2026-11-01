@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 
 use super::ModelBundle;
 #[cfg(feature = "vad")]
-use super::VAD_DIR;
+use super::SileroVersion;
+#[cfg(all(feature = "cuda", feature = "vad"))]
+use super::VadPaths;
 use crate::deployment::ParakeetDeployment;
 #[cfg(feature = "cuda")]
 use crate::deployment::ParakeetVersion;
@@ -68,9 +70,9 @@ impl ModelBundle {
 
     /// Download native CUDA weights and the native Silero VAD weights
     ///
-    /// The VAD weights come from a pinned snapshot of
-    /// `avencera/silero-vad-v5-safetensors`. Set `SCRIPTRS_MODELS_DIR` to force a
-    /// local native bundle
+    /// The VAD weights come from pinned snapshots of
+    /// `avencera/silero-vad-v5-safetensors` and `avencera/silero-vad-v6-safetensors`.
+    /// Set `SCRIPTRS_MODELS_DIR` to force a local native bundle
     #[cfg(all(feature = "cuda", feature = "vad"))]
     pub fn from_pretrained_native_long_form(
         deployment: ParakeetDeployment,
@@ -84,7 +86,7 @@ impl ModelBundle {
 
 const HF_REPO: HuggingFaceRepository = HuggingFaceRepository("avencera/scriptrs-models");
 const HF_REVISION: HuggingFaceRevision =
-    HuggingFaceRevision("63f6f9cbce43e5561c219229896f86f20c0eb660");
+    HuggingFaceRevision("54f3f976b63bf5d5fe9927363d259cffa1c23a89");
 
 // native CUDA weights live in one repository per model, named after the model, so
 // each is listed under its base model on Hugging Face and found by searching for it
@@ -99,9 +101,14 @@ const NATIVE_V3_SOURCE: HuggingFaceModelSource = HuggingFaceModelSource {
     revision: HuggingFaceRevision("01ffcdb65d1e0087f4f12bbe87f5413f9b429626"),
 };
 #[cfg(all(feature = "cuda", feature = "vad"))]
-const NATIVE_VAD_SOURCE: HuggingFaceModelSource = HuggingFaceModelSource {
+const NATIVE_VAD_V5_SOURCE: HuggingFaceModelSource = HuggingFaceModelSource {
     repository: HuggingFaceRepository("avencera/silero-vad-v5-safetensors"),
     revision: HuggingFaceRevision("bc58b9e061a5cb07bc3ec839df301647753dcc59"),
+};
+#[cfg(all(feature = "cuda", feature = "vad"))]
+const NATIVE_VAD_V6_SOURCE: HuggingFaceModelSource = HuggingFaceModelSource {
+    repository: HuggingFaceRepository("avencera/silero-vad-v6-safetensors"),
+    revision: HuggingFaceRevision("10e0013ed989abfc4491003a03dab3a38839029a"),
 };
 /// Weight file name in each native model repository
 #[cfg(feature = "cuda")]
@@ -132,6 +139,14 @@ impl HuggingFaceModelSource {
         match deployment.version() {
             ParakeetVersion::V2 => NATIVE_V2_SOURCE,
             ParakeetVersion::V3 => NATIVE_V3_SOURCE,
+        }
+    }
+
+    #[cfg(all(feature = "cuda", feature = "vad"))]
+    fn native_vad(version: SileroVersion) -> Self {
+        match version {
+            SileroVersion::V5 => NATIVE_VAD_V5_SOURCE,
+            SileroVersion::V6 => NATIVE_VAD_V6_SOURCE,
         }
     }
 
@@ -204,7 +219,9 @@ impl ModelManager {
         let files = repo_files(&deployment);
         #[cfg(feature = "vad")]
         if include_vad {
-            files.extend(mlmodelc_files(VAD_DIR));
+            for version in SileroVersion::ALL {
+                files.extend(mlmodelc_files(version.coreml_dir()));
+            }
         }
         #[cfg(not(feature = "vad"))]
         let _ = include_vad;
@@ -216,7 +233,8 @@ impl ModelManager {
     ///
     /// The weights come from the deployment's model repository, such as
     /// `avencera/parakeet-tdt-0.6b-v3-cuda`, and with `include_vad` the Silero VAD
-    /// weights from `avencera/silero-vad-v5-safetensors`, each at a pinned revision.
+    /// weights from `avencera/silero-vad-v5-safetensors` and
+    /// `avencera/silero-vad-v6-safetensors`, each at a pinned revision.
     /// The returned [`ModelBundle`] is a native bundle rooted at the Parakeet
     /// snapshot directory
     #[cfg(feature = "cuda")]
@@ -230,24 +248,28 @@ impl ModelManager {
         let vocab_path = repo.get(native_hub_vocab(&deployment))?;
 
         #[cfg(feature = "vad")]
-        let vad_path = match include_vad {
-            true => Some(
-                NATIVE_VAD_SOURCE
-                    .pinned_repo(&self.hub)
-                    .get(NATIVE_HUB_WEIGHTS)?,
-            ),
+        let vad_paths = match include_vad {
+            true => {
+                let get = |version| {
+                    HuggingFaceModelSource::native_vad(version)
+                        .pinned_repo(&self.hub)
+                        .get(NATIVE_HUB_WEIGHTS)
+                };
+                Some(VadPaths {
+                    v5: get(SileroVersion::V5)?,
+                    v6: get(SileroVersion::V6)?,
+                })
+            }
             false => None,
         };
         #[cfg(not(feature = "vad"))]
-        let vad_path = {
-            let _ = include_vad;
-            None
-        };
+        let _ = include_vad;
 
         Ok(ModelBundle::from_native_files(
             weights_path,
             vocab_path,
-            vad_path,
+            #[cfg(feature = "vad")]
+            vad_paths,
             deployment,
         ))
     }

@@ -28,7 +28,7 @@ const NATIVE_OVERLAP_SECONDS: f64 = 8.0;
 #[cfg(feature = "cuda")]
 const NATIVE_BATCH_SIZE: usize = 16;
 #[cfg(feature = "vad")]
-pub use planner::VadSegmentationConfig;
+pub use planner::{VadModel, VadSegmentationConfig};
 
 use self::execute::{RunRequest, execute_plan, transcribe_task};
 use self::merge::merge_overlapping_windows;
@@ -56,7 +56,7 @@ use self::vad::SileroVad;
 pub struct LongFormTranscriptionPipeline {
     inner: TranscriptionPipeline,
     #[cfg(feature = "vad")]
-    vad: Option<SileroVad>,
+    vad: SileroVad,
     default_config: LongFormConfig,
 }
 
@@ -339,13 +339,9 @@ impl LongFormTranscriptionPipeline {
             ..
         } = request;
         control.check()?;
-        let vad = self
+        let probabilities = self
             .vad
-            .as_ref()
-            .ok_or_else(|| self.inner.bundle().missing_vad_error())
-            .map_err(PreprocessedTranscriptionError::from)?;
-        let probabilities = vad
-            .process(audio, control)
+            .process(audio, config.segmentation.model, control)
             .map_err(PreprocessedTranscriptionError::from)?;
         control.check()?;
         let regions = detect_speech_regions(&probabilities, audio.len(), &config.segmentation);
@@ -528,11 +524,9 @@ impl LongFormTranscriptionPipeline {
             #[cfg(feature = "vad")]
             RunPath::Planned(LongFormMode::Vad) => {
                 let control = TranscriptionControl::internal_unbounded();
-                let vad = self
+                let probabilities = self
                     .vad
-                    .as_ref()
-                    .ok_or_else(|| self.inner.bundle().missing_vad_error())?;
-                let probabilities = vad.process(audio, &control)?;
+                    .process(audio, config.segmentation.model, &control)?;
                 let regions =
                     detect_speech_regions(&probabilities, audio.len(), &config.segmentation);
                 build_vad_execution_plan(&regions, &probabilities, config)
@@ -685,6 +679,8 @@ mod tests {
     use super::{
         LongFormConfig, LongFormMode, RunPath, WindowPreprocessor, build_fast_execution_plan,
     };
+    #[cfg(all(feature = "cuda", feature = "vad"))]
+    use super::{VadModel, VadSegmentationConfig};
     #[cfg(feature = "vad")]
     use super::{detect_speech_regions, merge_overlap_region};
     #[cfg(all(feature = "cuda", feature = "vad"))]
@@ -700,6 +696,8 @@ mod tests {
     use crate::deployment::ParakeetDeployment;
     #[cfg(feature = "cuda")]
     use crate::error::TranscriptionError;
+    #[cfg(all(feature = "cuda", feature = "vad"))]
+    use crate::models::SileroVersion;
     #[cfg(feature = "cuda")]
     use crate::preprocessing::PreprocessedTranscriptionError;
     use crate::preprocessing::{AudioWindowMut, TranscriptionControl};
@@ -1338,24 +1336,35 @@ mod tests {
         assert!(panicked, "the batched run should raise the worker's panic");
     }
 
-    /// Speech probabilities of the reference recording, from the native VAD and
-    /// from Silero itself
+    /// Speech probabilities of the reference recording under `model`, from the
+    /// native VAD and from Silero itself; fusion takes each window's higher Silero
+    /// probability
     #[cfg(all(feature = "cuda", feature = "vad"))]
-    fn reference_probabilities() -> (Vec<f32>, Vec<f32>, usize) {
-        let reference = NemoReference::silero();
-        let audio = reference.f32("audio");
+    fn reference_probabilities(model: VadModel) -> (Vec<f32>, Vec<f32>, usize) {
+        let silero = |version| -> Vec<f32> {
+            NemoReference::silero(version)
+                .f32("probs")
+                .into_iter()
+                .collect()
+        };
+        let expected = match model {
+            VadModel::SileroV5 => silero(SileroVersion::V5),
+            VadModel::SileroV6 => silero(SileroVersion::V6),
+            VadModel::SileroFusion => silero(SileroVersion::V5)
+                .into_iter()
+                .zip(silero(SileroVersion::V6))
+                .map(|(v5, v6)| v5.max(v6))
+                .collect(),
+        };
+
+        let audio = NemoReference::silero(SileroVersion::V6).f32("audio");
         let audio = audio.as_slice().expect("contiguous audio");
         let vad = SileroVad::from_bundle(&nemo_parity_bundle(ParakeetDeployment::v3()))
-            .expect("native VAD should load")
-            .expect("the native bundle should have a VAD model");
+            .expect("native VAD should load");
         let ours = vad
-            .process(audio, &TranscriptionControl::internal_unbounded())
+            .process(audio, model, &TranscriptionControl::internal_unbounded())
             .expect("VAD scan");
-        (
-            ours,
-            reference.f32("probs").into_iter().collect(),
-            audio.len(),
-        )
+        (ours, expected, audio.len())
     }
 
     /// Regions and planned ASR windows `(start, end)` for one set of probabilities
@@ -1374,22 +1383,38 @@ mod tests {
         (regions, windows)
     }
 
-    /// The native VAD's probabilities plan the same speech regions and ASR windows
-    /// as Silero's own on the reference recording, with the native defaults and with
-    /// 3 s windows that make the planner split the region on its probabilities
+    /// For each VAD model, the native VAD's probabilities plan the same speech
+    /// regions and ASR windows as Silero's own on the reference recording, with the
+    /// model's defaults and with 3 s windows that make the planner split the region
+    /// on its probabilities
     #[cfg(all(feature = "cuda", feature = "vad"))]
     #[test]
     #[ignore = "reads Silero references from /shared/datasets/parakeet-ref"]
     fn nemo_parity_native_vad_plans_the_reference_windows() {
-        let (ours, expected, audio_len) = reference_probabilities();
-        let defaults = LongFormConfig::for_bundle(&nemo_parity_bundle(ParakeetDeployment::v3()));
-        let mut short_windows = defaults.clone();
-        short_windows.overlap.max_model_samples = 48_000;
+        for model in [
+            VadModel::SileroV5,
+            VadModel::SileroV6,
+            VadModel::SileroFusion,
+        ] {
+            let (ours, expected, audio_len) = reference_probabilities(model);
+            let mut defaults =
+                LongFormConfig::for_bundle(&nemo_parity_bundle(ParakeetDeployment::v3()));
+            defaults.segmentation = VadSegmentationConfig::for_model(model);
+            let mut short_windows = defaults.clone();
+            short_windows.overlap.max_model_samples = 48_000;
 
-        for config in [defaults, short_windows] {
-            let plan = speech_plan(&ours, audio_len, &config);
-            assert!(!plan.0.is_empty(), "the reference recording is speech");
-            assert_eq!(plan, speech_plan(&expected, audio_len, &config));
+            for config in [defaults, short_windows] {
+                let plan = speech_plan(&ours, audio_len, &config);
+                assert!(
+                    !plan.0.is_empty(),
+                    "{model:?}: the reference recording is speech"
+                );
+                assert_eq!(
+                    plan,
+                    speech_plan(&expected, audio_len, &config),
+                    "{model:?}"
+                );
+            }
         }
     }
 
@@ -1397,7 +1422,7 @@ mod tests {
     /// single-input limit, with gaps the VAD must leave out
     #[cfg(all(feature = "cuda", feature = "vad"))]
     fn sparse_speech() -> (Vec<f32>, Vec<usize>) {
-        let speech = NemoReference::silero().f32("audio");
+        let speech = NemoReference::silero(SileroVersion::V6).f32("audio");
         let speech = speech.as_slice().expect("contiguous audio");
         let gap = vec![0.0; 20 * SAMPLE_RATE];
         let audio = [speech, &gap, speech, &gap, speech].concat();
@@ -1425,12 +1450,13 @@ mod tests {
         audio: &[f32],
         config: &LongFormConfig,
     ) -> Vec<(usize, usize, usize)> {
-        let vad = pipeline
+        let probabilities = pipeline
             .vad
-            .as_ref()
-            .expect("the native bundle has a VAD model");
-        let probabilities = vad
-            .process(audio, &TranscriptionControl::internal_unbounded())
+            .process(
+                audio,
+                config.segmentation.model,
+                &TranscriptionControl::internal_unbounded(),
+            )
             .expect("VAD scan");
         let (_, windows) = speech_plan(&probabilities, audio.len(), config);
         windows

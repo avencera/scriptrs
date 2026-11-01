@@ -24,8 +24,9 @@
 //! `--tf32` or `--fp32` runs the encoder GEMMs in that precision instead of FP16,
 //! as do `--fp8`, `--int8` and `--nvfp4` with the `low-precision` feature,
 //! and `--vad` (with the `vad` feature) plans long recordings from Silero speech
-//! regions instead of overlap windows over the whole recording, at
-//! `--vad-threshold <p>` and with `--vad-padding <seconds>` around each region if
+//! regions instead of overlap windows over the whole recording, scored by
+//! `--vad-model v5|v6|fusion` (fusion by default) at the model's threshold or
+//! `--vad-threshold <p>`, and with `--vad-padding <seconds>` around each region if
 //! given
 //!
 //! ```sh
@@ -65,7 +66,11 @@ struct Args {
     language: LanguageSelection,
     precision: Precision,
     vad: bool,
+    #[cfg(feature = "vad")]
+    vad_model: Option<String>,
+    #[cfg(feature = "vad")]
     vad_threshold: Option<f32>,
+    #[cfg(feature = "vad")]
     vad_padding: Option<f64>,
     scheduler: bool,
 }
@@ -114,14 +119,16 @@ fn run() -> Result<()> {
 
     let mut sorted = walls.clone();
     sorted.sort_by(f64::total_cmp);
-    let summary = json!({
+    #[cfg_attr(
+        not(feature = "vad"),
+        expect(unused_mut, reason = "only VAD runs add fields")
+    )]
+    let mut summary = json!({
         "backend": format!("scriptrs-cuda-{}", precision_name(args.precision)),
         "version": version,
         "bs": batch,
         "long": !args.long.is_empty(),
         "vad": args.vad,
-        "vad_threshold": args.vad_threshold,
-        "vad_padding": args.vad_padding,
         "scheduler": args.scheduler,
         "n_utts": texts.len(),
         "audio_s": audio_s,
@@ -129,6 +136,14 @@ fn run() -> Result<()> {
         "rtfx_best": audio_s / sorted[0],
         "rtfx_median": audio_s / median(&sorted),
     });
+    // the settings the run used rather than the flags, so a run on the defaults
+    // still records which model and threshold scored it
+    #[cfg(feature = "vad")]
+    if let Some(segmentation) = vad_segmentation(&args)? {
+        summary["vad_model"] = json!(format!("{:?}", segmentation.model));
+        summary["vad_threshold"] = json!(segmentation.threshold);
+        summary["vad_padding"] = json!(segmentation.speech_padding);
+    }
     if let Some(parent) = args.out.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -217,6 +232,31 @@ fn bench_manifest(
     ))
 }
 
+/// Segmentation of a `--vad` run: the `--vad-model` defaults, then the overrides
+#[cfg(feature = "vad")]
+fn vad_segmentation(args: &Args) -> Result<Option<scriptrs::VadSegmentationConfig>> {
+    if !args.vad {
+        return Ok(None);
+    }
+
+    let mut segmentation = match args.vad_model.as_deref() {
+        None => scriptrs::VadSegmentationConfig::default(),
+        Some(model) => scriptrs::VadSegmentationConfig::for_model(match model {
+            "v5" => scriptrs::VadModel::SileroV5,
+            "v6" => scriptrs::VadModel::SileroV6,
+            "fusion" => scriptrs::VadModel::SileroFusion,
+            other => bail!("unknown VAD model {other}; expected v5, v6 or fusion"),
+        }),
+    };
+    if let Some(threshold) = args.vad_threshold {
+        segmentation.threshold = threshold;
+    }
+    if let Some(padding) = args.vad_padding {
+        segmentation.speech_padding = padding;
+    }
+    Ok(Some(segmentation))
+}
+
 fn bench_long(bundle: ModelBundle, paths: &[PathBuf], args: &Args) -> Result<Bench> {
     let mut config = LongFormConfig::for_bundle(&bundle);
     config.transcription.language = args.language;
@@ -234,14 +274,9 @@ fn bench_long(bundle: ModelBundle, paths: &[PathBuf], args: &Args) -> Result<Ben
         config.overlap.overlap_seconds = overlap_s;
     }
     #[cfg(feature = "vad")]
-    if args.vad {
+    if let Some(segmentation) = vad_segmentation(args)? {
         config.mode = scriptrs::LongFormMode::Vad;
-        if let Some(threshold) = args.vad_threshold {
-            config.segmentation.threshold = threshold;
-        }
-        if let Some(padding) = args.vad_padding {
-            config.segmentation.speech_padding = padding;
-        }
+        config.segmentation = segmentation;
     }
     let pipeline = LongFormTranscriptionPipeline::from_bundle(bundle)?;
     let recordings = long_recordings(paths)?;
@@ -326,7 +361,11 @@ fn parse_args() -> Result<Args> {
     let mut language = LanguageSelection::Auto;
     let mut precision = Precision::default();
     let mut vad = false;
+    #[cfg(feature = "vad")]
+    let mut vad_model = None;
+    #[cfg(feature = "vad")]
     let mut vad_threshold = None;
+    #[cfg(feature = "vad")]
     let mut vad_padding = None;
     let mut scheduler = false;
     let mut args = env::args().skip(1);
@@ -364,7 +403,11 @@ fn parse_args() -> Result<Args> {
             "--nvfp4" => precision = Precision::Nvfp4,
             "--vad" if cfg!(feature = "vad") => vad = true,
             "--vad" => return Err(eyre!("--vad needs the `vad` feature")),
+            #[cfg(feature = "vad")]
+            "--vad-model" => vad_model = Some(value()?),
+            #[cfg(feature = "vad")]
             "--vad-threshold" => vad_threshold = Some(value()?.parse()?),
+            #[cfg(feature = "vad")]
             "--vad-padding" => vad_padding = Some(value()?.parse()?),
             "--scheduler" => scheduler = true,
             other => return Err(eyre!("unknown argument {other}")),
@@ -374,11 +417,16 @@ fn parse_args() -> Result<Args> {
     if vad && long.is_empty() {
         return Err(eyre!("--vad only applies to --long recordings"));
     }
-    if vad_threshold.is_some() && !vad {
-        return Err(eyre!("--vad-threshold needs --vad"));
-    }
-    if vad_padding.is_some() && !vad {
-        return Err(eyre!("--vad-padding needs --vad"));
+    #[cfg(feature = "vad")]
+    if !vad {
+        let flags = [
+            ("--vad-model", vad_model.is_some()),
+            ("--vad-threshold", vad_threshold.is_some()),
+            ("--vad-padding", vad_padding.is_some()),
+        ];
+        if let Some((flag, _)) = flags.into_iter().find(|(_, given)| *given) {
+            return Err(eyre!("{flag} needs --vad"));
+        }
     }
 
     Ok(Args {
@@ -394,7 +442,11 @@ fn parse_args() -> Result<Args> {
         language,
         precision,
         vad,
+        #[cfg(feature = "vad")]
+        vad_model,
+        #[cfg(feature = "vad")]
         vad_threshold,
+        #[cfg(feature = "vad")]
         vad_padding,
         scheduler,
     })

@@ -83,8 +83,15 @@ scriptrs = { version = "0.5", features = ["vad"] }
   `TranscriptionError::Control(TranscriptionControlError::Cancelled)` instead of
   `TranscriptionError::Cancelled`, and likewise for the other two.
 - `VadConfig` is gone. The speech threshold is now
-  `VadSegmentationConfig::threshold`, still 0.5 by default: set
-  `config.segmentation.threshold` instead of `config.vad.default_threshold`.
+  `VadSegmentationConfig::threshold`: set `config.segmentation.threshold`
+  instead of `config.vad.default_threshold`.
+- VAD mode defaults to Silero fusion (`VadModel::SileroFusion`): it scores each
+  window with both Silero VAD v5 and v6 and keeps the higher probability, at a 0.6 threshold, in place of v5 alone at 0.5. Set
+  `config.segmentation = VadSegmentationConfig::for_model(VadModel::SileroV5)`
+  to keep v5-only planning. `VadSegmentationConfig` has a new `model` field, so
+  struct literals that list every field need it. VAD bundles need both models
+  (see [Local model layout](#local-model-layout)), and
+  `ModelBundle::validate_long_form` checks for both.
 - `Vocabulary` loads only through a deployment, with
   `Vocabulary::load(path, &deployment)` or
   `Vocabulary::from_bytes(bytes, &deployment)`. `load` takes the deployment in
@@ -132,15 +139,16 @@ With the default `online` feature, `scriptrs` can resolve models automatically:
 - native CUDA weights come from
   [`avencera/parakeet-tdt-0.6b-v2-cuda`](https://huggingface.co/avencera/parakeet-tdt-0.6b-v2-cuda)
   and [`avencera/parakeet-tdt-0.6b-v3-cuda`](https://huggingface.co/avencera/parakeet-tdt-0.6b-v3-cuda),
-  and the native Silero VAD from
+  and the native Silero VAD models from
   [`avencera/silero-vad-v5-safetensors`](https://huggingface.co/avencera/silero-vad-v5-safetensors)
+  and [`avencera/silero-vad-v6-safetensors`](https://huggingface.co/avencera/silero-vad-v6-safetensors)
 
 You can force a local bundle when needed:
 
 - `SCRIPTRS_MODELS_DIR=/path/to/models` forces a local bundle
 
 Each download uses an immutable snapshot pinned in the release, such as
-`63f6f9cbce43e5561c219229896f86f20c0eb660` of `avencera/scriptrs-models`.
+`54f3f976b63bf5d5fe9927363d259cffa1c23a89` of `avencera/scriptrs-models`.
 
 ## Local model layout
 
@@ -162,12 +170,13 @@ models/
 
 Use `ParakeetDeployment::v2()` or `ParakeetDeployment::v3()` to select a layout. v2 remains the default for `from_dir` and `from_pretrained`.
 
-With `vad`, add:
+With `vad`, add both Silero VAD models:
 
 ```text
 models/
   vad/
-    silero-vad.mlmodelc/
+    silero-vad.mlmodelc/       # Silero VAD 5.1.2
+    silero-vad-v6.mlmodelc/    # Silero VAD 6.2.3
 ```
 
 
@@ -193,7 +202,8 @@ let result = pipeline.run(&audio)?;
 
 With `vad`, `from_pretrained_native_long_form` also downloads the Silero VAD
 weights from
-[`avencera/silero-vad-v5-safetensors`](https://huggingface.co/avencera/silero-vad-v5-safetensors).
+[`avencera/silero-vad-v5-safetensors`](https://huggingface.co/avencera/silero-vad-v5-safetensors)
+and [`avencera/silero-vad-v6-safetensors`](https://huggingface.co/avencera/silero-vad-v6-safetensors).
 To manage the files yourself, `dev-tools/nemo/export_native.py` writes
 them from the NeMo checkpoints in this layout, and `from_native_dir` loads them:
 
@@ -207,6 +217,7 @@ models/
     parakeet_vocab.json
   vad/
     silero-vad-v5.safetensors    # with `vad`
+    silero-vad-v6.safetensors    # with `vad`
 ```
 
 ```rust,ignore
@@ -279,27 +290,48 @@ normalizer. Speed is x real time for transcription alone on one RTX 5090, with
 models loaded and audio in memory; WhisperX runs its VAD with batch size 16. The
 last row's speed is over all 114 hours.
 
-With `vad`, Silero VAD v5 runs on the CPU, at about 0.3 s per hour of audio. On a
-GPU each step of its recurrence costs more in launches than the whole step costs on
-the CPU. VAD planning helps when most of a recording is not speech, and costs
-accuracy and speed on dense or far-field speech:
+With `vad`, Silero VAD runs on the CPU, at about 0.5 s per hour of audio. On a GPU
+each step of its recurrence costs more in launches than the whole step costs on the
+CPU. VAD planning wins when most of a recording is not speech, and helps a little
+on close-talk speech, but costs accuracy on far-field speech and speed on
+recordings that are mostly speech:
 
 | Set | Overlap WER | VAD WER | Overlap speed | VAD speed |
 |---|---:|---:|---:|---:|
 | Sparse speech, 24 % speech (4.2 h) | 14.8 % | **2.3 %** | 3430x | **3990x** |
-| Earnings-21 earnings calls | **8.2 %** | 8.4 % | **3630x** | 2030x |
-| AMI meetings, headset mix | 21.5 % | **21.1 %** | **3480x** | 1800x |
-| AMI meetings, far-field microphone | **23.2 %** | 26.0 % | **3480x** | 1790x |
-| CHiME-6 dinner parties | **44.0 %** | 54.0 % | **3490x** | 1970x |
+| Earnings-21 earnings calls | 8.2 % | **8.0 %** | **3630x** | 2030x |
+| AMI meetings, headset mix | 21.5 % | **20.8 %** | **3480x** | 1800x |
+| AMI meetings, far-field microphone | **23.2 %** | 25.3 % | **3480x** | 1790x |
+| CHiME-6 dinner parties | **44.0 %** | 53.4 % | **3490x** | 1970x |
 
 The sparse set is LibriSpeech test-clean utterances separated by 15 to 75 s of
-film music, effects, ambience and low-level noise. VAD runs use the default 0.5
-speech threshold and pad each speech region by 0.2 s on both sides, including both
-sides of a split inside a region longer than the model window. Silero is slow to
-react to a soft first word, such as the "a" in "a cold", and 0.1 s of padding cut
-it off. 0.2 s lowered WER on every set; larger padding cost AMI headset accuracy.
-The speed columns were measured with 0.1 s padding; in the padding sweep, 0.2 s
-was no slower.
+film music, effects, ambience and low-level noise. The speed columns were measured
+with Silero VAD v5 alone and 0.1 s padding; in the padding sweep, 0.2 s was no
+slower.
+
+The default, Silero fusion, takes each window's speech probability as the higher
+of Silero VAD v5's and v6's, and windows at 0.6 or above count as speech. Either
+model alone misses speech the other finds: v6 separates speech from non-speech
+better on most audio but misses more of the sparse set's speech at its threshold,
+and v5 holds up better on noisy dinner-party audio. Taking the higher probability
+scores at or below v5 alone on every set, and the 0.6 threshold keeps the sparse
+set at v5's error rate (it rises to 2.8 % at 0.5). Running both models adds about
+6 % to the scan's CPU time. VAD WER by model, each alone at its default 0.5
+threshold:
+
+| Set | v5 | v6 | Silero fusion (default) |
+|---|---:|---:|---:|
+| Sparse speech | **2.3 %** | 3.0 % | **2.3 %** |
+| Earnings-21 earnings calls | 8.4 % | **8.0 %** | **8.0 %** |
+| AMI meetings, headset mix | 21.1 % | **20.7 %** | 20.8 % |
+| AMI meetings, far-field microphone | 26.0 % | 25.6 % | **25.3 %** |
+| CHiME-6 dinner parties | 54.0 % | 61.9 % | **53.4 %** |
+
+Each speech region is padded by 0.2 s on both sides, including both sides of a
+split inside a region longer than the model window. Silero is slow to react to a
+soft first word, such as the "a" in "a cold", and 0.1 s of padding cut it off. In
+a padding sweep with v5, 0.2 s lowered WER on every set; larger padding cost AMI
+headset accuracy.
 
 By default the encoder layers' linear weights are stored in FP16, which has TF32's
 10-bit mantissa, and their matrix multiplies run on FP16 tensor cores with FP32
@@ -436,7 +468,7 @@ fn load_mono_16khz_audio() -> Vec<f32> {
 }
 ```
 
-Enable `vad` when you want VAD-backed speech region planning for sparse speech, long silences, or recordings with a lot of non-speech audio. Windows with a speech probability of at least `config.segmentation.threshold` (0.5 by default) count as speech:
+Enable `vad` when you want VAD-backed speech region planning for sparse speech, long silences, or recordings with a lot of non-speech audio. Windows with a speech probability of at least `config.segmentation.threshold` count as speech. By default that is Silero fusion, the higher of Silero VAD v5's and v6's probabilities, with a 0.6 threshold:
 
 ```rust
 use scriptrs::{LongFormConfig, LongFormMode, LongFormTranscriptionPipeline};
@@ -457,6 +489,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn load_mono_16khz_audio() -> Vec<f32> {
     Vec::new()
 }
+```
+
+`VadSegmentationConfig::for_model` runs one model instead, with that model's default threshold, 0.5 for either alone:
+
+```rust,ignore
+use scriptrs::{VadModel, VadSegmentationConfig};
+
+config.segmentation = VadSegmentationConfig::for_model(VadModel::SileroV5);
 ```
 
 ### Streaming (CUDA)
@@ -692,7 +732,7 @@ The example expects mono 16kHz WAV input.
 - The public API is still moving
 - `scriptrs` currently targets the exact file layout and model I/O shipped in `avencera/scriptrs-models`; if you swap in a different CoreML Parakeet export, you may need runtime code changes
 - Use `long-form` for the fastest path on clean, dense speech
-- Add `vad` when you need better robustness on sparse-speech or non-speech-heavy recordings; on dense or far-field speech it costs accuracy
+- Add `vad` when you need better robustness on sparse-speech or non-speech-heavy recordings; on far-field speech it costs accuracy, and on dense speech speed
 
 ## License
 
