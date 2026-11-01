@@ -678,11 +678,18 @@ mod tests {
     use crate::deployment::{ParakeetDeployment, ParakeetVersion};
     use crate::error::TranscriptionError;
     use std::fs;
-    use std::path::PathBuf;
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
 
-    fn fixture_models() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/models")
+    // layout checks only look for paths, so empty stand-ins replace the downloaded models
+    fn v2_layout() -> TempDir {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let root = temp_dir.path();
+        let layout = ParakeetDeployment::v2().layout();
+        for dir in [layout.encoder(), layout.decoder(), layout.joint_decision()] {
+            fs::create_dir_all(root.join(dir)).expect("v2 model dir should be created");
+        }
+        fs::write(root.join(layout.vocab()), []).expect("v2 vocab should be created");
+        temp_dir
     }
 
     fn coreml_layout(bundle: &ModelBundle) -> &CoreMlLayout {
@@ -694,11 +701,10 @@ mod tests {
     }
 
     #[test]
-    fn v2_bundle_resolves_existing_fixture_paths() {
-        let bundle = ModelBundle::from_dir(fixture_models());
-        bundle
-            .validate_base()
-            .expect("v2 fixture layout should validate");
+    fn v2_bundle_resolves_layout_paths() {
+        let models = v2_layout();
+        let bundle = ModelBundle::from_dir(models.path());
+        bundle.validate_base().expect("v2 layout should validate");
         assert_eq!(bundle.deployment().version(), ParakeetVersion::V2);
         assert!(
             coreml_layout(&bundle)
@@ -710,11 +716,11 @@ mod tests {
 
     #[test]
     fn v3_deployment_rejects_a_v2_layout() {
-        let bundle =
-            ModelBundle::from_dir_with_deployment(fixture_models(), ParakeetDeployment::v3());
+        let models = v2_layout();
+        let bundle = ModelBundle::from_dir_with_deployment(models.path(), ParakeetDeployment::v3());
         let error = bundle
             .validate_base()
-            .expect_err("v3 must reject the v2 fixture layout");
+            .expect_err("v3 must reject a v2 layout");
         match error {
             TranscriptionError::LayoutMismatch { expected, found } => {
                 assert_eq!(expected, ParakeetVersion::V3);

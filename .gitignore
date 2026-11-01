@@ -4,3 +4,4 @@
 /.venv
 /**/__pycache__
 /crates/*/target
+/t3-*/
