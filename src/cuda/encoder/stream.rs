@@ -17,9 +17,10 @@
 use cudakit::cudarc::driver::{CudaSlice, CudaView};
 
 use super::{
-    Activations, Attention, ConvModule, CudaEncoder, NORM_EPS, causal_subsampled, gemm_input,
-    gemm_output, linear, merged_in, normed_in, position_rows,
+    ActivationLens, Activations, Attention, ConvModule, CudaEncoder, NORM_EPS, causal_subsampled,
+    gemm_input, gemm_output, linear, merged_in, normed_in, position_rows,
 };
+use crate::cuda::arena::Arena;
 use crate::cuda::kernels::{CudaRuntime, FeatureMap, StreamGeometry, StreamRows};
 use crate::cuda::{Direction, HostStaging, zeros};
 use crate::error::TranscriptionError;
@@ -102,6 +103,9 @@ pub(crate) struct StreamWorkspace {
     /// Every layer's projected relative positions for the chunk's window,
     /// `[layers, context + 2 * frames - 1, d_model]`
     pos: CudaSlice<f32>,
+    /// The memory `act` aliases, which no other workspace shares; declared after
+    /// `act` so it drops last
+    _arena: Arena,
 }
 
 impl StreamWorkspace {
@@ -246,6 +250,14 @@ impl CudaEncoder {
             )?;
         }
 
+        let act = ActivationLens::new(spec, self.math, rows);
+        let mut arena = Arena::new();
+        // SAFETY: the arena is new, so nothing aliases it yet
+        unsafe { arena.reallocate(stream, act.bytes()) }?;
+        // SAFETY: the arena backs this workspace's activations alone and drops after
+        // them
+        let act = Activations::carve(&mut unsafe { arena.carve() }, act)?;
+
         Ok(StreamWorkspace {
             geometry,
             mel: zeros(stream, maps[0].len())?,
@@ -255,8 +267,9 @@ impl CudaEncoder {
             host_valid: vec![0; batch],
             maps: [zeros(stream, maps[1].len())?, zeros(stream, maps[2].len())?],
             flat: zeros(stream, rows * spec.subsampling_channels * maps[3].features)?,
-            act: Activations::new(runtime, spec, self.math, rows)?,
+            act,
             pos,
+            _arena: arena,
         })
     }
 
@@ -528,7 +541,7 @@ impl CudaEncoder {
             gemm_output(
                 self.math,
                 &mut act.merged,
-                act.fp16.as_mut().map(|fp16| &mut fp16.merged),
+                act.fp16.as_mut().map(|fp16| &mut *fp16.merged),
             )?,
             geometry,
             index,
@@ -596,7 +609,7 @@ impl CudaEncoder {
             gemm_output(
                 self.math,
                 &mut act.merged,
-                act.fp16.as_mut().map(|fp16| &mut fp16.merged),
+                act.fp16.as_mut().map(|fp16| &mut *fp16.merged),
             )?,
             geometry,
             self.spec.conv_kernel,

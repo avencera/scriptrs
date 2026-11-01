@@ -2,9 +2,10 @@
 //!
 //! The forward pass follows NeMo's `ConformerEncoder` operation by operation in FP32,
 //! so each stage can be held against the reference activations. Everything a pass
-//! touches lives in an [`EncoderWorkspace`] allocated once per input shape, which
-//! keeps [`CudaEncoder::enqueue`] free of allocations and host syncs and therefore
-//! capturable in a CUDA graph.
+//! touches lives in an [`EncoderWorkspace`] built once per input shape, which keeps
+//! [`CudaEncoder::enqueue`] free of allocations and host syncs and therefore
+//! capturable in a CUDA graph. The workspace owns only what lasts between calls; its
+//! activations alias an [`Arena`] that every shape shares.
 //!
 //! [`EncoderMath::Fp16`] stores the Conformer layers' linear weights in FP16 and has
 //! the kernels before each of those GEMMs write an FP16 copy of their output, so the
@@ -26,6 +27,7 @@
 use cudakit::cudarc::driver::{CudaSlice, CudaView, DevicePtrMut};
 use cudakit::{DeviceTensor, Math, Sgemm, SgemmBatched};
 
+use crate::cuda::arena::{Alias, Arena, Carve, alias_bytes};
 use crate::cuda::fp16::{linear_fp16, linear_fp16_to_fp16};
 use crate::cuda::kernels::{
     ATTENTION_HEAD_DIM, AttentionKernels, CudaRuntime, EncoderKernels, FeatureMap, GemmOperand,
@@ -230,14 +232,19 @@ impl FusedShapes {
     }
 }
 
-/// Device buffers for one `(batch, mel frames)` input shape
+/// Buffers for one `(batch, mel frames)` input shape
+///
+/// The [`Alias`] buffers are the shape's view of the shared arena: each call writes
+/// them before reading them, and their contents are gone once another shape runs.
+/// The owned ones keep the shape's position tables, which are written once, and the
+/// per-call lengths and input staging, which are small
 pub(crate) struct EncoderWorkspace {
     batch: usize,
     mel_frames: usize,
     /// Encoder frames after 8x subsampling
     frames: usize,
     /// `[batch, mel_frames, features]`
-    mel: CudaSlice<f32>,
+    mel: Alias<f32>,
     /// Pinned host copy of `mel` that [`CudaEncoder::set_input`] fills
     mel_host: HostStaging<f32>,
     /// Valid frames per batch row before and after each subsampling stage
@@ -245,8 +252,8 @@ pub(crate) struct EncoderWorkspace {
     host_lens: Vec<usize>,
     /// Subsampling feature maps, ping-ponged: `[0]` fits the first stage, `[1]` the
     /// second
-    maps: [CudaSlice<f32>; 2],
-    flat: CudaSlice<f32>,
+    maps: [Alias<f32>; 2],
+    flat: Alias<f32>,
     act: Activations,
     /// `[2 * frames - 1, d_model]` relative position table
     pos_emb: CudaSlice<f32>,
@@ -265,52 +272,100 @@ enum AttentionBuffers {
     FusedFp16 {
         /// `[batch * frames, 3 * d_model]` QKV projection in FP16, which the kernel
         /// reads in place of the FP32 one the streaming encoder shares
-        qkv: CudaSlice<u16>,
+        qkv: Alias<u16>,
         /// `[2 * frames - 1, d_model]` projected position table
-        pos: CudaSlice<u16>,
+        pos: Alias<u16>,
     },
     /// The TF32 kernel's `[2 * frames - 1, d_model]` projected position table
-    FusedTf32 { pos: CudaSlice<f32> },
+    FusedTf32 { pos: Alias<f32> },
 }
 
 struct UnfusedAttention {
     /// `[batch, heads, frames, head_dim]`, `q_v` `[heads, batch, frames, head_dim]`
-    q_u: CudaSlice<f32>,
-    q_v: CudaSlice<f32>,
-    k: CudaSlice<f32>,
-    v: CudaSlice<f32>,
+    q_u: Alias<f32>,
+    q_v: Alias<f32>,
+    k: Alias<f32>,
+    v: Alias<f32>,
     /// `[2 * frames - 1, d_model]` projected position table, and `[heads, 2 * frames -
     /// 1, head_dim]`
-    pos: CudaSlice<f32>,
-    pos_heads: CudaSlice<f32>,
+    pos: Alias<f32>,
+    pos_heads: Alias<f32>,
     /// `[batch, heads, frames, frames]` content scores, then weights
-    scores: CudaSlice<f32>,
+    scores: Alias<f32>,
     /// `[heads, batch, frames, 2 * frames - 1]` position scores
-    bd: CudaSlice<f32>,
+    bd: Alias<f32>,
     /// `[batch, heads, frames, head_dim]`
-    context: CudaSlice<f32>,
+    context: Alias<f32>,
+}
+
+/// Lengths, in values, of the attention buffers a shape carves for its path
+#[derive(Clone, Copy)]
+enum AttentionLens {
+    Unfused {
+        /// `q_u`, `q_v`, `k`, `v` and `context` each
+        rows_by_d: usize,
+        /// `pos` and `pos_heads` each
+        positions_by_d: usize,
+        scores: usize,
+        bd: usize,
+    },
+    FusedFp16 {
+        qkv: usize,
+        pos: usize,
+    },
+    FusedTf32 {
+        pos: usize,
+    },
+}
+
+impl AttentionLens {
+    /// Arena bytes the buffers take; [`AttentionBuffers::carve`] takes the same set
+    fn bytes(self) -> usize {
+        match self {
+            Self::Unfused {
+                rows_by_d,
+                positions_by_d,
+                scores,
+                bd,
+            } => {
+                5 * alias_bytes::<f32>(rows_by_d)
+                    + 2 * alias_bytes::<f32>(positions_by_d)
+                    + alias_bytes::<f32>(scores)
+                    + alias_bytes::<f32>(bd)
+            }
+            Self::FusedFp16 { qkv, pos } => alias_bytes::<u16>(qkv) + alias_bytes::<u16>(pos),
+            Self::FusedTf32 { pos } => alias_bytes::<f32>(pos),
+        }
+    }
 }
 
 impl AttentionBuffers {
-    fn bytes(&self) -> usize {
-        match self {
-            Self::Unfused(buffers) => [
-                &buffers.q_u,
-                &buffers.q_v,
-                &buffers.k,
-                &buffers.v,
-                &buffers.pos,
-                &buffers.pos_heads,
-                &buffers.scores,
-                &buffers.bd,
-                &buffers.context,
-            ]
-            .iter()
-            .map(|buffer| buffer.num_bytes())
-            .sum(),
-            Self::FusedFp16 { qkv, pos } => qkv.num_bytes() + pos.num_bytes(),
-            Self::FusedTf32 { pos } => pos.num_bytes(),
-        }
+    fn carve(carve: &mut Carve<'_>, lens: AttentionLens) -> Result<Self, TranscriptionError> {
+        Ok(match lens {
+            AttentionLens::Unfused {
+                rows_by_d,
+                positions_by_d,
+                scores,
+                bd,
+            } => Self::Unfused(Box::new(UnfusedAttention {
+                q_u: carve.take(rows_by_d)?,
+                q_v: carve.take(rows_by_d)?,
+                k: carve.take(rows_by_d)?,
+                v: carve.take(rows_by_d)?,
+                pos: carve.take(positions_by_d)?,
+                pos_heads: carve.take(positions_by_d)?,
+                scores: carve.take(scores)?,
+                bd: carve.take(bd)?,
+                context: carve.take(rows_by_d)?,
+            })),
+            AttentionLens::FusedFp16 { qkv, pos } => Self::FusedFp16 {
+                qkv: carve.take(qkv)?,
+                pos: carve.take(pos)?,
+            },
+            AttentionLens::FusedTf32 { pos } => Self::FusedTf32 {
+                pos: carve.take(pos)?,
+            },
+        })
     }
 }
 
@@ -319,14 +374,14 @@ impl AttentionBuffers {
 struct Activations {
     rows: usize,
     /// The residual stream, `[rows, d_model]`
-    x: CudaSlice<f32>,
-    normed: CudaSlice<f32>,
+    x: Alias<f32>,
+    normed: Alias<f32>,
     /// `[rows, max(ff_hidden, 2 * d_model)]`: the feed-forward hidden layer or the
     /// conv module's first pointwise output
-    hidden: CudaSlice<f32>,
-    qkv: CudaSlice<f32>,
+    hidden: Alias<f32>,
+    qkv: Alias<f32>,
     /// `[rows, d_model]` attention context or conv module output
-    merged: CudaSlice<f32>,
+    merged: Alias<f32>,
     /// FP16 GEMM inputs under [`EncoderMath::Fp16`]
     fp16: Option<Fp16Inputs>,
     quant: QuantScratch,
@@ -353,55 +408,75 @@ impl QuantScratch {
 /// FP16 copies of the activations the FP16 linear layers read
 struct Fp16Inputs {
     /// `[rows, d_model]` LayerNorm output
-    normed: CudaSlice<u16>,
+    normed: Alias<u16>,
     /// `[rows, ff_hidden]` SiLU output
-    hidden: CudaSlice<u16>,
+    hidden: Alias<u16>,
     /// `[rows, d_model]` attention context or conv module output
-    merged: CudaSlice<u16>,
+    merged: Alias<u16>,
+}
+
+/// Lengths, in values, of the buffers [`Activations`] carves
+#[derive(Clone, Copy)]
+struct ActivationLens {
+    rows: usize,
+    /// `x`, `normed` and `merged` each
+    rows_by_d: usize,
+    hidden: usize,
+    qkv: usize,
+    /// `[normed, hidden, merged]` under [`EncoderMath::Fp16`]
+    fp16: Option<[usize; 3]>,
+}
+
+impl ActivationLens {
+    fn new(spec: EncoderSpec, math: EncoderMath, rows: usize) -> Self {
+        let d = spec.d_model;
+        // the quantized maths also read FP16 activations
+        Self {
+            rows,
+            rows_by_d: rows * d,
+            hidden: rows * spec.ff_hidden.max(2 * d),
+            qkv: rows * 3 * d,
+            fp16: math
+                .fp16()
+                .then_some([rows * d, rows * spec.ff_hidden, rows * d]),
+        }
+    }
+
+    /// Arena bytes the buffers take; [`Activations::carve`] takes the same set
+    fn bytes(self) -> usize {
+        let fp16: usize = self
+            .fp16
+            .iter()
+            .flatten()
+            .map(|len| alias_bytes::<u16>(*len))
+            .sum();
+        3 * alias_bytes::<f32>(self.rows_by_d)
+            + alias_bytes::<f32>(self.hidden)
+            + alias_bytes::<f32>(self.qkv)
+            + fp16
+    }
 }
 
 impl Activations {
-    fn new(
-        runtime: &CudaRuntime,
-        spec: EncoderSpec,
-        math: EncoderMath,
-        rows: usize,
-    ) -> Result<Self, TranscriptionError> {
-        let stream = runtime.stream();
-        let d = spec.d_model;
-        // the quantized maths also read FP16 activations
-        let fp16 = match math.fp16() {
-            false => None,
-            true => Some(Fp16Inputs {
-                normed: zeros(stream, rows * d)?,
-                hidden: zeros(stream, rows * spec.ff_hidden)?,
-                merged: zeros(stream, rows * d)?,
+    fn carve(carve: &mut Carve<'_>, lens: ActivationLens) -> Result<Self, TranscriptionError> {
+        let fp16 = match lens.fp16 {
+            None => None,
+            Some([normed, hidden, merged]) => Some(Fp16Inputs {
+                normed: carve.take(normed)?,
+                hidden: carve.take(hidden)?,
+                merged: carve.take(merged)?,
             }),
         };
         Ok(Self {
-            rows,
-            x: zeros(stream, rows * d)?,
-            normed: zeros(stream, rows * d)?,
-            hidden: zeros(stream, rows * spec.ff_hidden.max(2 * d))?,
-            qkv: zeros(stream, rows * 3 * d)?,
-            merged: zeros(stream, rows * d)?,
+            rows: lens.rows,
+            x: carve.take(lens.rows_by_d)?,
+            normed: carve.take(lens.rows_by_d)?,
+            hidden: carve.take(lens.hidden)?,
+            qkv: carve.take(lens.qkv)?,
+            merged: carve.take(lens.rows_by_d)?,
             fp16,
             quant: QuantScratch::default(),
         })
-    }
-
-    fn bytes(&self) -> usize {
-        let single = [&self.x, &self.normed, &self.hidden, &self.qkv, &self.merged]
-            .iter()
-            .map(|buffer| buffer.num_bytes())
-            .sum::<usize>();
-        let fp16 = self.fp16.as_ref().map_or(0, |fp16| {
-            [&fp16.normed, &fp16.hidden, &fp16.merged]
-                .iter()
-                .map(|buffer| buffer.num_bytes())
-                .sum()
-        });
-        single + fp16 + self.quant.bytes()
     }
 
     /// Where a kernel writes `merged` for the next linear layer
@@ -409,7 +484,7 @@ impl Activations {
         gemm_output(
             math,
             &mut self.merged,
-            self.fp16.as_mut().map(|fp16| &mut fp16.merged),
+            self.fp16.as_mut().map(|fp16| &mut *fp16.merged),
         )
     }
 }
@@ -441,6 +516,27 @@ fn merged_in<'a>(
     )
 }
 
+/// Lengths, in values, of a shape's arena buffers
+struct ScratchLens {
+    mel: usize,
+    maps: [usize; 2],
+    flat: usize,
+    act: ActivationLens,
+    attention: AttentionLens,
+}
+
+impl ScratchLens {
+    /// Arena bytes the buffers take; [`CudaEncoder::workspace`] carves the same set
+    fn bytes(&self) -> usize {
+        [self.mel, self.maps[0], self.maps[1], self.flat]
+            .iter()
+            .map(|len| alias_bytes::<f32>(*len))
+            .sum::<usize>()
+            + self.act.bytes()
+            + self.attention.bytes()
+    }
+}
+
 impl EncoderWorkspace {
     /// Mel frames per batch row of the input
     pub(crate) fn mel_frames(&self) -> usize {
@@ -461,24 +557,15 @@ impl EncoderWorkspace {
         &self.act.x
     }
 
-    /// Device bytes held by the workspace's buffers
+    /// Bytes the workspace holds outside the arena: its device buffers and its
+    /// pinned input staging, so a cache bounded by this also bounds page-locked host
+    /// memory
     pub(crate) fn bytes(&self) -> usize {
         let lens: usize = self.lens.iter().map(CudaSlice::num_bytes).sum();
-        let buffers = [
-            &self.mel,
-            &self.maps[0],
-            &self.maps[1],
-            &self.flat,
-            &self.pos_emb,
-        ];
         let pos_emb_f16 = self.pos_emb_f16.as_ref().map_or(0, CudaSlice::num_bytes);
-        lens + pos_emb_f16
-            + self.act.bytes()
-            + self.attention.bytes()
-            + buffers
-                .iter()
-                .map(|buffer| buffer.num_bytes())
-                .sum::<usize>()
+        // the staging holds as many values as the device input it fills
+        let staging = self.mel.num_bytes();
+        lens + pos_emb_f16 + self.pos_emb.num_bytes() + staging + self.act.quant.bytes()
     }
 }
 
@@ -658,11 +745,59 @@ impl CudaEncoder {
         })
     }
 
-    /// Allocates the buffers for `batch` inputs of up to `mel_frames` frames, and the
-    /// relative position table for that length
-    pub(crate) fn workspace(
+    /// Lengths of the arena buffers for `batch` inputs of up to `mel_frames` frames
+    fn scratch_lens(&self, batch: usize, mel_frames: usize) -> ScratchLens {
+        let spec = self.spec;
+        let (d, heads) = (spec.d_model, spec.heads);
+        let maps = self.feature_maps(batch, mel_frames);
+        let frames = maps[3].frames;
+        let rows = batch * frames;
+        let positions = 2 * frames - 1;
+        let fused = self
+            .fused
+            .as_ref()
+            .is_some_and(|fused| fused.shapes.takes(batch, frames));
+        let attention = match self.math {
+            EncoderMath::Fp16 if fused => AttentionLens::FusedFp16 {
+                qkv: rows * 3 * d,
+                pos: positions * d,
+            },
+            EncoderMath::Single(_) if fused => AttentionLens::FusedTf32 { pos: positions * d },
+            _ => AttentionLens::Unfused {
+                rows_by_d: rows * d,
+                positions_by_d: positions * d,
+                scores: batch * heads * frames * frames,
+                bd: rows * heads * positions,
+            },
+        };
+        ScratchLens {
+            mel: maps[0].len(),
+            maps: [maps[1].len(), maps[2].len()],
+            flat: rows * spec.subsampling_channels * maps[3].features,
+            act: ActivationLens::new(spec, self.math, rows),
+            attention,
+        }
+    }
+
+    /// Arena bytes a workspace for `batch` inputs of up to `mel_frames` frames carves
+    pub(crate) fn scratch_bytes(&self, batch: usize, mel_frames: usize) -> usize {
+        self.scratch_lens(batch, mel_frames).bytes()
+    }
+
+    /// Builds the buffers for `batch` inputs of up to `mel_frames` frames, with its
+    /// activations carved from `arena`, and the relative position table for that
+    /// length
+    ///
+    /// # Safety
+    ///
+    /// The workspace aliases the memory of every other workspace on `arena`. The
+    /// caller must run one of them at a time on the runtime's stream, finish each
+    /// call's reads of [`EncoderWorkspace::output`] before another workspace runs,
+    /// and not use the workspace after the arena reallocates
+    pub(crate) unsafe fn workspace(
         &self,
         runtime: &CudaRuntime,
+        arena: &Arena,
         batch: usize,
         mel_frames: usize,
     ) -> Result<EncoderWorkspace, TranscriptionError> {
@@ -675,56 +810,26 @@ impl CudaEncoder {
                 "a streaming encoder runs chunk by chunk, not over whole inputs".to_owned(),
             ));
         }
-        let (d, heads) = (spec.d_model, spec.heads);
-        let channels = spec.subsampling_channels;
-        let maps = self.feature_maps(batch, mel_frames);
-        let frames = maps[3].frames;
-        let rows = batch * frames;
-        let positions = 2 * frames - 1;
-        let pos_emb = stream.clone_htod(&relative_positions(frames, d))?;
+        let lens = self.scratch_lens(batch, mel_frames);
+        let frames = self.feature_maps(batch, mel_frames)[3].frames;
+        let pos_emb = stream.clone_htod(&relative_positions(frames, spec.d_model))?;
         let pos_emb_f16 = self.fp16_copy(runtime, &pos_emb)?;
+
+        // SAFETY: the caller's contract is the carve's
+        let mut carve = unsafe { arena.carve() };
         #[cfg_attr(not(feature = "low-precision"), allow(unused_mut))]
-        let mut act = Activations::new(runtime, spec, self.math, rows)?;
+        let mut act = Activations::carve(&mut carve, lens.act)?;
+        // the quantized operands stay outside the arena, in the shape's own bytes
         #[cfg(feature = "low-precision")]
         if let Some(quant) = &self.quant {
-            act.quant.inputs = quant.inputs(runtime, spec, rows, positions)?;
+            act.quant.inputs = quant.inputs(runtime, spec, batch * frames, 2 * frames - 1)?;
         }
-
-        let fused = self
-            .fused
-            .as_ref()
-            .is_some_and(|fused| fused.shapes.takes(batch, frames));
-        let attention = match self.math {
-            EncoderMath::Fp16 if fused => AttentionBuffers::FusedFp16 {
-                qkv: zeros(stream, rows * 3 * d)?,
-                pos: zeros(stream, positions * d)?,
-            },
-            EncoderMath::Single(_) if fused => AttentionBuffers::FusedTf32 {
-                pos: zeros(stream, positions * d)?,
-            },
-            _ => AttentionBuffers::Unfused(Box::new(UnfusedAttention {
-                q_u: zeros(stream, rows * d)?,
-                q_v: zeros(stream, rows * d)?,
-                k: zeros(stream, rows * d)?,
-                v: zeros(stream, rows * d)?,
-                pos: zeros(stream, positions * d)?,
-                pos_heads: zeros(stream, positions * d)?,
-                scores: zeros(stream, batch * heads * frames * frames)?,
-                bd: zeros(stream, rows * heads * positions)?,
-                context: zeros(stream, rows * d)?,
-            })),
-        };
-
-        Ok(EncoderWorkspace {
+        let workspace = EncoderWorkspace {
             batch,
             mel_frames,
             frames,
-            mel: zeros(stream, batch * mel_frames * spec.features)?,
-            mel_host: HostStaging::new(
-                stream,
-                batch * mel_frames * spec.features,
-                Direction::Upload,
-            )?,
+            mel: carve.take(lens.mel)?,
+            mel_host: HostStaging::new(stream, lens.mel, Direction::Upload)?,
             lens: [
                 zeros(stream, batch)?,
                 zeros(stream, batch)?,
@@ -732,13 +837,19 @@ impl CudaEncoder {
                 zeros(stream, batch)?,
             ],
             host_lens: vec![0; batch],
-            maps: [zeros(stream, maps[1].len())?, zeros(stream, maps[2].len())?],
-            flat: zeros(stream, rows * channels * maps[3].features)?,
+            maps: [carve.take(lens.maps[0])?, carve.take(lens.maps[1])?],
+            flat: carve.take(lens.flat)?,
             act,
             pos_emb,
             pos_emb_f16,
-            attention,
-        })
+            attention: AttentionBuffers::carve(&mut carve, lens.attention)?,
+        };
+        debug_assert_eq!(
+            carve.used(),
+            lens.bytes(),
+            "the carve and its byte count differ"
+        );
+        Ok(workspace)
     }
 
     /// An FP16 copy of `table` for an FP16 GEMM under [`EncoderMath::Fp16`]
@@ -1019,7 +1130,7 @@ impl CudaEncoder {
             gemm_output(
                 self.math,
                 normed,
-                fp16.as_mut().map(|fp16| &mut fp16.normed),
+                fp16.as_mut().map(|fp16| &mut *fp16.normed),
             )?,
             self.spec.d_model,
             NORM_EPS,
@@ -1046,7 +1157,7 @@ impl CudaEncoder {
             gemm_output(
                 self.math,
                 normed,
-                fp16.as_mut().map(|fp16| &mut fp16.normed),
+                fp16.as_mut().map(|fp16| &mut *fp16.normed),
             )?,
             self.spec.d_model,
             NORM_EPS,
@@ -1401,7 +1512,7 @@ impl CudaEncoder {
         let glued = gemm_output(
             self.math,
             merged,
-            fp16.as_mut().map(|fp16| &mut fp16.merged),
+            fp16.as_mut().map(|fp16| &mut *fp16.merged),
         )?;
         self.kernels.conv_glue(
             runtime.stream(),
@@ -1515,7 +1626,7 @@ mod tests {
 
     use super::{CudaEncoder, EncoderMath, relative_positions};
     use crate::cuda::kernels::CudaRuntime;
-    use crate::cuda::test_support::{compare, weights};
+    use crate::cuda::test_support::{compare, lone_workspace, weights};
     use crate::deployment::{ParakeetDeployment, ParakeetVersion};
     use crate::test_support::NemoReference;
 
@@ -1591,9 +1702,7 @@ mod tests {
                 // NeMo's featurizer is feature-major; the encoder takes time-major rows
                 let time_major: Vec<f32> = mel.permuted_axes([0, 2, 1]).iter().copied().collect();
 
-                let mut ws = encoder
-                    .workspace(&runtime, batch, mel_frames)
-                    .expect("workspace");
+                let mut ws = lone_workspace(&runtime, &encoder, batch, mel_frames);
                 encoder
                     .set_input(&runtime, &mut ws, &lens, |mel| {
                         mel.copy_from_slice(&time_major)
@@ -1690,9 +1799,7 @@ mod tests {
                     .collect();
                 let time_major: Vec<f32> = mel.permuted_axes([0, 2, 1]).iter().copied().collect();
                 let encode = |encoder: &CudaEncoder| {
-                    let mut ws = encoder
-                        .workspace(&runtime, batch, mel_frames)
-                        .expect("workspace");
+                    let mut ws = lone_workspace(&runtime, encoder, batch, mel_frames);
                     encoder
                         .set_input(&runtime, &mut ws, &lens, |mel| {
                             mel.copy_from_slice(&time_major)
@@ -2177,9 +2284,7 @@ mod tests {
                     if let Some(attention) = encoder.fused.as_mut() {
                         attention.shapes = if fused { ALWAYS } else { NEVER };
                     }
-                    let mut ws = encoder
-                        .workspace(&runtime, batch, mel_frames)
-                        .expect("workspace");
+                    let mut ws = lone_workspace(&runtime, &encoder, batch, mel_frames);
                     assert_eq!(
                         !matches!(ws.attention, super::AttentionBuffers::Unfused(_)),
                         fused,
@@ -2294,9 +2399,7 @@ mod tests {
         mel_frames: usize,
     ) -> f64 {
         const REPLAYS: u32 = 50;
-        let mut ws = encoder
-            .workspace(runtime, batch, mel_frames)
-            .expect("workspace");
+        let mut ws = lone_workspace(runtime, encoder, batch, mel_frames);
         // a fixed LCG keeps the input the same for both paths
         let mut state = 0x2545_f491_u32;
         encoder
@@ -2361,9 +2464,7 @@ mod tests {
             .map(|len| *len as usize)
             .collect();
         let time_major: Vec<f32> = mel.permuted_axes([0, 2, 1]).iter().copied().collect();
-        let mut ws = encoder
-            .workspace(runtime, batch, mel_frames)
-            .expect("workspace");
+        let mut ws = lone_workspace(runtime, encoder, batch, mel_frames);
         encoder
             .set_input(runtime, &mut ws, &lens, |mel| {
                 mel.copy_from_slice(&time_major)

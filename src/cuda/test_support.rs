@@ -1,7 +1,11 @@
+use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 
 use ndarray::{ArrayD, Axis, Ix3};
 
+use crate::cuda::arena::Arena;
+use crate::cuda::encoder::{CudaEncoder, EncoderWorkspace};
+use crate::cuda::kernels::CudaRuntime;
 use crate::deployment::{ParakeetDeployment, ParakeetVersion};
 use crate::models::{ModelBundle, Precision};
 use crate::native::weights::WeightFile;
@@ -72,4 +76,45 @@ pub(crate) fn compare(ours: &[f32], reference: &ArrayD<f32>, lens: &[usize]) -> 
         }
     }
     ((error / norm).sqrt(), max_abs)
+}
+
+/// An encoder workspace on an arena of its own, for tests that run one shape alone
+pub(crate) struct LoneWorkspace {
+    // the workspace drops before the arena memory it aliases
+    workspace: EncoderWorkspace,
+    _arena: Arena,
+}
+
+impl Deref for LoneWorkspace {
+    type Target = EncoderWorkspace;
+
+    fn deref(&self) -> &EncoderWorkspace {
+        &self.workspace
+    }
+}
+
+impl DerefMut for LoneWorkspace {
+    fn deref_mut(&mut self) -> &mut EncoderWorkspace {
+        &mut self.workspace
+    }
+}
+
+/// A workspace for `batch` inputs of up to `mel_frames` frames on a fresh arena
+pub(crate) fn lone_workspace(
+    runtime: &CudaRuntime,
+    encoder: &CudaEncoder,
+    batch: usize,
+    mel_frames: usize,
+) -> LoneWorkspace {
+    let mut arena = Arena::new();
+    // SAFETY: the arena is new, so nothing aliases it yet
+    unsafe { arena.reallocate(runtime.stream(), encoder.scratch_bytes(batch, mel_frames)) }
+        .expect("arena");
+    // SAFETY: the arena backs this workspace alone, and drops after it
+    let workspace =
+        unsafe { encoder.workspace(runtime, &arena, batch, mel_frames) }.expect("workspace");
+    LoneWorkspace {
+        workspace,
+        _arena: arena,
+    }
 }

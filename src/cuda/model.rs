@@ -3,8 +3,10 @@
 //! A batch of chunks is padded to a mel-frame bucket, so inputs of similar length
 //! share one set of device buffers and captured graphs. The first batch of a shape
 //! runs eagerly, which also finishes cuBLAS's lazy setup, and records graphs that
-//! later batches of that shape replay. Shapes are evicted least recently used once
-//! their buffers pass a share of device memory
+//! later batches of that shape replay. Every shape's encoder activations alias one
+//! arena sized for the largest shape so far, so a shape holds only its graphs and a
+//! few small buffers. Shapes are evicted least recently used once they and the arena
+//! pass a share of device memory
 
 use std::collections::HashMap;
 use std::fmt;
@@ -13,9 +15,11 @@ use std::ops::Deref;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use cudakit::cudarc::driver::CudaStream;
 use cudakit::{Graph, Library, Options};
 
 use crate::backend::{ChunkDecode, DecodePolicy, EncoderChunk, LanguageMask};
+use crate::cuda::arena::Arena;
 use crate::cuda::decoder::{CudaDecoder, DecodeWorkspace};
 use crate::cuda::encoder::{CudaEncoder, EncoderWorkspace};
 use crate::cuda::kernels::CudaRuntime;
@@ -45,13 +49,22 @@ struct Shape {
     decode_graph: Option<Graph>,
     encoder: EncoderWorkspace,
     decoder: DecodeWorkspace,
+    /// Bytes the shape holds outside the arena
     bytes: usize,
     last_used: u64,
 }
 
-/// Shapes by `(batch, padded mel frames)`, bounded by the bytes their buffers hold
+/// Shapes by `(batch, padded mel frames)` and the arena their encoder activations
+/// alias, bounded by the bytes both hold
+///
+/// Holding the cache's lock is what lets the shapes share the arena: one call at a
+/// time writes it, and each call's decode reads the encoder output before the lock
+/// is released
 struct ShapeCache {
+    // shapes come first so their graphs and aliases drop before the arena's memory
     shapes: HashMap<(usize, usize), Shape>,
+    arena: Arena,
+    /// Bytes the shapes hold outside the arena
     bytes: usize,
     budget: usize,
     uses: u64,
@@ -61,6 +74,7 @@ impl ShapeCache {
     fn new(budget: usize) -> Self {
         Self {
             shapes: HashMap::new(),
+            arena: Arena::new(),
             bytes: 0,
             budget,
             uses: 0,
@@ -72,12 +86,30 @@ impl ShapeCache {
         self.bytes = 0;
     }
 
+    /// Makes the arena hold at least `bytes`
+    ///
+    /// Every cached shape aliases the arena's current memory, so growing it drops
+    /// them all first. When the largest shape comes first, that happens once;
+    /// otherwise each new largest shape does it, and the cache refills as shapes recur
+    fn reserve(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        bytes: usize,
+    ) -> Result<(), TranscriptionError> {
+        if bytes <= self.arena.bytes() {
+            return Ok(());
+        }
+        self.clear();
+        // SAFETY: the shapes just dropped held every alias of the old memory
+        unsafe { self.arena.reallocate(stream, bytes) }
+    }
+
     /// Adds `shape`, then evicts the least recently used others while over budget;
     /// a shape larger than the whole budget is still kept, alone
     fn insert(&mut self, key: (usize, usize), shape: Shape) {
         self.bytes += shape.bytes;
         self.shapes.insert(key, shape);
-        while self.bytes > self.budget {
+        while self.bytes + self.arena.bytes() > self.budget {
             let Some(oldest) = self
                 .shapes
                 .iter()
@@ -247,16 +279,21 @@ impl CudaModel {
         })?;
         let key = (batch, mel_frames);
         if !shapes.shapes.contains_key(&key) {
-            // adding a shape may free others' graphs and buffers, by eviction or by the
-            // retry below, and a failed allocation frees what it had made
+            // adding a shape may free others' graphs and buffers, by growing the arena,
+            // by eviction or by the retry below, and a failed allocation frees what it
+            // had made
             let _exclusive = exclusive_device_work();
-            let shape = match engine.shape(batch, mel_frames) {
+            shapes.reserve(
+                engine.runtime.stream(),
+                engine.encoder.scratch_bytes(batch, mel_frames),
+            )?;
+            let shape = match engine.shape(&shapes.arena, batch, mel_frames) {
                 Ok(shape) => shape,
                 // the allocation may have failed on memory cached shapes hold: free
                 // them all and try once more
                 Err(_) => {
                     shapes.clear();
-                    engine.shape(batch, mel_frames)?
+                    engine.shape(&shapes.arena, batch, mel_frames)?
                 }
             };
             shapes.insert(key, shape);
@@ -269,8 +306,20 @@ impl CudaModel {
 }
 
 impl Engine {
-    fn shape(&self, batch: usize, mel_frames: usize) -> Result<Shape, TranscriptionError> {
-        let encoder = self.encoder.workspace(&self.runtime, batch, mel_frames)?;
+    /// A new shape whose encoder activations alias `arena`, the shape cache's
+    fn shape(
+        &self,
+        arena: &Arena,
+        batch: usize,
+        mel_frames: usize,
+    ) -> Result<Shape, TranscriptionError> {
+        // SAFETY: the arena belongs to the shape cache, whose lock every call holds
+        // through its decode, so one shape runs at a time and its encoder output is
+        // read before another runs; growing the arena drops every shape first
+        let encoder = unsafe {
+            self.encoder
+                .workspace(&self.runtime, arena, batch, mel_frames)?
+        };
         let decoder = self
             .decoder
             .workspace(&self.runtime, batch, encoder.frames())?;
@@ -376,6 +425,7 @@ mod tests {
     use super::{CudaModel, MEL_BUCKET};
     use crate::backend::{DecodePolicy, EncoderChunk};
     use crate::config::TranscriptionConfig;
+    use crate::cuda::arena::Arena;
     use crate::cuda::test_support::{native_bundle, native_root, nemo_parity_bundle};
     use crate::decode::RawTranscription;
     use crate::deployment::{ParakeetDeployment, ParakeetVersion};
@@ -385,54 +435,129 @@ mod tests {
     use crate::pipeline::TranscriptionPipeline;
     use crate::test_support::NemoReference;
     use crate::types::TranscriptionResult;
+    use crate::vocab::Vocabulary;
 
-    /// Runs each b8 utterance alone under a cache budget of two of the largest
-    /// shapes, forward, backward and forward again, so calls keep evicting shapes and
-    /// capturing their graphs anew, and holds every output to the first, unbounded run
+    /// A v3 model and the features of each b8 reference utterance
+    struct Lone {
+        model: CudaModel,
+        deployment: ParakeetDeployment,
+        vocab: Vocabulary,
+        features: Vec<Array2<f32>>,
+    }
+
+    impl Lone {
+        fn load(precision: Precision) -> Self {
+            let root = native_root();
+            let bundle = ModelBundle::from_native_dir(&root, ParakeetDeployment::v3());
+            let deployment = bundle.deployment().clone();
+            let vocab = bundle.vocabulary().expect("vocabulary");
+            let model = CudaModel::load(
+                &root.join(deployment.native_weights_path()),
+                &deployment,
+                precision,
+            )
+            .expect("model");
+            let extractor =
+                ParakeetFeatureExtractor::new(&TranscriptionConfig::from_deployment(&deployment));
+
+            let reference = NemoReference::open(ParakeetVersion::V3, "b8");
+            let audio = reference.f32("audio");
+            let features = reference
+                .i64("audio_len")
+                .iter()
+                .enumerate()
+                .map(|(row, len)| {
+                    let samples: Vec<f32> = audio
+                        .index_axis(Axis(0), row)
+                        .iter()
+                        .take(*len as usize)
+                        .copied()
+                        .collect();
+                    extractor.extract(&samples).expect("features")
+                })
+                .collect();
+            Self {
+                model,
+                deployment,
+                vocab,
+                features,
+            }
+        }
+
+        fn policy(&self) -> DecodePolicy<'_> {
+            DecodePolicy::new(&self.deployment, &self.vocab, LanguageSelection::Auto)
+                .expect("policy")
+        }
+
+        /// Runs the longest utterance, so the arena reaches the size every row needs
+        /// and later rows' shapes stay cached instead of being dropped as it grows
+        fn size_the_arena(&self, policy: &DecodePolicy<'_>) {
+            let longest = (0..self.features.len())
+                .max_by_key(|row| self.features[*row].nrows())
+                .expect("a reference row");
+            self.run(policy, longest);
+        }
+
+        fn run(&self, policy: &DecodePolicy<'_>, row: usize) -> RawTranscription {
+            let mut decoded = self
+                .model
+                .transcribe_chunks(&[EncoderChunk::new(self.features[row].view())], policy)
+                .expect("transcribe");
+            decoded.remove(0).raw
+        }
+
+        /// Every utterance in one batch, padded to the longest
+        fn run_batch(&self, policy: &DecodePolicy<'_>) -> Vec<RawTranscription> {
+            let chunks: Vec<EncoderChunk<'_>> = self
+                .features
+                .iter()
+                .map(|features| EncoderChunk::new(features.view()))
+                .collect();
+            self.model
+                .transcribe_chunks(&chunks, policy)
+                .expect("transcribe")
+                .into_iter()
+                .map(|decoded| decoded.raw)
+                .collect()
+        }
+
+        /// Drops every shape and the arena, so the next call starts on fresh, zeroed
+        /// memory as each shape did before shapes shared one
+        fn fresh_arena(&self) {
+            // the shapes go before the memory they alias
+            let mut cache = self.model.0.shapes.lock().expect("cache");
+            cache.clear();
+            cache.arena = Arena::new();
+        }
+
+        fn poison(&self, byte: u8) {
+            let mut cache = self.model.0.shapes.lock().expect("cache");
+            cache.arena.poison(self.model.0.runtime.stream(), byte);
+        }
+    }
+
+    fn assert_same(raw: &RawTranscription, want: &RawTranscription, what: &str) {
+        assert_eq!(raw.token_ids, want.token_ids, "{what} tokens");
+        assert_eq!(raw.frame_indices, want.frame_indices, "{what} frames");
+        assert_eq!(raw.durations, want.durations, "{what} durations");
+        assert_eq!(raw.confidences, want.confidences, "{what} confidences");
+    }
+
+    /// Runs each b8 utterance alone under a cache budget of the arena and two of the
+    /// largest shapes, forward, backward and forward again, so calls keep evicting
+    /// shapes and capturing their graphs anew, and holds every output to the first,
+    /// unbounded run
     #[test]
     #[ignore = "needs a CUDA GPU, the native weights and the NeMo references; `just gpu-parity` runs it on gpu0"]
     fn gpu_evicted_shapes_transcribe_the_same() {
-        let root = native_root();
-        let bundle = ModelBundle::from_native_dir(&root, ParakeetDeployment::v3());
-        let deployment = bundle.deployment().clone();
-        let vocab = bundle.vocabulary().expect("vocabulary");
-        let model = CudaModel::load(
-            &root.join(deployment.native_weights_path()),
-            &deployment,
-            Precision::Fp32,
-        )
-        .expect("model");
-        let policy =
-            DecodePolicy::new(&deployment, &vocab, LanguageSelection::Auto).expect("policy");
-        let extractor =
-            ParakeetFeatureExtractor::new(&TranscriptionConfig::from_deployment(&deployment));
-
-        let reference = NemoReference::open(ParakeetVersion::V3, "b8");
-        let audio = reference.f32("audio");
-        let features: Vec<Array2<f32>> = reference
-            .i64("audio_len")
-            .iter()
-            .enumerate()
-            .map(|(row, len)| {
-                let samples: Vec<f32> = audio
-                    .index_axis(Axis(0), row)
-                    .iter()
-                    .take(*len as usize)
-                    .copied()
-                    .collect();
-                extractor.extract(&samples).expect("features")
-            })
-            .collect();
-        let run = |features: &Array2<f32>| -> RawTranscription {
-            let mut decoded = model
-                .transcribe_chunks(&[EncoderChunk::new(features.view())], &policy)
-                .expect("transcribe");
-            decoded.remove(0).raw
-        };
-        let expected: Vec<RawTranscription> = features.iter().map(run).collect();
+        let lone = Lone::load(Precision::Fp32);
+        let policy = lone.policy();
+        let rows = lone.features.len();
+        lone.size_the_arena(&policy);
+        let expected: Vec<RawTranscription> = (0..rows).map(|row| lone.run(&policy, row)).collect();
 
         let (shapes, largest) = {
-            let mut cache = model.0.shapes.lock().expect("cache");
+            let mut cache = lone.model.0.shapes.lock().expect("cache");
             let shapes = cache.shapes.len();
             let largest = cache.shapes.values().map(|shape| shape.bytes).max();
             cache.clear();
@@ -442,36 +567,94 @@ mod tests {
             shapes >= 3,
             "the utterances fall in {shapes} shapes; eviction needs 3"
         );
-        model.0.shapes.lock().expect("cache").budget = 2 * largest;
+        {
+            let mut cache = lone.model.0.shapes.lock().expect("cache");
+            cache.budget = cache.arena.bytes() + 2 * largest;
+        }
 
-        let rows = features.len();
         let order = (0..rows).chain((0..rows).rev()).chain(0..rows);
         for (call, row) in order.enumerate() {
-            let raw = run(&features[row]);
-            let want = &expected[row];
-            assert_eq!(
-                raw.token_ids, want.token_ids,
-                "call {call} row {row} tokens"
-            );
-            assert_eq!(
-                raw.frame_indices, want.frame_indices,
-                "call {call} row {row} frames"
-            );
-            assert_eq!(
-                raw.durations, want.durations,
-                "call {call} row {row} durations"
-            );
-            assert_eq!(
-                raw.confidences, want.confidences,
-                "call {call} row {row} confidences"
+            assert_same(
+                &lone.run(&policy, row),
+                &expected[row],
+                &format!("call {call} row {row}"),
             );
 
-            let cache = model.0.shapes.lock().expect("cache");
+            let cache = lone.model.0.shapes.lock().expect("cache");
             let held: usize = cache.shapes.values().map(|shape| shape.bytes).sum();
             assert_eq!(cache.bytes, held, "call {call}: cache byte count");
             assert!(
-                cache.bytes <= cache.budget,
+                cache.bytes + cache.arena.bytes() <= cache.budget,
                 "call {call}: cache over budget"
+            );
+        }
+    }
+
+    /// Runs the b8 utterances on fresh, zeroed arenas, each alone and then all in
+    /// one batch, in FP32 and in FP16, whose GEMM inputs are separate buffers. Then,
+    /// with every shape cached, it runs them again in a new order with the shared
+    /// arena filled before each call, once with NaN and once with a finite value,
+    /// since NaN can vanish through the max in ReLU and softmax. Each output must
+    /// match its fresh run bit for bit, so no kernel reads arena memory its own call
+    /// has not written, which another shape's call would have left there
+    #[test]
+    #[ignore = "needs a CUDA GPU, the native weights and the NeMo references; `just gpu-parity` runs it on gpu0"]
+    fn gpu_shapes_ignore_what_the_arena_held() {
+        // all-ones bytes are NaN in FP32 and FP16; 0x41 bytes are 12.1 and 2.6
+        const POISONS: [u8; 2] = [0xff, 0x41];
+        let precisions = [
+            Precision::Fp32,
+            Precision::Tf32,
+            Precision::Fp16,
+            #[cfg(feature = "low-precision")]
+            Precision::Fp8,
+        ];
+        for precision in precisions {
+            let lone = Lone::load(precision);
+            let policy = lone.policy();
+            let rows = lone.features.len();
+            let fresh: Vec<RawTranscription> = (0..rows)
+                .map(|row| {
+                    lone.fresh_arena();
+                    lone.run(&policy, row)
+                })
+                .collect();
+            lone.fresh_arena();
+            let fresh_batch = lone.run_batch(&policy);
+
+            lone.size_the_arena(&policy);
+            for row in 0..rows {
+                lone.run(&policy, row);
+            }
+            lone.run_batch(&policy);
+            let shapes = lone.model.0.shapes.lock().expect("cache").shapes.len();
+            assert!(
+                shapes >= 3,
+                "the utterances fall in {shapes} shapes; the test needs 3"
+            );
+
+            for byte in POISONS {
+                let what = format!("{precision:?} poisoned with {byte:#x}");
+                for row in (0..rows).rev().chain((0..rows).step_by(2)) {
+                    lone.poison(byte);
+                    assert_same(
+                        &lone.run(&policy, row),
+                        &fresh[row],
+                        &format!("{what}, row {row}"),
+                    );
+                }
+                lone.poison(byte);
+                for (row, (raw, want)) in
+                    lone.run_batch(&policy).iter().zip(&fresh_batch).enumerate()
+                {
+                    assert_same(raw, want, &format!("{what}, batch row {row}"));
+                }
+            }
+            let cache = lone.model.0.shapes.lock().expect("cache");
+            assert_eq!(
+                cache.shapes.len(),
+                shapes,
+                "{precision:?}: every shape stayed cached"
             );
         }
     }

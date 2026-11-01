@@ -388,7 +388,7 @@ mod tests {
     use crate::cuda::linear;
     use crate::cuda::quant::test_support::e4m3_value;
     use crate::cuda::quant::{QuantizedWeight, Scheme, f16_bits, f16_value, fp8_tensor, nvfp4};
-    use crate::cuda::test_support::weights;
+    use crate::cuda::test_support::{lone_workspace, weights};
     use crate::deployment::{ParakeetDeployment, ParakeetVersion};
     use crate::error::TranscriptionError;
     use crate::test_support::NemoReference;
@@ -487,9 +487,7 @@ mod tests {
 
         /// The encoder output and its valid frames per row
         fn encode(&self, runtime: &CudaRuntime, encoder: &CudaEncoder) -> (Vec<f32>, Vec<usize>) {
-            let mut ws = encoder
-                .workspace(runtime, self.batch, self.mel_frames)
-                .expect("workspace");
+            let mut ws = lone_workspace(runtime, encoder, self.batch, self.mel_frames);
             encoder
                 .set_input(runtime, &mut ws, &self.lens, |mel| {
                     mel.copy_from_slice(&self.time_major)

@@ -826,7 +826,7 @@ mod tests {
     use crate::backend::{DecodePolicy, LanguageMask, decide_from_logits};
     use crate::cuda::encoder::{CudaEncoder, EncoderMath};
     use crate::cuda::kernels::CudaRuntime;
-    use crate::cuda::test_support::{native_root, weights};
+    use crate::cuda::test_support::{lone_workspace, native_root, weights};
     use crate::decode::RawTranscription;
     use crate::deployment::{ParakeetDeployment, ParakeetVersion};
     use crate::language::{LanguageSelection, ParakeetLanguage};
@@ -960,9 +960,7 @@ mod tests {
                     .map(|len| *len as usize)
                     .collect();
                 let time_major: Vec<f32> = mel.permuted_axes([0, 2, 1]).iter().copied().collect();
-                let mut encoder_ws = encoder
-                    .workspace(&runtime, batch, mel_frames)
-                    .expect("encoder workspace");
+                let mut encoder_ws = lone_workspace(&runtime, &encoder, batch, mel_frames);
                 encoder
                     .set_input(&runtime, &mut encoder_ws, &mel_lens, |mel| {
                         mel.copy_from_slice(&time_major)
