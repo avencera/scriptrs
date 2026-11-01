@@ -304,97 +304,161 @@ fn validate_positive_duration(field: &str, value: f64) -> Result<(), Transcripti
     )))
 }
 
+/// Speech regions of a recording from its VAD window probabilities
 #[cfg(feature = "vad")]
 pub(crate) fn detect_speech_regions(
     probabilities: &[f32],
     audio_length_samples: usize,
     config: &VadSegmentationConfig,
 ) -> Vec<SampleRange> {
-    if probabilities.is_empty() || audio_length_samples == 0 {
-        return Vec::new();
+    let mut detector = SpeechRegions::new(audio_length_samples, config);
+    let mut regions = detector.push(probabilities);
+    regions.extend(detector.finish());
+    regions
+}
+
+/// Finds the speech regions of a recording as its VAD probabilities arrive
+///
+/// Speech starts at a window at or above the threshold and ends after
+/// `min_silence_duration` below the negative threshold; speech shorter than
+/// `min_speech_duration` is dropped. Each region is padded by `speech_padding`,
+/// or by half the gap when the next region is closer than twice that. A region is
+/// returned once no later probability can change it: when the next region is
+/// found, or once the scan is twice the padding past its end with no speech
+/// started. Pushing the probabilities in any number of pieces gives the same
+/// regions
+#[cfg(feature = "vad")]
+pub(crate) struct SpeechRegions {
+    audio_len: usize,
+    threshold: f32,
+    negative_threshold: f32,
+    min_speech_samples: usize,
+    min_silence_samples: usize,
+    speech_pad_samples: usize,
+    /// Probabilities scanned so far
+    scanned: usize,
+    triggered: bool,
+    speech_start: usize,
+    silence_start: Option<usize>,
+    /// The last speech found, its start padded and its end not yet
+    open: Option<SampleRange>,
+}
+
+#[cfg(feature = "vad")]
+impl SpeechRegions {
+    pub(crate) fn new(audio_len: usize, config: &VadSegmentationConfig) -> Self {
+        let samples = |seconds: f64| (seconds * SAMPLE_RATE as f64) as usize;
+        Self {
+            audio_len,
+            threshold: config.threshold,
+            negative_threshold: config.effective_negative_threshold(),
+            min_speech_samples: samples(config.min_speech_duration),
+            min_silence_samples: samples(config.min_silence_duration),
+            speech_pad_samples: samples(config.speech_padding),
+            scanned: 0,
+            triggered: false,
+            speech_start: 0,
+            silence_start: None,
+            open: None,
+        }
     }
 
-    let hop_size = VAD_WINDOW_SAMPLES;
-    let min_speech_samples = (config.min_speech_duration * SAMPLE_RATE as f64) as usize;
-    let min_silence_samples = (config.min_silence_duration * SAMPLE_RATE as f64) as usize;
-    let speech_pad_samples = (config.speech_padding * SAMPLE_RATE as f64) as usize;
-    let threshold = config.threshold;
-    let negative_threshold = config.effective_negative_threshold();
-
-    let mut triggered = false;
-    let mut current_speech_start = 0usize;
-    let mut temp_end = None;
-    let mut speeches = Vec::new();
-
-    for (index, probability) in probabilities.iter().copied().enumerate() {
-        let frame_start = index * hop_size;
-        if probability >= threshold {
-            temp_end = None;
-            if !triggered {
-                triggered = true;
-                current_speech_start = frame_start;
-            }
-            continue;
+    /// Scans the probabilities not seen yet, `probabilities` being every one so
+    /// far, and returns the regions that became final
+    ///
+    /// A returned region's probabilities all lie in `probabilities`
+    pub(crate) fn push(&mut self, probabilities: &[f32]) -> Vec<SampleRange> {
+        let mut regions = Vec::new();
+        if self.audio_len == 0 {
+            return regions;
         }
 
-        if probability < negative_threshold && triggered {
-            if temp_end.is_none() {
-                temp_end = Some(frame_start);
-            }
-            if let Some(start_silence) = temp_end
-                && frame_start.saturating_sub(start_silence) >= min_silence_samples
-            {
-                if start_silence.saturating_sub(current_speech_start) >= min_speech_samples {
-                    speeches.push(SampleRange {
-                        start: current_speech_start,
-                        end: start_silence,
-                    });
+        for (index, probability) in probabilities.iter().copied().enumerate().skip(self.scanned) {
+            let frame_start = index * VAD_WINDOW_SAMPLES;
+            if probability >= self.threshold {
+                self.silence_start = None;
+                if !self.triggered {
+                    self.triggered = true;
+                    self.speech_start = frame_start;
                 }
-                triggered = false;
-                temp_end = None;
+                continue;
+            }
+
+            if probability < self.negative_threshold && self.triggered {
+                let silence_start = *self.silence_start.get_or_insert(frame_start);
+                if frame_start.saturating_sub(silence_start) >= self.min_silence_samples {
+                    if silence_start.saturating_sub(self.speech_start) >= self.min_speech_samples {
+                        self.speech(self.speech_start, silence_start, &mut regions);
+                    }
+                    self.triggered = false;
+                    self.silence_start = None;
+                }
             }
         }
+        self.scanned = self.scanned.max(probabilities.len());
+
+        // no later speech starts before this, so an open region this far behind
+        // keeps its full padding whatever comes next
+        let next_start = if self.triggered {
+            self.speech_start
+        } else {
+            self.scanned * VAD_WINDOW_SAMPLES
+        };
+        if let Some(open) = self.open
+            && next_start.saturating_sub(open.end) >= 2 * self.speech_pad_samples
+        {
+            self.open = None;
+            self.emit(open.start, open.end + self.speech_pad_samples, &mut regions);
+        }
+        regions
     }
 
-    if triggered && audio_length_samples.saturating_sub(current_speech_start) >= min_speech_samples
-    {
-        speeches.push(SampleRange {
-            start: current_speech_start,
-            end: audio_length_samples,
+    /// The regions left once every probability has been pushed
+    pub(crate) fn finish(mut self) -> Vec<SampleRange> {
+        let mut regions = Vec::new();
+        if self.scanned == 0 || self.audio_len == 0 {
+            return regions;
+        }
+
+        if self.triggered
+            && self.audio_len.saturating_sub(self.speech_start) >= self.min_speech_samples
+        {
+            self.speech(self.speech_start, self.audio_len, &mut regions);
+        }
+        if let Some(open) = self.open.take() {
+            self.emit(open.start, open.end + self.speech_pad_samples, &mut regions);
+        }
+        regions
+    }
+
+    /// Records speech from `start` to `end`, which fixes the padding between it
+    /// and the open region
+    fn speech(&mut self, start: usize, end: usize, regions: &mut Vec<SampleRange>) {
+        let pad = match self.open.take() {
+            Some(open) => {
+                let silence = start.saturating_sub(open.end);
+                let pad = if silence < 2 * self.speech_pad_samples {
+                    silence / 2
+                } else {
+                    self.speech_pad_samples
+                };
+                self.emit(open.start, open.end + pad, regions);
+                pad
+            }
+            None => self.speech_pad_samples,
+        };
+        self.open = Some(SampleRange {
+            start: start.saturating_sub(pad),
+            end,
         });
     }
 
-    if speeches.is_empty() {
-        return Vec::new();
-    }
-
-    let mut adjusted = speeches;
-    for index in 0..adjusted.len() {
-        if index == 0 {
-            adjusted[index].start = adjusted[index].start.saturating_sub(speech_pad_samples);
-        }
-        if index < adjusted.len() - 1 {
-            let silence = adjusted[index + 1]
-                .start
-                .saturating_sub(adjusted[index].end);
-            if silence < 2 * speech_pad_samples {
-                let half = silence / 2;
-                adjusted[index].end = (adjusted[index].end + half).min(audio_length_samples);
-                adjusted[index + 1].start = adjusted[index + 1].start.saturating_sub(half);
-            } else {
-                adjusted[index].end =
-                    (adjusted[index].end + speech_pad_samples).min(audio_length_samples);
-                adjusted[index + 1].start =
-                    adjusted[index + 1].start.saturating_sub(speech_pad_samples);
-            }
-        } else {
-            adjusted[index].end =
-                (adjusted[index].end + speech_pad_samples).min(audio_length_samples);
+    fn emit(&self, start: usize, end: usize, regions: &mut Vec<SampleRange>) {
+        let end = end.min(self.audio_len);
+        if end > start {
+            regions.push(SampleRange { start, end });
         }
     }
-
-    adjusted.retain(|range| range.end > range.start);
-    adjusted
 }
 
 #[cfg(feature = "vad")]
@@ -498,22 +562,54 @@ pub(super) fn build_vad_execution_plan(
     probabilities: &[f32],
     config: &LongFormConfig,
 ) -> LongFormExecutionPlan {
-    let mut tasks = Vec::new();
-    let mut region_tasks = Vec::with_capacity(regions.len());
-    let mut previous_end = 0;
+    let mut plan = VadPlan::new(config);
     for region in regions.iter().copied() {
-        region_tasks.push(build_region_plan(
-            region,
-            previous_end,
-            probabilities,
-            config,
-            &mut tasks,
-        ));
-        previous_end = region.end;
+        plan.add_region(region, probabilities);
     }
-    LongFormExecutionPlan {
-        tasks,
-        regions: region_tasks,
+    plan.finish()
+}
+
+/// A VAD plan built a region at a time, in recording order
+#[cfg(feature = "vad")]
+pub(super) struct VadPlan<'a> {
+    config: &'a LongFormConfig,
+    plan: LongFormExecutionPlan,
+    previous_end: usize,
+}
+
+#[cfg(feature = "vad")]
+impl<'a> VadPlan<'a> {
+    pub(super) fn new(config: &'a LongFormConfig) -> Self {
+        Self {
+            config,
+            plan: LongFormExecutionPlan {
+                tasks: Vec::new(),
+                regions: Vec::new(),
+            },
+            previous_end: 0,
+        }
+    }
+
+    /// Plans the windows of `region`, whose probabilities lie in `probabilities`
+    pub(super) fn add_region(&mut self, region: SampleRange, probabilities: &[f32]) {
+        let region_task = build_region_plan(
+            region,
+            self.previous_end,
+            probabilities,
+            self.config,
+            &mut self.plan.tasks,
+        );
+        self.plan.regions.push(region_task);
+        self.previous_end = region.end;
+    }
+
+    /// Every window planned so far, in plan order
+    pub(super) fn tasks(&self) -> &[ChunkTask] {
+        &self.plan.tasks
+    }
+
+    pub(super) fn finish(self) -> LongFormExecutionPlan {
+        self.plan
     }
 }
 
@@ -660,7 +756,7 @@ mod tests {
     use super::{OverlapChunkConfig, RegionTaskKind, SampleRange, build_fast_execution_plan};
     #[cfg(feature = "vad")]
     use super::{
-        VadModel, VadSegmentationConfig, build_region_plan, detect_speech_regions,
+        SpeechRegions, VadModel, VadSegmentationConfig, build_region_plan, detect_speech_regions,
         plan_region_subsegments,
     };
     use crate::constants::SAMPLES_PER_ENCODER_FRAME;
@@ -677,6 +773,179 @@ mod tests {
         VadSegmentationConfig {
             threshold,
             ..VadSegmentationConfig::default()
+        }
+    }
+
+    /// Speech regions as the planner found them before it streamed: every
+    /// probability scanned first, then each region padded against its neighbours
+    #[cfg(feature = "vad")]
+    fn whole_recording_regions(
+        probabilities: &[f32],
+        audio_length_samples: usize,
+        config: &VadSegmentationConfig,
+    ) -> Vec<SampleRange> {
+        use crate::constants::SAMPLE_RATE;
+
+        if probabilities.is_empty() || audio_length_samples == 0 {
+            return Vec::new();
+        }
+
+        let hop_size = VAD_WINDOW_SAMPLES;
+        let min_speech_samples = (config.min_speech_duration * SAMPLE_RATE as f64) as usize;
+        let min_silence_samples = (config.min_silence_duration * SAMPLE_RATE as f64) as usize;
+        let speech_pad_samples = (config.speech_padding * SAMPLE_RATE as f64) as usize;
+        let threshold = config.threshold;
+        let negative_threshold = config.effective_negative_threshold();
+
+        let mut triggered = false;
+        let mut current_speech_start = 0usize;
+        let mut temp_end = None;
+        let mut speeches = Vec::new();
+
+        for (index, probability) in probabilities.iter().copied().enumerate() {
+            let frame_start = index * hop_size;
+            if probability >= threshold {
+                temp_end = None;
+                if !triggered {
+                    triggered = true;
+                    current_speech_start = frame_start;
+                }
+                continue;
+            }
+
+            if probability < negative_threshold && triggered {
+                if temp_end.is_none() {
+                    temp_end = Some(frame_start);
+                }
+                if let Some(start_silence) = temp_end
+                    && frame_start.saturating_sub(start_silence) >= min_silence_samples
+                {
+                    if start_silence.saturating_sub(current_speech_start) >= min_speech_samples {
+                        speeches.push(SampleRange {
+                            start: current_speech_start,
+                            end: start_silence,
+                        });
+                    }
+                    triggered = false;
+                    temp_end = None;
+                }
+            }
+        }
+
+        if triggered
+            && audio_length_samples.saturating_sub(current_speech_start) >= min_speech_samples
+        {
+            speeches.push(SampleRange {
+                start: current_speech_start,
+                end: audio_length_samples,
+            });
+        }
+
+        let mut adjusted = speeches;
+        for index in 0..adjusted.len() {
+            if index == 0 {
+                adjusted[index].start = adjusted[index].start.saturating_sub(speech_pad_samples);
+            }
+            if index < adjusted.len() - 1 {
+                let silence = adjusted[index + 1]
+                    .start
+                    .saturating_sub(adjusted[index].end);
+                if silence < 2 * speech_pad_samples {
+                    let half = silence / 2;
+                    adjusted[index].end = (adjusted[index].end + half).min(audio_length_samples);
+                    adjusted[index + 1].start = adjusted[index + 1].start.saturating_sub(half);
+                } else {
+                    adjusted[index].end =
+                        (adjusted[index].end + speech_pad_samples).min(audio_length_samples);
+                    adjusted[index + 1].start =
+                        adjusted[index + 1].start.saturating_sub(speech_pad_samples);
+                }
+            } else {
+                adjusted[index].end =
+                    (adjusted[index].end + speech_pad_samples).min(audio_length_samples);
+            }
+        }
+
+        adjusted.retain(|range| range.end > range.start);
+        adjusted
+    }
+
+    /// xorshift64, so the generated recordings are the same on every run
+    #[cfg(feature = "vad")]
+    struct Rng(u64);
+
+    #[cfg(feature = "vad")]
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        /// Uniform in `0..bound`
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next() % bound as u64) as usize
+        }
+
+        fn unit(&mut self) -> f32 {
+            (self.next() >> 40) as f32 / (1u64 << 24) as f32
+        }
+    }
+
+    /// Streaming the probabilities in random pieces finds exactly the regions the
+    /// whole-recording planner found, each returned only once its probabilities
+    /// have arrived
+    #[cfg(feature = "vad")]
+    #[test]
+    fn streamed_regions_match_the_whole_recording() {
+        let mut rng = Rng(0x5eed_cafe_f00d_d00d);
+        for case in 0..2_000 {
+            // runs of speech, silence and in-between scores, of lengths around the
+            // silence and padding durations, so gaps land on both sides of them
+            let windows = 1 + rng.below(1_500);
+            let mut probabilities = Vec::with_capacity(windows);
+            while probabilities.len() < windows {
+                let level = match rng.below(3) {
+                    0 => 0.6 + 0.4 * rng.unit(),
+                    1 => 0.3 * rng.unit(),
+                    _ => 0.3 + 0.4 * rng.unit(),
+                };
+                let run = 1 + rng.below(60);
+                probabilities.extend((0..run).map(|_| level + 0.05 * (rng.unit() - 0.5)));
+            }
+            probabilities.truncate(windows);
+            let audio_len = windows * VAD_WINDOW_SAMPLES - rng.below(VAD_WINDOW_SAMPLES);
+
+            let config = VadSegmentationConfig {
+                min_speech_duration: 0.05 + 0.3 * rng.unit() as f64,
+                min_silence_duration: 0.05 + 1.0 * rng.unit() as f64,
+                speech_padding: 0.6 * rng.unit() as f64,
+                ..segmentation_at(0.4 + 0.3 * rng.unit())
+            };
+            let expected = whole_recording_regions(&probabilities, audio_len, &config);
+            assert_eq!(
+                detect_speech_regions(&probabilities, audio_len, &config),
+                expected,
+                "case {case} in one piece"
+            );
+
+            let mut detector = SpeechRegions::new(audio_len, &config);
+            let mut streamed = Vec::new();
+            let mut arrived = 0;
+            while arrived < windows {
+                arrived = (arrived + 1 + rng.below(200)).min(windows);
+                let found = detector.push(&probabilities[..arrived]);
+                for region in &found {
+                    assert!(
+                        region.end.div_ceil(VAD_WINDOW_SAMPLES) <= arrived,
+                        "case {case}: {region:?} returned with {arrived} windows scored"
+                    );
+                }
+                streamed.extend(found);
+            }
+            streamed.extend(detector.finish());
+            assert_eq!(streamed, expected, "case {case} streamed");
         }
     }
 

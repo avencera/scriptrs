@@ -292,22 +292,23 @@ last row's speed is over all 114 hours.
 
 With `vad`, Silero VAD runs on the CPU, at about 0.5 s per hour of audio. On a GPU
 each step of its recurrence costs more in launches than the whole step costs on the
-CPU. VAD planning wins when most of a recording is not speech, and helps a little
-on close-talk speech, but costs accuracy on far-field speech and speed on
-recordings that are mostly speech:
+CPU. The scan runs alongside transcription: each speech region goes to the model as
+soon as the scan has passed it, and the transcript is the same as scanning first.
+VAD planning wins when most of a recording is not speech, and helps a little on
+close-talk speech, but costs accuracy on far-field speech and runs at about two
+thirds of overlap speed on recordings that are mostly speech:
 
 | Set | Overlap WER | VAD WER | Overlap speed | VAD speed |
 |---|---:|---:|---:|---:|
-| Sparse speech, 24 % speech (4.2 h) | 14.8 % | **2.3 %** | 3430x | **3990x** |
-| Earnings-21 earnings calls | 8.2 % | **8.0 %** | **3630x** | 2030x |
-| AMI meetings, headset mix | 21.5 % | **20.8 %** | **3480x** | 1800x |
-| AMI meetings, far-field microphone | **23.2 %** | 25.3 % | **3480x** | 1790x |
-| CHiME-6 dinner parties | **44.0 %** | 53.4 % | **3490x** | 1970x |
+| Sparse speech, 24 % speech (4.2 h) | 14.8 % | **2.3 %** | 3906x | **4509x** |
+| Earnings-21 earnings calls | 8.2 % | **8.0 %** | **4049x** | 2994x |
+| AMI meetings, headset mix | 21.5 % | **20.8 %** | **3946x** | 2589x |
+| AMI meetings, far-field microphone | **23.2 %** | 25.3 % | **3940x** | 2485x |
+| CHiME-6 dinner parties | **44.0 %** | 53.4 % | **3994x** | 2918x |
 
 The sparse set is LibriSpeech test-clean utterances separated by 15 to 75 s of
-film music, effects, ambience and low-level noise. The speed columns were measured
-with Silero VAD v5 alone and 0.1 s padding; in the padding sweep, 0.2 s was no
-slower.
+film music, effects, ambience and low-level noise. Speeds are the best of two or
+three runs.
 
 The default, Silero fusion, takes each window's speech probability as the higher
 of Silero VAD v5's and v6's, and windows at 0.6 or above count as speech. Either
@@ -732,7 +733,7 @@ The example expects mono 16kHz WAV input.
 - The public API is still moving
 - `scriptrs` currently targets the exact file layout and model I/O shipped in `avencera/scriptrs-models`; if you swap in a different CoreML Parakeet export, you may need runtime code changes
 - Use `long-form` for the fastest path on clean, dense speech
-- Add `vad` when you need better robustness on sparse-speech or non-speech-heavy recordings; on far-field speech it costs accuracy, and on dense speech speed
+- Add `vad` when you need better robustness on sparse-speech or non-speech-heavy recordings; on far-field speech it costs accuracy, and on dense speech about a third of the speed
 
 ## License
 
