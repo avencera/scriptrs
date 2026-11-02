@@ -356,9 +356,10 @@ impl LongFormTranscriptionPipeline {
         } = request;
         control.check()?;
         if control.max_windows() < usize::MAX {
+            // a failing scan stops its run, which must not stop the caller's control
             let probabilities = self
                 .vad
-                .process(audio, config.segmentation.model, control)
+                .process(audio, config.segmentation.model, &control.run_scope())
                 .map_err(PreprocessedTranscriptionError::from)?;
             control.check()?;
             let regions = detect_speech_regions(&probabilities, audio.len(), &config.segmentation);
@@ -694,10 +695,8 @@ impl Drop for ClosePlan<'_> {
 /// Stops the run when the code holding it unwinds, so the scan stops at its next
 /// block rather than running to the end of the recording before the panic
 /// surfaces
-#[cfg(feature = "vad")]
 struct StopRunOnPanic<'a>(&'a TranscriptionControl);
 
-#[cfg(feature = "vad")]
 impl Drop for StopRunOnPanic<'_> {
     fn drop(&mut self) {
         if std::thread::panicking() {

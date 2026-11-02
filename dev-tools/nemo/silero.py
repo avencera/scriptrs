@@ -33,6 +33,8 @@ def jit_path(version: str) -> Path:
         partial.rename(path)
     found = hashlib.sha256(path.read_bytes()).hexdigest()
     if found != sha256:
+        # a bad file left in the cache would fail every later run the same way
+        path.unlink()
         raise SystemExit(f"{path} has SHA-256 {found}, expected {sha256} for Silero {tag}")
     return path
 

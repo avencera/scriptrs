@@ -7,7 +7,7 @@ use std::sync::{Condvar, Mutex, PoisonError};
 use std::thread;
 
 use super::planner::ChunkTask;
-use super::{LongFormConfig, validate_finite_samples};
+use super::{LongFormConfig, StopRunOnPanic, validate_finite_samples};
 use crate::decode::RawTranscription;
 use crate::error::TranscriptionError;
 use crate::pipeline::{ChunkPreparer, PreparedWindow, TranscriptionPipeline};
@@ -225,8 +225,12 @@ fn run_batched_plan<P: WindowPreprocessor + ?Sized>(
                 scope.spawn(move || {
                     // a panicking worker closes the gate, so the others stop and
                     // drop their senders, the model side sees the channel close,
-                    // and the scope's join raises the panic instead of hanging
+                    // and the scope's join raises the panic instead of hanging.
+                    // Stopping the run also stops the scan, which closes the plan
+                    // and wakes workers waiting in `TaskStream::get` for windows
+                    // the scan has not found yet
                     let _stop_on_panic = StopOnPanic(lookahead);
+                    let _stop_run_on_panic = StopRunOnPanic(control);
                     let preparer = chunk.preparer();
                     loop {
                         let task_idx = next_task.fetch_add(1, Ordering::Relaxed);
@@ -247,8 +251,10 @@ fn run_batched_plan<P: WindowPreprocessor + ?Sized>(
             }
             drop(sender);
             // a panic in the model call unwinds past the cleanup below, and the
-            // scope would then wait on workers parked at the gate
+            // scope would then wait on workers parked at the gate or in
+            // `TaskStream::get` until the scan ends
             let _stop_on_panic = StopOnPanic(&lookahead);
+            let _stop_run_on_panic = StopRunOnPanic(control);
 
             // windows arrive in any order; batches are cut in plan order, each
             // full unless it holds the plan's last window, so a plan still being
@@ -280,6 +286,9 @@ fn run_batched_plan<P: WindowPreprocessor + ?Sized>(
                         windows.push(window?);
                     }
                     if windows.is_empty() {
+                        // a run stopped after the last window must not return as a
+                        // finished, empty transcription, as on the serial path
+                        control.check()?;
                         break;
                     }
                     // the next batch prepares while this one runs
@@ -336,6 +345,9 @@ fn run_parallel_plan<P: WindowPreprocessor + ?Sized>(
             // own from the bundle
             let bundle = pipeline.bundle().clone();
             scope.spawn(move || {
+                // the other workers and the scan stop instead of running the plan
+                // out before the panic surfaces at the scope's join
+                let _stop = StopRunOnPanic(control);
                 // a worker loads its model once it has a window, so a plan still
                 // being built loads none it turns out not to need
                 let mut task_idx = next_task.fetch_add(1, Ordering::Relaxed);

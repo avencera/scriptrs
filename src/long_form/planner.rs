@@ -13,7 +13,8 @@ pub(crate) struct SampleRange {
 
 /// Silero VAD model that scores each window's speech probability
 ///
-/// The default, Silero fusion, is the most accurate on every set measured (README). Silero
+/// The default, Silero fusion, is the most accurate or within 0.1 WER points of it on
+/// every set measured (README). Silero
 /// v6 alone beats v5 on calls and meetings but loses on sparse speech, where it
 /// takes more music and effects for speech, and on far-field conversation, where it
 /// misses distant speakers

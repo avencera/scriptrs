@@ -5,11 +5,11 @@ use crate::constants::{VAD_CONTEXT_SAMPLES, VAD_WINDOW_SAMPLES};
 #[cfg(target_os = "macos")]
 use crate::coreml::SileroVadCoreMlModel;
 use crate::error::TranscriptionError;
-use crate::long_form::VadModel;
+use crate::long_form::{StopRunOnPanic, VadModel};
 use crate::models::{ModelBundle, RuntimeBundle, SileroVersion};
 #[cfg(feature = "cuda")]
 use crate::native::silero::{SileroModel, SileroState};
-use crate::preprocessing::TranscriptionControl;
+use crate::preprocessing::{TranscriptionControl, TranscriptionControlError};
 use std::path::PathBuf;
 use std::sync::mpsc;
 
@@ -50,6 +50,8 @@ impl SileroVad {
     }
 
     /// Speech probability of each window of `audio` under `model`
+    ///
+    /// A model failure stops `control`'s run, as in [`Self::scan`]
     pub(crate) fn process(
         &self,
         audio: &[f32],
@@ -62,6 +64,9 @@ impl SileroVad {
     /// [`Self::process`], calling `progress` with every probability so far each time
     /// more are ready, so the caller can act on the start of a recording while the
     /// rest is scanned
+    ///
+    /// A model failure stops `control`'s run, so pass a run scope
+    /// ([`TranscriptionControl::run_scope`]) rather than a caller's own control
     pub(crate) fn scan(
         &self,
         audio: &[f32],
@@ -81,6 +86,11 @@ impl SileroVad {
         // each model's recurrence is one thread's critical path, so running both at
         // once costs little more than running one. Core ML models are `Send` but not
         // `Sync`, so each thread gets its own clone, which shares the weights
+        //
+        // a scan that fails or panics stops the run, so the other scan and the
+        // run's windows stop instead of running to the end of the recording before
+        // the error surfaces. An interruption stops nothing: the other scan shares
+        // the same cancellation and deadline, and reports them itself
         std::thread::scope(|scope| {
             let (sender, receiver) = mpsc::channel();
             let scans: Vec<_> = models
@@ -90,10 +100,17 @@ impl SileroVad {
                     let model = model.clone();
                     let sender = sender.clone();
                     scope.spawn(move || {
+                        let _stop = StopRunOnPanic(control);
                         // the receiver outlives every scan, so a send cannot fail
-                        model.process(audio, control, |block| {
+                        let scanned = model.process(audio, control, |block| {
                             let _ = sender.send((slot, block.to_vec()));
-                        })
+                        });
+                        if let Err(error) = &scanned
+                            && !is_interruption(error)
+                        {
+                            control.stop_run();
+                        }
+                        scanned
                     })
                 })
                 .collect();
@@ -120,12 +137,27 @@ impl SileroVad {
                 progress(&probabilities);
             }
 
-            // the first model's error wins when both fail
+            // a model's own failure wins over the interruption it caused in the
+            // other scan; otherwise the first model's error wins
+            let mut first_error = None;
             for scan in scans {
-                scan.join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
+                let scanned = scan
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                if let Err(error) = scanned {
+                    match &first_error {
+                        None => first_error = Some(error),
+                        Some(existing) if is_interruption(existing) && !is_interruption(&error) => {
+                            first_error = Some(error);
+                        }
+                        Some(_) => {}
+                    }
+                }
             }
-            Ok(probabilities)
+            match first_error {
+                Some(error) => Err(error),
+                None => Ok(probabilities),
+            }
         })
     }
 
@@ -141,6 +173,16 @@ impl SileroVad {
             }
         }
     }
+}
+
+/// Whether `error` only reports that the scan was stopped, rather than a failure
+fn is_interruption(error: &TranscriptionError) -> bool {
+    matches!(
+        error,
+        TranscriptionError::Control(
+            TranscriptionControlError::Cancelled | TranscriptionControlError::DeadlineExpired
+        )
+    )
 }
 
 #[derive(Debug, Clone)]
