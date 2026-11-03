@@ -28,13 +28,15 @@ const NATIVE_OVERLAP_SECONDS: f64 = 8.0;
 #[cfg(feature = "cuda")]
 const NATIVE_BATCH_SIZE: usize = 16;
 #[cfg(feature = "vad")]
-pub use planner::VadSegmentationConfig;
+pub use planner::{VadModel, VadSegmentationConfig};
 
-use self::execute::{RunRequest, execute_plan, transcribe_task};
+use self::execute::{RunRequest, TaskStream, execute_plan, transcribe_task};
+#[cfg(feature = "vad")]
+use self::execute::{execute_scoped_plan, is_interruption};
 use self::merge::merge_overlapping_windows;
 use self::planner::{ChunkTask, LongFormExecutionPlan, RegionTaskKind, build_fast_execution_plan};
 #[cfg(feature = "vad")]
-use self::planner::{build_vad_execution_plan, detect_speech_regions};
+use self::planner::{SpeechRegions, VadPlan, build_vad_execution_plan, detect_speech_regions};
 #[cfg(feature = "vad")]
 use self::vad::SileroVad;
 
@@ -56,7 +58,7 @@ use self::vad::SileroVad;
 pub struct LongFormTranscriptionPipeline {
     inner: TranscriptionPipeline,
     #[cfg(feature = "vad")]
-    vad: Option<SileroVad>,
+    vad: SileroVad,
     default_config: LongFormConfig,
 }
 
@@ -175,9 +177,12 @@ pub enum LongFormMode {
     /// Skip VAD and chunk the full recording with overlap windows
     #[default]
     Fast,
-    /// Detect speech with VAD before chunk planning
+    /// Detect speech with VAD and transcribe only the speech
     ///
-    /// Audio that fits one window is transcribed whole without a VAD scan
+    /// Each speech region is transcribed as soon as the scan has passed it, while
+    /// the scan goes on; the windows and transcript are those of scanning the
+    /// whole recording first. Audio that fits one window is transcribed whole
+    /// without a VAD scan
     #[cfg(feature = "vad")]
     Vad,
 }
@@ -261,6 +266,10 @@ impl LongFormTranscriptionPipeline {
     }
 
     /// Transcribe audio while preprocessing each planned ASR window once
+    ///
+    /// The plan is checked against `control`'s window limit before any window is
+    /// preprocessed. In VAD mode that means scanning the whole recording first, so
+    /// with a limit below `usize::MAX` the scan no longer overlaps transcription
     pub fn run_with_preprocessor<P: WindowPreprocessor + ?Sized>(
         &self,
         audio: &[f32],
@@ -327,6 +336,13 @@ impl LongFormTranscriptionPipeline {
         &self.default_config
     }
 
+    /// Transcribes each speech region's windows as soon as the VAD scan has
+    /// planned them
+    ///
+    /// The scan runs ahead on the CPU while the model works through the windows
+    /// planned so far, and plans the windows planning the whole recording first
+    /// would. A window limit is checked against the whole plan before any window
+    /// runs, so a run with one scans first
     #[cfg(feature = "vad")]
     fn run_vad_long_form<P: WindowPreprocessor + ?Sized>(
         &self,
@@ -339,19 +355,71 @@ impl LongFormTranscriptionPipeline {
             ..
         } = request;
         control.check()?;
-        let vad = self
-            .vad
-            .as_ref()
-            .ok_or_else(|| self.inner.bundle().missing_vad_error())
-            .map_err(PreprocessedTranscriptionError::from)?;
-        let probabilities = vad
-            .process(audio, control)
-            .map_err(PreprocessedTranscriptionError::from)?;
-        control.check()?;
-        let regions = detect_speech_regions(&probabilities, audio.len(), &config.segmentation);
-        let execution_plan = build_vad_execution_plan(&regions, &probabilities, config);
-        control.check_plan(execution_plan.tasks.len())?;
-        self.run_plan(request, execution_plan)
+        if control.max_windows() < usize::MAX {
+            // a failing scan stops its run, which must not stop the caller's control
+            let probabilities = self
+                .vad
+                .process(audio, config.segmentation.model, &control.run_scope())
+                .map_err(PreprocessedTranscriptionError::from)?;
+            control.check()?;
+            let regions = detect_speech_regions(&probabilities, audio.len(), &config.segmentation);
+            let execution_plan = build_vad_execution_plan(&regions, &probabilities, config);
+            control.check_plan(execution_plan.tasks.len())?;
+            return self.run_plan(request, execution_plan);
+        }
+
+        // the scan and the windows stop each other through the run's own signal
+        let run_control = control.run_scope();
+        let request = RunRequest {
+            control: &run_control,
+            ..request
+        };
+        let tasks = TaskStream::open();
+        let (planned, raw_tasks) = std::thread::scope(|scope| {
+            let (run_control, tasks) = (&run_control, &tasks);
+            // the pipeline is not `Sync`, so the scan gets its own handle on the
+            // VAD models
+            let vad = self.vad.clone();
+            let planner = scope.spawn(move || {
+                let _close = ClosePlan(tasks, run_control);
+                let planned = plan_while_scanning(&vad, audio, config, run_control, tasks);
+                if planned.is_err() {
+                    run_control.stop_run();
+                }
+                planned
+            });
+
+            let _stop = StopRunOnPanic(run_control);
+            let raw_tasks = execute_scoped_plan(&self.inner, request, tasks);
+            if raw_tasks.is_err() {
+                run_control.stop_run();
+            }
+            let planned = planner
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            (planned, raw_tasks)
+        });
+
+        // whichever side failed stopped the other, which reports only the stop
+        let raw_tasks = match raw_tasks {
+            Err(error) if !is_interruption(&error) => return Err(error),
+            raw_tasks => raw_tasks,
+        };
+        let execution_plan = match planned {
+            Ok(execution_plan) => execution_plan,
+            // a side that saw the other's stop reports it as a cancellation, so the
+            // caller's control says whether it was a cancellation or the deadline
+            Err(error @ TranscriptionError::Control(_)) => {
+                control.check()?;
+                return Err(raw_tasks.err().unwrap_or_else(|| error.into()));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let raw_tasks = raw_tasks?;
+        if execution_plan.tasks.is_empty() {
+            return Ok(TranscriptionResult::empty(duration_seconds(audio.len())));
+        }
+        Ok(self.build_plan_result(audio.len(), execution_plan, raw_tasks)?)
     }
 
     fn run_fast_long_form<P: WindowPreprocessor + ?Sized>(
@@ -397,7 +465,8 @@ impl LongFormTranscriptionPipeline {
             return Ok(TranscriptionResult::empty(duration_seconds(audio_len)));
         }
 
-        let raw_tasks = execute_plan(&self.inner, request, &execution_plan.tasks)?;
+        let tasks = TaskStream::complete(&execution_plan.tasks);
+        let raw_tasks = execute_plan(&self.inner, request, &tasks)?;
         Ok(self.build_plan_result(audio_len, execution_plan, raw_tasks)?)
     }
 
@@ -528,11 +597,9 @@ impl LongFormTranscriptionPipeline {
             #[cfg(feature = "vad")]
             RunPath::Planned(LongFormMode::Vad) => {
                 let control = TranscriptionControl::internal_unbounded();
-                let vad = self
+                let probabilities = self
                     .vad
-                    .as_ref()
-                    .ok_or_else(|| self.inner.bundle().missing_vad_error())?;
-                let probabilities = vad.process(audio, &control)?;
+                    .process(audio, config.segmentation.model, &control)?;
                 let regions =
                     detect_speech_regions(&probabilities, audio.len(), &config.segmentation);
                 build_vad_execution_plan(&regions, &probabilities, config)
@@ -583,6 +650,59 @@ fn validate_finite_samples(
     Err(TranscriptionError::InvalidAudioSample {
         index: source_offset + index,
     })
+}
+
+/// Scans `audio` for speech, adding each region's windows to `tasks` as soon as
+/// the region is final, and returns the whole plan
+#[cfg(feature = "vad")]
+fn plan_while_scanning(
+    vad: &SileroVad,
+    audio: &[f32],
+    config: &LongFormConfig,
+    control: &TranscriptionControl,
+    tasks: &TaskStream,
+) -> Result<LongFormExecutionPlan, TranscriptionError> {
+    let mut regions = SpeechRegions::new(audio.len(), &config.segmentation);
+    let mut plan = VadPlan::new(config);
+    let probabilities = vad.scan(audio, config.segmentation.model, control, |probabilities| {
+        for region in regions.push(probabilities) {
+            plan.add_region(region, probabilities);
+        }
+        tasks.extend(plan.tasks());
+    })?;
+    for region in regions.finish() {
+        plan.add_region(region, &probabilities);
+    }
+    tasks.extend(plan.tasks());
+    Ok(plan.finish())
+}
+
+/// Ends the plan when the planning thread finishes, also by panicking, so a
+/// window executor waiting on the next window never hangs
+#[cfg(feature = "vad")]
+struct ClosePlan<'a>(&'a TaskStream, &'a TranscriptionControl);
+
+#[cfg(feature = "vad")]
+impl Drop for ClosePlan<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.1.stop_run();
+        }
+        self.0.close();
+    }
+}
+
+/// Stops the run when the code holding it unwinds, so the scan stops at its next
+/// block rather than running to the end of the recording before the panic
+/// surfaces
+struct StopRunOnPanic<'a>(&'a TranscriptionControl);
+
+impl Drop for StopRunOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.stop_run();
+        }
+    }
 }
 
 fn identity_error(
@@ -685,6 +805,8 @@ mod tests {
     use super::{
         LongFormConfig, LongFormMode, RunPath, WindowPreprocessor, build_fast_execution_plan,
     };
+    #[cfg(all(feature = "cuda", feature = "vad"))]
+    use super::{VadModel, VadSegmentationConfig};
     #[cfg(feature = "vad")]
     use super::{detect_speech_regions, merge_overlap_region};
     #[cfg(all(feature = "cuda", feature = "vad"))]
@@ -700,6 +822,8 @@ mod tests {
     use crate::deployment::ParakeetDeployment;
     #[cfg(feature = "cuda")]
     use crate::error::TranscriptionError;
+    #[cfg(all(feature = "cuda", feature = "vad"))]
+    use crate::models::SileroVersion;
     #[cfg(feature = "cuda")]
     use crate::preprocessing::PreprocessedTranscriptionError;
     use crate::preprocessing::{AudioWindowMut, TranscriptionControl};
@@ -1225,6 +1349,29 @@ mod tests {
         }
     }
 
+    /// Fails window 1 only, so the other workers keep succeeding and must be
+    /// stopped by the run; on the batched path they would otherwise park at the
+    /// look-ahead gate and hang the join
+    #[cfg(feature = "cuda")]
+    struct FailingHook(RecordingHook);
+
+    #[cfg(feature = "cuda")]
+    impl WindowPreprocessor for FailingHook {
+        type Error = HookError;
+
+        fn process(
+            &self,
+            window: &mut AudioWindowMut<'_>,
+            control: &TranscriptionControl,
+        ) -> Result<(), Self::Error> {
+            self.0.process(window, control)?;
+            if window.index().get() == 1 {
+                return Err(HookError);
+            }
+            Ok(())
+        }
+    }
+
     /// A preprocessor error stops the parallel and batched workers, which join and
     /// return that error rather than finishing the plan, and leaves the caller's
     /// control uncancelled
@@ -1232,27 +1379,6 @@ mod tests {
     #[test]
     #[ignore = "needs a CUDA GPU and the native weights; `just gpu-parity` runs it on gpu0"]
     fn gpu_workers_join_after_the_first_preprocessor_error() {
-        /// Fails window 1 only, so the other workers keep succeeding and must be
-        /// stopped by the run; on the batched path they would otherwise park at the
-        /// look-ahead gate and hang the join
-        struct FailingHook(RecordingHook);
-
-        impl WindowPreprocessor for FailingHook {
-            type Error = HookError;
-
-            fn process(
-                &self,
-                window: &mut AudioWindowMut<'_>,
-                control: &TranscriptionControl,
-            ) -> Result<(), Self::Error> {
-                self.0.process(window, control)?;
-                if window.index().get() == 1 {
-                    return Err(HookError);
-                }
-                Ok(())
-            }
-        }
-
         let (pipeline, base) = native_pipeline();
         let audio = vec![0.0; LONG_AUDIO_SAMPLES];
 
@@ -1338,24 +1464,35 @@ mod tests {
         assert!(panicked, "the batched run should raise the worker's panic");
     }
 
-    /// Speech probabilities of the reference recording, from the native VAD and
-    /// from Silero itself
+    /// Speech probabilities of the reference recording under `model`, from the
+    /// native VAD and from Silero itself; fusion takes each window's higher Silero
+    /// probability
     #[cfg(all(feature = "cuda", feature = "vad"))]
-    fn reference_probabilities() -> (Vec<f32>, Vec<f32>, usize) {
-        let reference = NemoReference::silero();
-        let audio = reference.f32("audio");
+    fn reference_probabilities(model: VadModel) -> (Vec<f32>, Vec<f32>, usize) {
+        let silero = |version| -> Vec<f32> {
+            NemoReference::silero(version)
+                .f32("probs")
+                .into_iter()
+                .collect()
+        };
+        let expected = match model {
+            VadModel::SileroV5 => silero(SileroVersion::V5),
+            VadModel::SileroV6 => silero(SileroVersion::V6),
+            VadModel::SileroFusion => silero(SileroVersion::V5)
+                .into_iter()
+                .zip(silero(SileroVersion::V6))
+                .map(|(v5, v6)| v5.max(v6))
+                .collect(),
+        };
+
+        let audio = NemoReference::silero(SileroVersion::V6).f32("audio");
         let audio = audio.as_slice().expect("contiguous audio");
         let vad = SileroVad::from_bundle(&nemo_parity_bundle(ParakeetDeployment::v3()))
-            .expect("native VAD should load")
-            .expect("the native bundle should have a VAD model");
+            .expect("native VAD should load");
         let ours = vad
-            .process(audio, &TranscriptionControl::internal_unbounded())
+            .process(audio, model, &TranscriptionControl::internal_unbounded())
             .expect("VAD scan");
-        (
-            ours,
-            reference.f32("probs").into_iter().collect(),
-            audio.len(),
-        )
+        (ours, expected, audio.len())
     }
 
     /// Regions and planned ASR windows `(start, end)` for one set of probabilities
@@ -1374,22 +1511,38 @@ mod tests {
         (regions, windows)
     }
 
-    /// The native VAD's probabilities plan the same speech regions and ASR windows
-    /// as Silero's own on the reference recording, with the native defaults and with
-    /// 3 s windows that make the planner split the region on its probabilities
+    /// For each VAD model, the native VAD's probabilities plan the same speech
+    /// regions and ASR windows as Silero's own on the reference recording, with the
+    /// model's defaults and with 3 s windows that make the planner split the region
+    /// on its probabilities
     #[cfg(all(feature = "cuda", feature = "vad"))]
     #[test]
     #[ignore = "reads Silero references from /shared/datasets/parakeet-ref"]
     fn nemo_parity_native_vad_plans_the_reference_windows() {
-        let (ours, expected, audio_len) = reference_probabilities();
-        let defaults = LongFormConfig::for_bundle(&nemo_parity_bundle(ParakeetDeployment::v3()));
-        let mut short_windows = defaults.clone();
-        short_windows.overlap.max_model_samples = 48_000;
+        for model in [
+            VadModel::SileroV5,
+            VadModel::SileroV6,
+            VadModel::SileroFusion,
+        ] {
+            let (ours, expected, audio_len) = reference_probabilities(model);
+            let mut defaults =
+                LongFormConfig::for_bundle(&nemo_parity_bundle(ParakeetDeployment::v3()));
+            defaults.segmentation = VadSegmentationConfig::for_model(model);
+            let mut short_windows = defaults.clone();
+            short_windows.overlap.max_model_samples = 48_000;
 
-        for config in [defaults, short_windows] {
-            let plan = speech_plan(&ours, audio_len, &config);
-            assert!(!plan.0.is_empty(), "the reference recording is speech");
-            assert_eq!(plan, speech_plan(&expected, audio_len, &config));
+            for config in [defaults, short_windows] {
+                let plan = speech_plan(&ours, audio_len, &config);
+                assert!(
+                    !plan.0.is_empty(),
+                    "{model:?}: the reference recording is speech"
+                );
+                assert_eq!(
+                    plan,
+                    speech_plan(&expected, audio_len, &config),
+                    "{model:?}"
+                );
+            }
         }
     }
 
@@ -1397,7 +1550,7 @@ mod tests {
     /// single-input limit, with gaps the VAD must leave out
     #[cfg(all(feature = "cuda", feature = "vad"))]
     fn sparse_speech() -> (Vec<f32>, Vec<usize>) {
-        let speech = NemoReference::silero().f32("audio");
+        let speech = NemoReference::silero(SileroVersion::V6).f32("audio");
         let speech = speech.as_slice().expect("contiguous audio");
         let gap = vec![0.0; 20 * SAMPLE_RATE];
         let audio = [speech, &gap, speech, &gap, speech].concat();
@@ -1425,12 +1578,13 @@ mod tests {
         audio: &[f32],
         config: &LongFormConfig,
     ) -> Vec<(usize, usize, usize)> {
-        let vad = pipeline
+        let probabilities = pipeline
             .vad
-            .as_ref()
-            .expect("the native bundle has a VAD model");
-        let probabilities = vad
-            .process(audio, &TranscriptionControl::internal_unbounded())
+            .process(
+                audio,
+                config.segmentation.model,
+                &TranscriptionControl::internal_unbounded(),
+            )
             .expect("VAD scan");
         let (_, windows) = speech_plan(&probabilities, audio.len(), config);
         windows
@@ -1438,6 +1592,105 @@ mod tests {
             .enumerate()
             .map(|(index, (start, end))| (index, start, end))
             .collect()
+    }
+
+    /// The reference speech and 20 s of silence, 40 times over: 20 minutes, long
+    /// enough that the native VAD scores it in several blocks and the run streams
+    #[cfg(all(feature = "cuda", feature = "vad"))]
+    fn long_sparse_speech() -> Vec<f32> {
+        let speech = NemoReference::silero(SileroVersion::V6).f32("audio");
+        let speech = speech.as_slice().expect("contiguous audio");
+        let gap = vec![0.0; 20 * SAMPLE_RATE];
+        [speech, &gap].concat().repeat(40)
+    }
+
+    /// Without a window limit, VAD runs transcribe windows while the scan goes on;
+    /// every path still preprocesses exactly the planned windows and returns the
+    /// transcript of scanning first
+    #[cfg(all(feature = "cuda", feature = "vad"))]
+    #[test]
+    #[ignore = "needs a CUDA GPU and the native weights; `just gpu-parity` runs it on gpu0"]
+    fn gpu_streamed_vad_matches_scanning_first() {
+        let (pipeline, base) = native_vad_pipeline();
+        let audio = long_sparse_speech();
+
+        for path in [
+            ExecutionPath::Serial,
+            ExecutionPath::Parallel,
+            ExecutionPath::Batched,
+        ] {
+            let config = path.config(&base);
+            let planned = planned_vad_windows(&pipeline, &audio, &config);
+            assert!(
+                planned.len() > config.batch_size,
+                "{path:?} planned {planned:?}"
+            );
+            let scanned_first = pipeline
+                .run_with_preprocessor(
+                    &audio,
+                    &config,
+                    &recording_control(planned.len()),
+                    &super::IdentityPreprocessor,
+                )
+                .unwrap_or_else(|error| panic!("{path:?} scan-first run failed: {error}"));
+            let hook = RecordingHook(Arc::new(Mutex::new(Vec::new())));
+
+            let streamed = pipeline
+                .run_with_preprocessor(
+                    &audio,
+                    &config,
+                    &TranscriptionControl::internal_unbounded(),
+                    &hook,
+                )
+                .unwrap_or_else(|error| panic!("{path:?} streamed run failed: {error}"));
+
+            let mut observed = observed_hooks(&hook);
+            if !matches!(path, ExecutionPath::Serial) {
+                observed.sort_unstable();
+            }
+            assert_eq!(observed, planned, "{path:?} preprocessed windows");
+            assert!(!streamed.text.is_empty(), "{path:?} transcribed no speech");
+            assert_eq!(streamed, scanned_first, "{path:?} transcript");
+        }
+    }
+
+    /// A preprocessor error while the scan goes on stops the scan and every worker,
+    /// and the run reports the error rather than the stop
+    #[cfg(all(feature = "cuda", feature = "vad"))]
+    #[test]
+    #[ignore = "needs a CUDA GPU and the native weights; `just gpu-parity` runs it on gpu0"]
+    fn gpu_streamed_vad_reports_a_preprocessor_error() {
+        let (pipeline, base) = native_vad_pipeline();
+        let audio = long_sparse_speech();
+
+        for path in [
+            ExecutionPath::Serial,
+            ExecutionPath::Parallel,
+            ExecutionPath::Batched,
+        ] {
+            let config = path.config(&base);
+            let planned = planned_vad_windows(&pipeline, &audio, &config).len();
+            let hook = FailingHook(RecordingHook(Arc::new(Mutex::new(Vec::new()))));
+            let control = TranscriptionControl::internal_unbounded();
+
+            let error = pipeline
+                .run_with_preprocessor(&audio, &config, &control, &hook)
+                .expect_err("a preprocessor failure should stop the run");
+
+            assert!(
+                matches!(
+                    error,
+                    PreprocessedTranscriptionError::Preprocessing(HookError)
+                ),
+                "{path:?} returned {error}"
+            );
+            let observed = observed_hooks(&hook.0).len();
+            assert!(
+                observed < planned,
+                "{path:?} preprocessed all {planned} windows after the first error"
+            );
+            assert_eq!(control.check(), Ok(()), "{path:?} cancelled the caller");
+        }
     }
 
     /// In VAD mode every path preprocesses exactly the planned speech windows, and

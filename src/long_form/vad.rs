@@ -5,33 +5,184 @@ use crate::constants::{VAD_CONTEXT_SAMPLES, VAD_WINDOW_SAMPLES};
 #[cfg(target_os = "macos")]
 use crate::coreml::SileroVadCoreMlModel;
 use crate::error::TranscriptionError;
-use crate::models::{ModelBundle, RuntimeBundle};
+use crate::long_form::{StopRunOnPanic, VadModel};
+use crate::models::{ModelBundle, RuntimeBundle, SileroVersion};
 #[cfg(feature = "cuda")]
 use crate::native::silero::{SileroModel, SileroState};
-use crate::preprocessing::TranscriptionControl;
+use crate::preprocessing::{TranscriptionControl, TranscriptionControlError};
+use std::path::PathBuf;
+use std::sync::mpsc;
 
 /// Silero VAD owner: window chunking, context carry-over, tail padding, and
 /// per-recording recurrent state reset
 ///
-/// Runtimes only classify prepared windows and advance the opaque state
+/// Holds every Silero model the bundle provides and runs the ones a
+/// [`VadModel`] names. Runtimes only classify prepared windows and advance the
+/// opaque state
 #[derive(Debug, Clone)]
 pub(crate) struct SileroVad {
-    model: VadModelInner,
+    v5: Slot,
+    v6: Slot,
+}
+
+/// One Silero version: its model, or where the bundle expected it
+#[derive(Debug, Clone)]
+enum Slot {
+    Loaded(VadModelInner),
+    Missing(PathBuf),
 }
 
 impl SileroVad {
-    /// Load the VAD model a bundle provides, if it provides one
-    pub(crate) fn from_bundle(bundle: &ModelBundle) -> Result<Option<Self>, TranscriptionError> {
-        VadModelInner::from_bundle(bundle).map(|model| model.map(|model| Self { model }))
+    /// Load every Silero model the bundle provides; a missing one fails only the
+    /// runs that need it
+    pub(crate) fn from_bundle(bundle: &ModelBundle) -> Result<Self, TranscriptionError> {
+        let slot = |version| {
+            let path = bundle.runtime().vad_paths().get(version);
+            if !path.exists() {
+                return Ok(Slot::Missing(path.to_path_buf()));
+            }
+            VadModelInner::load(bundle.runtime(), version, path).map(Slot::Loaded)
+        };
+        Ok(Self {
+            v5: slot(SileroVersion::V5)?,
+            v6: slot(SileroVersion::V6)?,
+        })
     }
 
+    /// Speech probability of each window of `audio` under `model`
+    ///
+    /// A model failure stops `control`'s run, as in [`Self::scan`]
     pub(crate) fn process(
         &self,
         audio: &[f32],
+        model: VadModel,
         control: &TranscriptionControl,
     ) -> Result<Vec<f32>, TranscriptionError> {
-        self.model.process(audio, control)
+        self.scan(audio, model, control, |_| {})
     }
+
+    /// [`Self::process`], calling `progress` with every probability so far each time
+    /// more are ready, so the caller can act on the start of a recording while the
+    /// rest is scanned
+    ///
+    /// A model failure stops `control`'s run, so pass a run scope
+    /// ([`TranscriptionControl::run_scope`]) rather than a caller's own control
+    pub(crate) fn scan(
+        &self,
+        audio: &[f32],
+        model: VadModel,
+        control: &TranscriptionControl,
+        mut progress: impl FnMut(&[f32]),
+    ) -> Result<Vec<f32>, TranscriptionError> {
+        let models = match model {
+            VadModel::SileroV5 => vec![self.model(SileroVersion::V5)?],
+            VadModel::SileroV6 => vec![self.model(SileroVersion::V6)?],
+            VadModel::SileroFusion => vec![
+                self.model(SileroVersion::V5)?,
+                self.model(SileroVersion::V6)?,
+            ],
+        };
+
+        // each model's recurrence is one thread's critical path, so running both at
+        // once costs little more than running one. Core ML models are `Send` but not
+        // `Sync`, so each thread gets its own clone, which shares the weights
+        //
+        // a scan that fails or panics stops the run, so the other scan and the
+        // run's windows stop instead of running to the end of the recording before
+        // the error surfaces. An interruption stops nothing: the other scan shares
+        // the same cancellation and deadline, and reports them itself
+        std::thread::scope(|scope| {
+            let (sender, receiver) = mpsc::channel();
+            let scans: Vec<_> = models
+                .into_iter()
+                .enumerate()
+                .map(|(slot, model)| {
+                    let model = model.clone();
+                    let sender = sender.clone();
+                    scope.spawn(move || {
+                        let _stop = StopRunOnPanic(control);
+                        // the receiver outlives every scan, so a send cannot fail
+                        let scanned = model.process(audio, control, |block| {
+                            let _ = sender.send((slot, block.to_vec()));
+                        });
+                        if let Err(error) = &scanned
+                            && !is_interruption(error)
+                        {
+                            control.stop_run();
+                        }
+                        scanned
+                    })
+                })
+                .collect();
+            drop(sender);
+
+            // fusion keeps each window's higher probability, once both models have
+            // scored it
+            let mut scores = vec![Vec::new(); scans.len()];
+            let mut probabilities = Vec::new();
+            for (slot, block) in receiver {
+                scores[slot].extend(block);
+                let ready = scores.iter().map(Vec::len).min().unwrap_or(0);
+                if ready == probabilities.len() {
+                    continue;
+                }
+                // every model has scored a window below `ready`
+                probabilities.extend((probabilities.len()..ready).map(|index| {
+                    scores
+                        .iter()
+                        .map(|model_scores| model_scores[index])
+                        .reduce(f32::max)
+                        .unwrap_or_default()
+                }));
+                progress(&probabilities);
+            }
+
+            // a model's own failure wins over the interruption it caused in the
+            // other scan; otherwise the first model's error wins
+            let mut first_error = None;
+            for scan in scans {
+                let scanned = scan
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                if let Err(error) = scanned {
+                    match &first_error {
+                        None => first_error = Some(error),
+                        Some(existing) if is_interruption(existing) && !is_interruption(&error) => {
+                            first_error = Some(error);
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+            match first_error {
+                Some(error) => Err(error),
+                None => Ok(probabilities),
+            }
+        })
+    }
+
+    fn model(&self, version: SileroVersion) -> Result<&VadModelInner, TranscriptionError> {
+        let slot = match version {
+            SileroVersion::V5 => &self.v5,
+            SileroVersion::V6 => &self.v6,
+        };
+        match slot {
+            Slot::Loaded(model) => Ok(model),
+            Slot::Missing(path) => {
+                Err(TranscriptionError::MissingModelAsset { path: path.clone() })
+            }
+        }
+    }
+}
+
+/// Whether `error` only reports that the scan was stopped, rather than a failure
+fn is_interruption(error: &TranscriptionError) -> bool {
+    matches!(
+        error,
+        TranscriptionError::Control(
+            TranscriptionControlError::Cancelled | TranscriptionControlError::DeadlineExpired
+        )
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -43,49 +194,48 @@ enum VadModelInner {
     // no VAD runtime without Core ML or the native weights; keeps the matches
     // below compiling
     #[cfg(not(any(target_os = "macos", feature = "cuda")))]
-    #[expect(dead_code, reason = "from_bundle never builds a VAD model here")]
+    #[expect(dead_code, reason = "load never builds a VAD model here")]
     Unsupported,
 }
 
 impl VadModelInner {
-    fn from_bundle(bundle: &ModelBundle) -> Result<Option<Self>, TranscriptionError> {
-        match bundle.runtime() {
-            RuntimeBundle::CoreMl(layout) => {
-                if !layout.vad_dir().exists() {
-                    return Ok(None);
-                }
-
+    fn load(
+        runtime: &RuntimeBundle,
+        version: SileroVersion,
+        path: &std::path::Path,
+    ) -> Result<Self, TranscriptionError> {
+        match runtime {
+            RuntimeBundle::CoreMl(_) => {
+                // every Silero version takes the same Core ML inputs and outputs
+                let _ = version;
                 #[cfg(target_os = "macos")]
                 {
-                    Ok(Some(Self::CoreMl(SileroVadCoreMlModel::new(
-                        layout.vad_dir(),
-                    )?)))
+                    Ok(Self::CoreMl(SileroVadCoreMlModel::new(path)?))
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
+                    let _ = path;
                     Err(TranscriptionError::UnsupportedPlatform)
                 }
             }
             #[cfg(feature = "cuda")]
-            RuntimeBundle::Native(layout) => {
-                if !layout.vad_path().exists() {
-                    return Ok(None);
-                }
-                Ok(Some(Self::Native(SileroModel::open(layout.vad_path())?)))
-            }
+            RuntimeBundle::Native(_) => Ok(Self::Native(SileroModel::open(path, version)?)),
         }
     }
 
+    /// Speech probability of each window of `audio`, also passed to `report` in
+    /// order as they are scored
     fn process(
         &self,
         audio: &[f32],
         control: &TranscriptionControl,
+        report: impl FnMut(&[f32]),
     ) -> Result<Vec<f32>, TranscriptionError> {
         match self {
             #[cfg(target_os = "macos")]
             Self::CoreMl(model) => {
                 let mut state = vec![0.0f32; 2 * VAD_STATE_SIZE];
-                process_blocks(audio, control, 1, |window, probabilities| {
+                process_blocks(audio, control, 1, report, |window, probabilities| {
                     let (hidden_state, cell_state) = state.split_at_mut(VAD_STATE_SIZE);
                     let outputs = model.run(window, hidden_state, cell_state)?;
                     copy_state_vec(&outputs.hidden_state, hidden_state)?;
@@ -101,6 +251,7 @@ impl VadModelInner {
                     audio,
                     control,
                     model.block_windows(),
+                    report,
                     |windows, probabilities| {
                         model.classify(windows, &mut state, probabilities);
                         Ok(())
@@ -109,8 +260,7 @@ impl VadModelInner {
             }
             #[cfg(not(any(target_os = "macos", feature = "cuda")))]
             Self::Unsupported => {
-                let _ = audio;
-                let _ = control;
+                let _ = (audio, control, report);
                 Err(TranscriptionError::UnsupportedPlatform)
             }
         }
@@ -121,24 +271,32 @@ impl VadModelInner {
 #[cfg(any(target_os = "macos", feature = "cuda", test))]
 const WINDOW_INPUT_SAMPLES: usize = VAD_CONTEXT_SAMPLES + VAD_WINDOW_SAMPLES;
 
+/// Probabilities scored between reports, about 8 s of audio; a Core ML block is one
+/// window, and reporting each would cost a channel send per 32 ms of audio
+#[cfg(any(target_os = "macos", feature = "cuda", test))]
+const REPORT_WINDOWS: usize = 256;
+
 /// Run one classifier over every window of a recording, `block_windows` at a time
 ///
 /// The caller starts the recurrent state at zero for each recording, and
 /// `classify` pushes one probability per window, in order. Each window is
 /// `VAD_CONTEXT_SAMPLES` from the previous chunk (zeros for the first) followed by
 /// one chunk of `VAD_WINDOW_SAMPLES`; a short final chunk is padded with its last
-/// sample. Cancellation is checked before each block
+/// sample. `report` gets the new probabilities after any block that brings them to
+/// [`REPORT_WINDOWS`], and after the last. Cancellation is checked before each block
 #[cfg(any(target_os = "macos", feature = "cuda", test))]
 fn process_blocks(
     audio: &[f32],
     control: &TranscriptionControl,
     block_windows: usize,
+    mut report: impl FnMut(&[f32]),
     mut classify: impl FnMut(&[f32], &mut Vec<f32>) -> Result<(), TranscriptionError>,
 ) -> Result<Vec<f32>, TranscriptionError> {
     let count = audio.len().div_ceil(VAD_WINDOW_SAMPLES);
     let block_windows = block_windows.max(1);
     let mut probabilities = Vec::with_capacity(count);
     let mut inputs = vec![0.0f32; block_windows.min(count) * WINDOW_INPUT_SAMPLES];
+    let mut reported = 0;
 
     for first in (0..count).step_by(block_windows) {
         control.check()?;
@@ -156,6 +314,10 @@ fn process_blocks(
         let before = probabilities.len();
         classify(inputs, &mut probabilities)?;
         debug_assert_eq!(probabilities.len(), before + windows);
+        if probabilities.len() - reported >= REPORT_WINDOWS || probabilities.len() == count {
+            report(&probabilities[reported..]);
+            reported = probabilities.len();
+        }
     }
 
     Ok(probabilities)
@@ -194,7 +356,7 @@ fn copy_state_vec(values: &[f32], state: &mut [f32]) -> Result<(), Transcription
 
 #[cfg(test)]
 mod tests {
-    use super::{WINDOW_INPUT_SAMPLES, process_blocks};
+    use super::{REPORT_WINDOWS, WINDOW_INPUT_SAMPLES, process_blocks};
     use crate::constants::{VAD_CONTEXT_SAMPLES, VAD_WINDOW_SAMPLES};
     use crate::preprocessing::TranscriptionControl;
 
@@ -203,18 +365,32 @@ mod tests {
     }
 
     /// Every window the classifier sees, in order, with `block_windows` per call
+    ///
+    /// Also checks the reports: they add up to the probabilities, and every one but
+    /// the last holds at least `REPORT_WINDOWS`
     fn windows_seen(audio: &[f32], block_windows: usize) -> Vec<Vec<f32>> {
         let mut seen = Vec::new();
-        let probabilities = process_blocks(audio, &control(), block_windows, |inputs, out| {
-            assert!(inputs.len() <= block_windows * WINDOW_INPUT_SAMPLES);
-            for input in inputs.as_chunks::<WINDOW_INPUT_SAMPLES>().0 {
-                seen.push(input.to_vec());
-                out.push(seen.len() as f32);
-            }
-            Ok(())
-        })
+        let mut reports = Vec::new();
+        let probabilities = process_blocks(
+            audio,
+            &control(),
+            block_windows,
+            |block| reports.push(block.to_vec()),
+            |inputs, out| {
+                assert!(inputs.len() <= block_windows * WINDOW_INPUT_SAMPLES);
+                for input in inputs.as_chunks::<WINDOW_INPUT_SAMPLES>().0 {
+                    seen.push(input.to_vec());
+                    out.push(seen.len() as f32);
+                }
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(probabilities.len(), seen.len());
+        assert_eq!(reports.concat(), probabilities);
+        if let Some((_, earlier)) = reports.split_last() {
+            assert!(earlier.iter().all(|report| report.len() >= REPORT_WINDOWS));
+        }
         seen
     }
 
@@ -256,9 +432,26 @@ mod tests {
     }
 
     #[test]
+    fn reports_cover_every_window_in_order() {
+        let audio = vec![0.25f32; VAD_WINDOW_SAMPLES * (2 * REPORT_WINDOWS + 7)];
+
+        // one window per block reports every `REPORT_WINDOWS`, larger blocks after
+        // the block that crosses it
+        for block_windows in [1, 100, 3 * REPORT_WINDOWS] {
+            windows_seen(&audio, block_windows);
+        }
+    }
+
+    #[test]
     fn empty_audio_never_invokes_the_classifier() {
-        let probabilities =
-            process_blocks(&[], &control(), 4, |_, _| panic!("classifier must not run")).unwrap();
+        let probabilities = process_blocks(
+            &[],
+            &control(),
+            4,
+            |_| panic!("nothing to report"),
+            |_, _| panic!("classifier must not run"),
+        )
+        .unwrap();
         assert!(probabilities.is_empty());
     }
 
@@ -267,20 +460,26 @@ mod tests {
         let audio = vec![0.0f32; VAD_WINDOW_SAMPLES * 6];
         let control = control();
         let mut calls = 0;
-        let error = process_blocks(&audio, &control, 2, |inputs, out| {
-            calls += 1;
-            if calls == 1 {
-                control.cancel();
-            }
-            out.extend(
-                inputs
-                    .as_chunks::<WINDOW_INPUT_SAMPLES>()
-                    .0
-                    .iter()
-                    .map(|_| 0.1),
-            );
-            Ok(())
-        })
+        let error = process_blocks(
+            &audio,
+            &control,
+            2,
+            |_| {},
+            |inputs, out| {
+                calls += 1;
+                if calls == 1 {
+                    control.cancel();
+                }
+                out.extend(
+                    inputs
+                        .as_chunks::<WINDOW_INPUT_SAMPLES>()
+                        .0
+                        .iter()
+                        .map(|_| 0.1),
+                );
+                Ok(())
+            },
+        )
         .expect_err("cancelled scan");
 
         assert_eq!(calls, 1);

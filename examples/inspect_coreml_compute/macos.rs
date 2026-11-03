@@ -19,8 +19,12 @@ use scriptrs::ModelBundle;
 const ENCODER_DIR: &str = "parakeet-v2/encoder.mlmodelc";
 const DECODER_DIR: &str = "parakeet-v2/decoder.mlmodelc";
 const JOINT_DECISION_DIR: &str = "parakeet-v2/joint-decision.mlmodelc";
+/// Silero VAD 5.1.2 and 6.2.3, the two models Silero fusion runs
 #[cfg(feature = "vad")]
-const VAD_DIR: &str = "vad/silero-vad.mlmodelc";
+const VAD_DIRS: [(&str, &str); 2] = [
+    ("vad v5", "vad/silero-vad.mlmodelc"),
+    ("vad v6", "vad/silero-vad-v6.mlmodelc"),
+];
 
 pub fn main() -> ExitCode {
     match run() {
@@ -64,12 +68,14 @@ fn run() -> Result<()> {
 
     #[cfg(feature = "vad")]
     if args.long_form {
-        inspect_model(
-            "vad",
-            &bundle.root().join(VAD_DIR),
-            args.compute_units,
-            args.show_ops,
-        )?;
+        for (name, dir) in VAD_DIRS {
+            inspect_model(
+                name,
+                &bundle.root().join(dir),
+                args.compute_units,
+                args.show_ops,
+            )?;
+        }
     }
 
     #[cfg(not(feature = "vad"))]
@@ -150,7 +156,7 @@ fn print_usage() {
 Options:
   --models-dir <dir>         local scriptrs model bundle directory
   --pretrained               download models via the online feature
-  --long-form                include the Silero VAD model
+  --long-form                include the Silero VAD models
   --compute-units <mode>     cpu_only | cpu_and_gpu | all | cpu_and_neural_engine
   --show-ops <n>             print the first n ML Program operations"
     );

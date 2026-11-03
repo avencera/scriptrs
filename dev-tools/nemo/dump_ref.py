@@ -1,9 +1,10 @@
-"""Dump NeMo reference activations for Parakeet TDT 0.6B v2/v3 and Silero VAD v5
+"""Dump NeMo reference activations for Parakeet TDT 0.6B v2/v3 and Silero VAD v5 and v6
 
 Writes <out>/b1.safetensors and <out>/b8.safetensors (plus .json metadata): per-stage
 encoder activations (fp32, TF32 off), a step-by-step greedy TDT decode trace per
 utterance, and a bf16-autocast encoder output for tolerance scale. With --vad-audio it
-also writes <out>/vad.safetensors from the Silero v5 TorchScript model. With --long-audio
+also writes <out>/silero-v5/vad.safetensors and <out>/silero-v6/vad.safetensors from Silero's
+TorchScript models. With --long-audio
 it writes long-full and long-local sets for one long excerpt, the second with NeMo's
 long-form recipe (rel_pos_local_attn [256, 256])
 
@@ -247,17 +248,17 @@ def run_set(model, rows, device, audios=None):
 
 
 @torch.no_grad()
-def dump_vad(out, audio_path):
-    """Silero v5 probabilities for every 512-sample window of one file, plus window 0's stages
+def dump_vad(out, audio_path, version):
+    """One Silero version's probabilities for every 512-sample window of one file, plus window 0's stages
 
     Mirrors scriptrs `process_windows`: zero state per recording, 64 context samples from
     the previous chunk, and a short final chunk padded with its last sample
     """
-    import importlib.resources
+    import silero
 
-    jit = torch.jit.load(
-        str(importlib.resources.files("silero_vad").joinpath("data/silero_vad.jit")), map_location="cpu"
-    )
+    out = out / f"silero-{version}"
+    out.mkdir(parents=True, exist_ok=True)
+    jit = torch.jit.load(str(silero.jit_path(version)), map_location="cpu")
     model = jit._model
     audio = torch.from_numpy(sf.read(audio_path, dtype="float32")[0])
     window, context_len = 512, 64
@@ -288,7 +289,7 @@ def dump_vad(out, audio_path):
     save_file({k: v.contiguous() for k, v in tensors.items()}, str(out / "vad.safetensors"))
     meta = {"audio": audio_path, "windows": len(probs), "keys": {k: list(v.shape) for k, v in tensors.items()}}
     (out / "vad.json").write_text(json.dumps(meta, indent=1))
-    print("vad", meta)
+    print(f"vad {version}", meta)
 
 
 # NeMo's long-form recipe, as the 2026-10-23 profile ran it on the 1 h Earnings-21 file
@@ -332,7 +333,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--version", choices=sorted(NEMO_PATHS), required=True)
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--vad-audio", help="also dump Silero v5 references for this 16 kHz wav")
+    ap.add_argument("--vad-audio", help="also dump Silero v5 and v6 references for this 16 kHz wav")
     ap.add_argument("--long-audio", help="dump only the long-full and long-local sets from this 16 kHz wav")
     ap.add_argument("--long-offset", type=float, default=300.0, help="excerpt start in seconds")
     ap.add_argument("--long-seconds", type=float, default=120.0, help="excerpt length in seconds")
@@ -344,7 +345,8 @@ def main():
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
     if args.vad_audio:
-        dump_vad(out, args.vad_audio)
+        for version in ("v5", "v6"):
+            dump_vad(out, args.vad_audio, version)
     model = load_model(args.version, device)
     if args.long_audio:
         dump_long(model, out, args.long_audio, args.long_offset, args.long_seconds, device)

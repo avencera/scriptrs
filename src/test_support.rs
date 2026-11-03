@@ -53,10 +53,15 @@ impl NemoReference {
         Self::open_in(dir, set)
     }
 
-    /// Silero VAD v5 probabilities for one LibriSpeech file (`silero-v5/vad`)
+    /// One Silero VAD version's probabilities for one LibriSpeech file
+    /// (`silero-v5/vad` or `silero-v6/vad`)
     #[cfg(all(feature = "cuda", feature = "vad"))]
-    pub(crate) fn silero() -> Self {
-        Self::open_in(reference_root().join("silero-v5"), "vad")
+    pub(crate) fn silero(version: crate::models::SileroVersion) -> Self {
+        let dir = match version {
+            crate::models::SileroVersion::V5 => "silero-v5",
+            crate::models::SileroVersion::V6 => "silero-v6",
+        };
+        Self::open_in(reference_root().join(dir), "vad")
     }
 
     /// The tensor dump of NeMo's streaming run of `model` (`nemotron-en` or

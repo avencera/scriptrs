@@ -137,9 +137,10 @@ class Pipeline:
         ``~/.cache/huggingface/hub``; later calls load from the cache. Setting
         ``SCRIPTRS_MODELS_DIR`` loads a local directory instead, as
         :meth:`from_dir` does.
-        With ``vad``, the Silero VAD model is downloaded too, and long recordings
-        are split at detected speech instead of at fixed intervals, which helps
-        when most of a recording is silence or noise.
+        With ``vad``, the Silero VAD v5 and v6 models are downloaded too, and long
+        recordings are split at speech instead of at fixed intervals, which helps
+        when most of a recording is silence or noise. Each window counts as speech
+        when the higher of its v5 and v6 speech probabilities is at least 0.6.
 
         Raises :class:`ScriptrsError` with code ``model_download`` when a
         download fails, or ``cuda`` when Linux has no NVIDIA driver.

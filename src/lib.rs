@@ -63,12 +63,13 @@
 //!
 //! Select a version with [`ParakeetDeployment::v2`] or [`ParakeetDeployment::v3`]
 //!
-//! With `vad`, add:
+//! With `vad`, add both Silero VAD models:
 //!
 //! ```text
 //! models/
 //!   vad/
-//!     silero-vad.mlmodelc/
+//!     silero-vad.mlmodelc/       # Silero VAD 5.1.2
+//!     silero-vad-v6.mlmodelc/    # Silero VAD 6.2.3
 //! ```
 //!
 //! You can force local model resolution with an environment variable:
@@ -189,12 +190,12 @@ pub use language::{
     FilteredToken, LanguageSelection, ParakeetLanguage, Script, TopKCandidates, TopKPair,
     V3_LANGUAGES, detect_language_from_tokens, filter_top_k_language, select_language_from_logits,
 };
-#[cfg(feature = "vad")]
-pub use long_form::VadSegmentationConfig;
 #[cfg(feature = "long-form")]
 pub use long_form::{
     LongFormConfig, LongFormMode, LongFormTranscriptionPipeline, OverlapChunkConfig,
 };
+#[cfg(feature = "vad")]
+pub use long_form::{VadModel, VadSegmentationConfig};
 pub use model_io::{DecodedJointStep, EncoderOutputs, JointOutputs, decode_joint_outputs};
 pub use models::ModelBundle;
 #[cfg(feature = "online")]

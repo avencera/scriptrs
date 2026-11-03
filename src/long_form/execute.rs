@@ -7,7 +7,7 @@ use std::sync::{Condvar, Mutex, PoisonError};
 use std::thread;
 
 use super::planner::ChunkTask;
-use super::{LongFormConfig, validate_finite_samples};
+use super::{LongFormConfig, StopRunOnPanic, validate_finite_samples};
 use crate::decode::RawTranscription;
 use crate::error::TranscriptionError;
 use crate::pipeline::{ChunkPreparer, PreparedWindow, TranscriptionPipeline};
@@ -47,27 +47,137 @@ impl<'a, P: ?Sized> RunRequest<'a, P> {
     }
 }
 
+/// A plan's windows, all known up front or added while the VAD scan finds more
+///
+/// Executors take windows by index and wait for one not planned yet, so the model
+/// can start on a recording's first speech while the rest is still scanned
+pub(super) struct TaskStream {
+    state: Mutex<TaskStreamState>,
+    changed: Condvar,
+}
+
+struct TaskStreamState {
+    tasks: Vec<ChunkTask>,
+    /// Whether the plan is complete
+    closed: bool,
+}
+
+impl TaskStream {
+    /// A plan whose windows are all known
+    pub(super) fn complete(tasks: &[ChunkTask]) -> Self {
+        Self::with_state(tasks.to_vec(), true)
+    }
+
+    /// A plan still being built, until [`Self::close`]
+    #[cfg(feature = "vad")]
+    pub(super) fn open() -> Self {
+        Self::with_state(Vec::new(), false)
+    }
+
+    fn with_state(tasks: Vec<ChunkTask>, closed: bool) -> Self {
+        Self {
+            state: Mutex::new(TaskStreamState { tasks, closed }),
+            changed: Condvar::new(),
+        }
+    }
+
+    /// Adds the windows planned since the last call, `planned` being every window
+    /// planned so far
+    #[cfg(feature = "vad")]
+    pub(super) fn extend(&self, planned: &[ChunkTask]) {
+        let mut state = self.lock();
+        let known = state.tasks.len();
+        if planned.len() > known {
+            state.tasks.extend_from_slice(&planned[known..]);
+            self.changed.notify_all();
+        }
+    }
+
+    /// Ends the plan, also when planning failed; executors stop at its last window
+    #[cfg(feature = "vad")]
+    pub(super) fn close(&self) {
+        self.lock().closed = true;
+        self.changed.notify_all();
+    }
+
+    /// Window `index`, once planned; `None` once the plan ends without it
+    fn get(&self, index: usize) -> Option<ChunkTask> {
+        let mut state = self.lock();
+        loop {
+            if let Some(task) = state.tasks.get(index) {
+                return Some(*task);
+            }
+            if state.closed {
+                return None;
+            }
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// Windows planned so far
+    fn planned(&self) -> usize {
+        self.lock().tasks.len()
+    }
+
+    /// Workers for `requested`, no more than a complete plan has windows
+    ///
+    /// A plan still being built first waits for its second window or its end, so a
+    /// plan of one window runs serially on the caller's model rather than on a
+    /// parallel worker that loads another. The scan plans the next window long
+    /// before a worker could load its model, and at worst this waits out the
+    /// scan, as a run that plans the whole recording first does
+    fn worker_count(&self, requested: usize) -> usize {
+        self.get(1);
+        let state = self.lock();
+        if state.closed {
+            parallel_worker_count(state.tasks.len(), requested)
+        } else {
+            requested.max(1)
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, TaskStreamState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 /// Runs the plan's windows on the path the config and backend select
 ///
 /// Returns each window's raw transcription in plan order
 pub(super) fn execute_plan<P: WindowPreprocessor + ?Sized>(
     pipeline: &TranscriptionPipeline,
     request: RunRequest<'_, P>,
-    tasks: &[ChunkTask],
+    tasks: &TaskStream,
 ) -> Result<Vec<Option<RawTranscription>>, PreprocessedTranscriptionError<P::Error>> {
     // workers stop each other on this run's own signal, so a failed run leaves
     // the caller's control usable for its next run
     let control = request.control.run_scope();
-    let request = RunRequest {
-        control: &control,
-        ..request
-    };
+    execute_scoped_plan(
+        pipeline,
+        RunRequest {
+            control: &control,
+            ..request
+        },
+        tasks,
+    )
+}
+
+/// [`execute_plan`] for a request whose control is already the run's own
+/// [`TranscriptionControl::run_scope`], shared with whatever else the run does
+pub(super) fn execute_scoped_plan<P: WindowPreprocessor + ?Sized>(
+    pipeline: &TranscriptionPipeline,
+    request: RunRequest<'_, P>,
+    tasks: &TaskStream,
+) -> Result<Vec<Option<RawTranscription>>, PreprocessedTranscriptionError<P::Error>> {
     // a host-loop backend runs a batch one window at a time with no control
     // checks between them, so it stays on the per-window paths
     if request.config.batch_size > 1 && pipeline.batches_on_device() {
         return run_batched_plan(pipeline, request, tasks);
     }
-    let worker_count = parallel_worker_count(tasks.len(), request.config.worker_count);
+    let worker_count = tasks.worker_count(request.config.worker_count);
     if worker_count <= 1 {
         return run_serial_plan(pipeline, request, tasks);
     }
@@ -78,13 +188,14 @@ pub(super) fn execute_plan<P: WindowPreprocessor + ?Sized>(
 fn run_serial_plan<P: WindowPreprocessor + ?Sized>(
     pipeline: &TranscriptionPipeline,
     request: RunRequest<'_, P>,
-    tasks: &[ChunkTask],
+    tasks: &TaskStream,
 ) -> Result<Vec<Option<RawTranscription>>, PreprocessedTranscriptionError<P::Error>> {
     let context = request.task_context(pipeline);
-    let mut raw_tasks = vec![None; tasks.len()];
-    for (task_idx, task) in tasks.iter().enumerate() {
+    let mut raw_tasks = Vec::new();
+    while let Some(task) = tasks.get(raw_tasks.len()) {
         request.control.check()?;
-        raw_tasks[task_idx] = Some(transcribe_task(&context, task, WindowIndex::new(task_idx))?);
+        let index = WindowIndex::new(raw_tasks.len());
+        raw_tasks.push(Some(transcribe_task(&context, &task, index)?));
     }
     request.control.check()?;
     Ok(raw_tasks)
@@ -100,13 +211,13 @@ fn run_serial_plan<P: WindowPreprocessor + ?Sized>(
 fn run_batched_plan<P: WindowPreprocessor + ?Sized>(
     pipeline: &TranscriptionPipeline,
     request: RunRequest<'_, P>,
-    tasks: &[ChunkTask],
+    tasks: &TaskStream,
 ) -> Result<Vec<Option<RawTranscription>>, PreprocessedTranscriptionError<P::Error>> {
     let RunRequest {
         config, control, ..
     } = request;
     let batch_size = config.batch_size;
-    let worker_count = parallel_worker_count(tasks.len(), config.worker_count);
+    let worker_count = tasks.worker_count(config.worker_count);
     let next_task = AtomicUsize::new(0);
     let lookahead = Lookahead::new(batch_size);
     // the pipeline is not `Sync`, so each worker builds its preparer from this
@@ -121,8 +232,12 @@ fn run_batched_plan<P: WindowPreprocessor + ?Sized>(
                 scope.spawn(move || {
                     // a panicking worker closes the gate, so the others stop and
                     // drop their senders, the model side sees the channel close,
-                    // and the scope's join raises the panic instead of hanging
+                    // and the scope's join raises the panic instead of hanging.
+                    // Stopping the run also stops the scan, which closes the plan
+                    // and wakes workers waiting in `TaskStream::get` for windows
+                    // the scan has not found yet
                     let _stop_on_panic = StopOnPanic(lookahead);
+                    let _stop_run_on_panic = StopRunOnPanic(control);
                     let preparer = chunk.preparer();
                     loop {
                         let task_idx = next_task.fetch_add(1, Ordering::Relaxed);
@@ -132,7 +247,7 @@ fn run_batched_plan<P: WindowPreprocessor + ?Sized>(
                         if !lookahead.wait_for(task_idx) {
                             break;
                         }
-                        let window = prepare_window(&request, &preparer, task, task_idx);
+                        let window = prepare_window(&request, &preparer, &task, task_idx);
                         let failed = window.is_err();
                         // a closed channel means the model side has stopped
                         if sender.send((task_idx, window)).is_err() || failed {
@@ -143,18 +258,25 @@ fn run_batched_plan<P: WindowPreprocessor + ?Sized>(
             }
             drop(sender);
             // a panic in the model call unwinds past the cleanup below, and the
-            // scope would then wait on workers parked at the gate
+            // scope would then wait on workers parked at the gate or in
+            // `TaskStream::get` until the scan ends
             let _stop_on_panic = StopOnPanic(&lookahead);
+            let _stop_run_on_panic = StopRunOnPanic(control);
 
-            // windows arrive in any order; batches are cut in plan order, and an
-            // error surfaces when its window is reached, as on the serial path
+            // windows arrive in any order; batches are cut in plan order, each
+            // full unless it holds the plan's last window, so a plan still being
+            // built batches as it would complete, and an error surfaces when its
+            // window is reached, as on the serial path
             let consume = || -> Result<Vec<_>, PreprocessedTranscriptionError<P::Error>> {
                 let mut ready = BTreeMap::new();
-                let mut raw_tasks = Vec::with_capacity(tasks.len());
-                for batch_start in (0..tasks.len()).step_by(batch_size) {
-                    let batch_end = (batch_start + batch_size).min(tasks.len());
-                    let mut windows = Vec::with_capacity(batch_end - batch_start);
-                    for task_idx in batch_start..batch_end {
+                let mut raw_tasks = Vec::new();
+                loop {
+                    let batch_start = raw_tasks.len();
+                    let mut windows = Vec::with_capacity(batch_size);
+                    for task_idx in batch_start..batch_start + batch_size {
+                        if tasks.get(task_idx).is_none() {
+                            break;
+                        }
                         while !ready.contains_key(&task_idx) {
                             let (done_idx, window) = receiver.recv().map_err(|_| {
                                 TranscriptionError::InvalidModelOutput(format!(
@@ -170,7 +292,14 @@ fn run_batched_plan<P: WindowPreprocessor + ?Sized>(
                         })?;
                         windows.push(window?);
                     }
+                    if windows.is_empty() {
+                        // a run stopped after the last window must not return as a
+                        // finished, empty transcription, as on the serial path
+                        control.check()?;
+                        break;
+                    }
                     // the next batch prepares while this one runs
+                    let batch_end = batch_start + windows.len();
                     lookahead.allow(batch_end + batch_size);
 
                     control.check()?;
@@ -178,6 +307,9 @@ fn run_batched_plan<P: WindowPreprocessor + ?Sized>(
                         .transcribe_prepared_batch(&windows, config.transcription.language)?;
                     raw_tasks.extend(raws.into_iter().map(Some));
                     control.check()?;
+                    if windows.len() < batch_size {
+                        break;
+                    }
                 }
                 Ok(raw_tasks)
             };
@@ -201,7 +333,7 @@ fn run_batched_plan<P: WindowPreprocessor + ?Sized>(
 fn run_parallel_plan<P: WindowPreprocessor + ?Sized>(
     pipeline: &TranscriptionPipeline,
     request: RunRequest<'_, P>,
-    tasks: &[ChunkTask],
+    tasks: &TaskStream,
     worker_count: usize,
 ) -> Result<Vec<Option<RawTranscription>>, PreprocessedTranscriptionError<P::Error>> {
     let control = request.control;
@@ -220,6 +352,15 @@ fn run_parallel_plan<P: WindowPreprocessor + ?Sized>(
             // own from the bundle
             let bundle = pipeline.bundle().clone();
             scope.spawn(move || {
+                // the other workers and the scan stop instead of running the plan
+                // out before the panic surfaces at the scope's join
+                let _stop = StopRunOnPanic(control);
+                // a worker loads its model once it has a window, so a plan still
+                // being built loads none it turns out not to need
+                let mut task_idx = next_task.fetch_add(1, Ordering::Relaxed);
+                if tasks.get(task_idx).is_none() {
+                    return;
+                }
                 let pipeline = match TranscriptionPipeline::from_bundle(bundle) {
                     Ok(pipeline) => pipeline,
                     Err(error) => {
@@ -229,18 +370,12 @@ fn run_parallel_plan<P: WindowPreprocessor + ?Sized>(
                     }
                 };
                 let context = request.task_context(&pipeline);
-                loop {
-                    let task_idx = next_task.fetch_add(1, Ordering::Relaxed);
-                    if task_idx >= tasks.len() {
-                        break;
-                    }
-
+                while let Some(task) = tasks.get(task_idx) {
                     if control.check().is_err() {
                         break;
                     }
-                    let result =
-                        transcribe_task(&context, &tasks[task_idx], WindowIndex::new(task_idx))
-                            .map(|raw| CompletedTask { task_idx, raw });
+                    let result = transcribe_task(&context, &task, WindowIndex::new(task_idx))
+                        .map(|raw| CompletedTask { task_idx, raw });
                     if let Err(error) = &result
                         && !is_interruption(error)
                     {
@@ -249,34 +384,43 @@ fn run_parallel_plan<P: WindowPreprocessor + ?Sized>(
                     if sender.send(result).is_err() {
                         break;
                     }
+                    task_idx = next_task.fetch_add(1, Ordering::Relaxed);
                 }
             });
         }
         drop(sender);
 
-        collect_completed_tasks(tasks.len(), receiver, control)
+        collect_completed_tasks(tasks, receiver, control)
     })
 }
 
 /// Gathers the parallel workers' windows into plan order, or the error that
 /// stopped them
 fn collect_completed_tasks<E>(
-    task_count: usize,
+    tasks: &TaskStream,
     receiver: Receiver<Result<CompletedTask, PreprocessedTranscriptionError<E>>>,
     control: &TranscriptionControl,
 ) -> Result<Vec<Option<RawTranscription>>, PreprocessedTranscriptionError<E>>
 where
     E: std::error::Error + Send + Sync + 'static,
 {
-    let mut raw_tasks = vec![None; task_count];
+    let mut raw_tasks = Vec::new();
     let mut first_error = None;
 
     while let Ok(message) = receiver.recv() {
         match message {
-            Ok(completed) => raw_tasks[completed.task_idx] = Some(completed.raw),
+            Ok(completed) => {
+                if raw_tasks.len() <= completed.task_idx {
+                    raw_tasks.resize(completed.task_idx + 1, None);
+                }
+                raw_tasks[completed.task_idx] = Some(completed.raw);
+            }
             Err(error) => remember_parallel_error(&mut first_error, error),
         }
     }
+    // every worker has stopped, so the plan is complete unless the run stopped
+    // first, which the checks below report
+    raw_tasks.resize(tasks.planned().max(raw_tasks.len()), None);
 
     if let Some(error) = first_error {
         return Err(error);
@@ -437,7 +581,7 @@ fn prepare_window_samples<P: WindowPreprocessor + ?Sized>(
 
 /// Whether the error only reports that the run was cancelled or ran out of time,
 /// rather than a failure that should stop the other workers
-fn is_interruption<E>(error: &PreprocessedTranscriptionError<E>) -> bool
+pub(super) fn is_interruption<E>(error: &PreprocessedTranscriptionError<E>) -> bool
 where
     E: std::error::Error + Send + Sync + 'static,
 {
@@ -493,6 +637,40 @@ mod tests {
         assert_eq!(parallel_worker_count(3, 0), 1);
         assert_eq!(parallel_worker_count(3, 2), 2);
         assert_eq!(parallel_worker_count(3, 8), 3);
+    }
+
+    /// A plan still being built picks its workers once it has a second window or
+    /// ends with one, so a one-window plan takes the serial path on the caller's
+    /// model
+    #[cfg(feature = "vad")]
+    #[test]
+    fn open_plan_picks_workers_once_it_has_two_windows_or_ends() {
+        use super::TaskStream;
+
+        let mut config = LongFormConfig::default();
+        config.overlap.max_model_samples = 48_000;
+        let plan = build_fast_execution_plan(96_000, &config);
+        assert!(
+            plan.tasks.len() >= 2,
+            "the plan should have several windows"
+        );
+
+        let one_window = TaskStream::open();
+        let two_windows = TaskStream::open();
+        let (one, two) = std::thread::scope(|scope| {
+            let one = scope.spawn(|| one_window.worker_count(4));
+            let two = scope.spawn(|| two_windows.worker_count(4));
+            one_window.extend(&plan.tasks[..1]);
+            two_windows.extend(&plan.tasks[..1]);
+            two_windows.extend(&plan.tasks[..2]);
+            let two = two.join().expect("worker count should not panic");
+            one_window.close();
+            two_windows.close();
+            (one.join().expect("worker count should not panic"), two)
+        });
+
+        assert_eq!(one, 1);
+        assert_eq!(two, 4);
     }
 
     #[test]

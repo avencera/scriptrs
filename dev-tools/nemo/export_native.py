@@ -1,5 +1,5 @@
-"""Export Parakeet TDT and Nemotron streaming `.nemo` checkpoints and Silero VAD v5 to
-scriptrs native weights
+"""Export Parakeet TDT and Nemotron streaming `.nemo` checkpoints and Silero VAD v5
+and v6 to scriptrs native weights
 
 Writes, under --out:
 
@@ -7,7 +7,7 @@ Writes, under --out:
     parakeet-v3/model.safetensors, parakeet-v3/parakeet_vocab.json
     nemotron-speech-streaming-en-0.6b/model.safetensors, .../vocab.txt
     nemotron-3.5-asr-streaming-0.6b/model.safetensors, .../vocab.txt
-    vad/silero-vad-v5.safetensors
+    vad/silero-vad-v5.safetensors, vad/silero-vad-v6.safetensors
 
 Tensors keep their NeMo (or Silero) names and stay fp32, so the file is the parity
 oracle's own weights. Layout changes such as BatchNorm folding or transposes happen
@@ -22,7 +22,6 @@ import hashlib
 import importlib
 import importlib.metadata
 import inspect
-import importlib.resources
 import json
 import tarfile
 from pathlib import Path
@@ -31,6 +30,8 @@ import sentencepiece
 import torch
 import yaml
 from safetensors.torch import save_file
+
+import silero
 
 FORMAT = "scriptrs-native"
 FORMAT_VERSION = "2"
@@ -360,14 +361,10 @@ def write_vocab(version: str, tokenizer_model: bytes, vocab_size: int, path: Pat
     print(f"[{version}] wrote {vocab_size} tokens to {path}")
 
 
-def export_silero(out: Path) -> None:
+def export_silero(version: str, out: Path) -> None:
     target = out / "vad"
     target.mkdir(parents=True, exist_ok=True)
-    package_version = importlib.metadata.version("silero-vad")
-    if not package_version.startswith("5."):
-        raise SystemExit(f"silero-vad {package_version} does not ship the v5 weights")
-
-    jit_path = importlib.resources.files("silero_vad").joinpath("data/silero_vad.jit")
+    jit_path = silero.jit_path(version)
     model = torch.jit.load(str(jit_path), map_location="cpu")
     # `_model` is the 16 kHz branch; `_model_8k` is not used by scriptrs
     tensors = {
@@ -375,18 +372,19 @@ def export_silero(out: Path) -> None:
         for name, tensor in model.state_dict().items()
         if name.startswith("_model.")
     }
+    name = f"silero-vad-{version}"
     metadata = {
         "format": FORMAT,
         "format_version": FORMAT_VERSION,
-        "model": "silero-vad-v5",
-        "source": f"silero-vad {package_version} (16 kHz branch)",
-        "source_sha256": sha256_file(Path(str(jit_path))),
+        "model": name,
+        "source": silero.source(version),
+        "source_sha256": sha256_file(jit_path),
         "config": json.dumps(
             {"sample_rate": 16000, "window": 512, "context": 64, "state": 128}, sort_keys=True
         ),
     }
-    save_file(tensors, target / "silero-vad-v5.safetensors", metadata=metadata)
-    print(f"[vad] wrote {len(tensors)} tensors to {target / 'silero-vad-v5.safetensors'}")
+    save_file(tensors, target / f"{name}.safetensors", metadata=metadata)
+    print(f"[vad] wrote {len(tensors)} tensors to {target / f'{name}.safetensors'}")
 
 
 def main() -> None:
@@ -400,7 +398,8 @@ def main() -> None:
         if key in only:
             export_streaming(key, getattr(args, f"{key}_nemo"), args.out)
     if "vad" in only:
-        export_silero(args.out)
+        for version in silero.VERSIONS:
+            export_silero(version, args.out)
 
 
 if __name__ == "__main__":
