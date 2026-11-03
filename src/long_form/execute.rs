@@ -123,7 +123,14 @@ impl TaskStream {
     }
 
     /// Workers for `requested`, no more than a complete plan has windows
+    ///
+    /// A plan still being built first waits for its second window or its end, so a
+    /// plan of one window runs serially on the caller's model rather than on a
+    /// parallel worker that loads another. The scan plans the next window long
+    /// before a worker could load its model, and at worst this waits out the
+    /// scan, as a run that plans the whole recording first does
     fn worker_count(&self, requested: usize) -> usize {
+        self.get(1);
         let state = self.lock();
         if state.closed {
             parallel_worker_count(state.tasks.len(), requested)
@@ -630,6 +637,40 @@ mod tests {
         assert_eq!(parallel_worker_count(3, 0), 1);
         assert_eq!(parallel_worker_count(3, 2), 2);
         assert_eq!(parallel_worker_count(3, 8), 3);
+    }
+
+    /// A plan still being built picks its workers once it has a second window or
+    /// ends with one, so a one-window plan takes the serial path on the caller's
+    /// model
+    #[cfg(feature = "vad")]
+    #[test]
+    fn open_plan_picks_workers_once_it_has_two_windows_or_ends() {
+        use super::TaskStream;
+
+        let mut config = LongFormConfig::default();
+        config.overlap.max_model_samples = 48_000;
+        let plan = build_fast_execution_plan(96_000, &config);
+        assert!(
+            plan.tasks.len() >= 2,
+            "the plan should have several windows"
+        );
+
+        let one_window = TaskStream::open();
+        let two_windows = TaskStream::open();
+        let (one, two) = std::thread::scope(|scope| {
+            let one = scope.spawn(|| one_window.worker_count(4));
+            let two = scope.spawn(|| two_windows.worker_count(4));
+            one_window.extend(&plan.tasks[..1]);
+            two_windows.extend(&plan.tasks[..1]);
+            two_windows.extend(&plan.tasks[..2]);
+            let two = two.join().expect("worker count should not panic");
+            one_window.close();
+            two_windows.close();
+            (one.join().expect("worker count should not panic"), two)
+        });
+
+        assert_eq!(one, 1);
+        assert_eq!(two, 4);
     }
 
     #[test]
