@@ -52,3 +52,9 @@ features = ["pyo3/extension-module"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["model: loads a Parakeet model, so it needs a backend and downloads the model"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint.isort]
+known-first-party = ["scriptrs", "conftest"]
