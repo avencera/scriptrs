@@ -35,10 +35,16 @@ jobs:
           toolchain: stable
           components: rustfmt
 
-      - name: Install just
+      # a prebuilt cargo-deny instead of cargo-deny-action, whose Docker build fails
+      # whenever Docker Hub rate-limits the runner
+      - name: Install just and cargo-deny
         uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
-          tool: just
+          tool: just,cargo-deny@0.20.2
+
+      # `just fmt` and `just python-lint` run ruff through uvx
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       # `just fmt` rewrites files, so any diff it leaves means the code wasn't formatted
       - name: Format
@@ -46,8 +52,14 @@ jobs:
           just fmt
           git diff --exit-code
 
+      - name: Python lints
+        run: just python-lint
+
       - name: No ONNX Runtime
         run: just no-ort
+
+      - name: Advisories, licenses and sources
+        run: just deny
 
   check:
     name: Clippy and tests (${{ matrix.name }})
@@ -80,6 +92,11 @@ jobs:
 
       - name: Clippy
         run: just clippy
+
+      # docs.rs builds on Linux with every feature, so the CUDA docs only build here
+      - name: Docs as docs.rs builds them
+        if: runner.os == 'Linux'
+        run: just doc
 
       - name: Test
         run: just test --all-features
