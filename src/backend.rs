@@ -25,10 +25,18 @@ pub(crate) use policy::test_support::decide_from_logits;
 
 /// Log-mel input for one chunk, in `[frames, features]` order
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(
+    not(any(target_os = "macos", feature = "cuda")),
+    allow(dead_code, reason = "a build with no backend never runs a chunk")
+)]
 pub(crate) struct EncoderChunk<'a> {
     features: ArrayView2<'a, f32>,
 }
 
+#[cfg_attr(
+    not(any(target_os = "macos", feature = "cuda")),
+    allow(dead_code, reason = "a build with no backend never runs a chunk")
+)]
 impl<'a> EncoderChunk<'a> {
     pub(crate) fn new(features: ArrayView2<'a, f32>) -> Self {
         Self { features }

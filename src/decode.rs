@@ -20,6 +20,13 @@ pub(crate) struct RawTranscription {
 }
 
 impl RawTranscription {
+    #[cfg_attr(
+        not(any(target_os = "macos", feature = "cuda", feature = "long-form")),
+        allow(
+            dead_code,
+            reason = "only a backend or the long-form merge starts an empty transcription"
+        )
+    )]
     pub(crate) fn empty() -> Self {
         Self { tokens: Vec::new() }
     }

@@ -18,6 +18,10 @@ pub(crate) struct DecodePolicy<'a> {
     deployment: &'a ParakeetDeployment,
     vocabulary: &'a Vocabulary,
     language: LanguageSelection,
+    #[cfg_attr(
+        not(any(target_os = "macos", feature = "cuda")),
+        allow(dead_code, reason = "only a backend decodes with the policy")
+    )]
     keep_top_k: bool,
 }
 
@@ -57,6 +61,10 @@ impl<'a> DecodePolicy<'a> {
         MAX_TOKENS_PER_STEP
     }
 
+    #[cfg_attr(
+        not(any(target_os = "macos", feature = "cuda")),
+        allow(dead_code, reason = "only a backend decodes with the policy")
+    )]
     pub(crate) fn keep_top_k(&self) -> bool {
         self.keep_top_k
     }

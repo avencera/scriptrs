@@ -15,6 +15,10 @@ pub(crate) const SECONDS_PER_ENCODER_FRAME: f64 =
 pub(crate) const ENCODER_HIDDEN_SIZE: usize = 1_024;
 pub(crate) const DECODER_HIDDEN_SIZE: usize = 640;
 pub(crate) const DECODER_LAYERS: usize = 2;
+#[cfg_attr(
+    not(any(target_os = "macos", feature = "cuda")),
+    allow(dead_code, reason = "only a backend decodes")
+)]
 pub(crate) const MAX_TOKENS_PER_STEP: usize = 10;
 // width of the v3 joint's top-K outputs in the published Core ML bundle; device
 // backends filter languages over the same candidate set
