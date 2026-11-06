@@ -1,3 +1,22 @@
+# Build, test and publish scriptrs: the Python wheels and sdist, the crate, and a
+# GitHub release, all from one version tag
+#
+# To release:
+#   1. set the version in Cargo.toml and crates/scriptrs-python/Cargo.toml
+#   2. rename the CHANGELOG.md "Unreleased" section to "[X.Y.Z] - YYYY-MM-DD" and
+#      update the compare links at the bottom
+#   3. merge, then tag the merge commit and push the tag:
+#        git tag vX.Y.Z
+#        git push origin vX.Y.Z
+#
+# The tag publishes to TestPyPI and installs that release. The pypi environment then
+# waits for a reviewer, and once approved the workflow publishes the Python package to
+# PyPI, then the crate to crates.io, then a GitHub release with the tag's CHANGELOG.md
+# entry as its notes and the wheels and sdist attached. A tag whose version or
+# changelog entry is wrong fails before anything is published. PyPI, TestPyPI and
+# crates.io all trust this workflow through OIDC, so no token is stored. Every publish
+# skips files already uploaded, so "Re-run failed jobs" finishes a partial release
+
 name: Python
 
 on:
@@ -19,6 +38,28 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  # the crate as crates.io receives it, built as a dependency with each feature set
+  crate:
+    name: Crate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      - name: Install just
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: just
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Package and build as a dependency
+        run: just package
+
   # one abi3 wheel per platform with the backend that platform runs; the Linux
   # wheel builds without a GPU or CUDA toolkit because CUDA is loaded at run time
   wheels:
@@ -118,13 +159,13 @@ jobs:
           path: dist/*.tar.gz
 
   tests:
-    name: Tests (${{ matrix.name }})
+    name: Tests (${{ matrix.platform.name }}, Python ${{ matrix.python }})
     needs: wheels
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.platform.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
+        platform:
           # a GitHub runner has no NVIDIA driver, so this checks that the CUDA wheel
           # imports and fails cleanly before downloading a model
           - name: Linux x86_64
@@ -134,6 +175,8 @@ jobs:
           - name: macOS arm64
             os: macos-15
             target: aarch64-apple-darwin
+        # the one abi3 wheel serves every version, so test the oldest and the newest
+        python: ["3.11", "3.14"]
     env:
       SCRIPTRS_TEST_MODELS: parakeet/v2
     steps:
@@ -145,26 +188,58 @@ jobs:
       - name: Download wheel
         uses: actions/download-artifact@v8
         with:
-          name: python-wheel-${{ matrix.target }}
+          name: python-wheel-${{ matrix.platform.target }}
           path: dist
 
       - name: Install wheel into a fresh environment
         shell: bash
         run: |
           set -euo pipefail
-          uv venv --python 3.12 .venv-wheel
+          uv venv --python ${{ matrix.python }} .venv-wheel
           uv pip install --python .venv-wheel dist/*.whl pytest numpy
 
       - name: Run tests
         working-directory: crates/scriptrs-python
         run: ../../.venv-wheel/bin/python -m pytest -rA
 
+  # checks a tag before anything is published: the crate's version must match it, and
+  # CHANGELOG.md needs its entry, which becomes the GitHub release notes
+  release-check:
+    name: Check the tag
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      # the GitHub release reads its notes with parse-changelog, so the same parser
+      # checks the entry here
+      - name: Install parse-changelog
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: parse-changelog
+
+      - name: Check the version and changelog
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$crate" != "$version" ]; then
+            echo "Cargo.toml is $crate but the tag is $GITHUB_REF_NAME"
+            exit 1
+          fi
+          notes="$(parse-changelog CHANGELOG.md "$version")"
+          if [ -z "$notes" ]; then
+            echo "the CHANGELOG.md entry for $version is empty"
+            exit 1
+          fi
+
   # a v* tag publishes to TestPyPI, installs that release, and only then publishes to
   # PyPI; each index trusts this workflow and environment, so no token is stored
   testpypi-publish:
     name: Publish to TestPyPI
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [wheels, sdist, tests]
+    needs: [release-check, crate, wheels, sdist, tests]
     runs-on: ubuntu-24.04
     environment:
       name: testpypi
@@ -197,6 +272,7 @@ jobs:
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
 
   testpypi-install:
     name: Install from TestPyPI (${{ matrix.name }})
@@ -241,6 +317,8 @@ jobs:
             grep -qi 'indifference' <<< "$text"
           fi
 
+  # the pypi environment's reviewer approves the release here, before anything
+  # outside TestPyPI is published
   pypi-publish:
     name: Publish to PyPI
     needs: testpypi-install
@@ -260,3 +338,124 @@ jobs:
 
       - name: Publish
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          skip-existing: true
+
+  crates-publish:
+    name: Publish to crates.io
+    needs: pypi-publish
+    runs-on: ubuntu-24.04
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/scriptrs
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      # a rerun after a later job failed finds this version already published
+      - name: Check crates.io for this version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          status="$(curl -sS -o /dev/null -w '%{http_code}' -A 'scriptrs-release (github.com/avencera/scriptrs)' \
+            "https://crates.io/api/v1/crates/scriptrs/$version")"
+          case "$status" in
+            200) echo "scriptrs $version is already on crates.io"; echo "publish=false" >> "$GITHUB_OUTPUT" ;;
+            404) echo "publish=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "crates.io answered HTTP $status" >&2; exit 1 ;;
+          esac
+
+      - name: Get a crates.io token
+        if: steps.version.outputs.publish == 'true'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+
+      - name: Publish
+        if: steps.version.outputs.publish == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked -p scriptrs
+
+  # the release starts as a draft and is published only once its files are attached
+  github-release:
+    name: GitHub release
+    needs: crates-publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Download wheels and sdist
+        uses: actions/download-artifact@v8
+        with:
+          pattern: python-*
+          path: dist
+          merge-multiple: true
+
+      # create-gh-release-action deletes a release that already exists, so a rerun
+      # leaves a published release alone and finishes a draft instead of recreating it
+      - name: Check for an existing release
+        id: existing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if draft="$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2> view.err)"; then
+            if [ "$draft" = true ]; then state=draft; else state=published; fi
+          elif grep -q 'release not found' view.err; then
+            state=none
+          else
+            # any other failure could hide a release the next step would delete
+            cat view.err >&2
+            exit 1
+          fi
+          echo "the $GITHUB_REF_NAME release is $state"
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+
+      - name: Create a draft release
+        if: steps.existing.outputs.state == 'none'
+        uses: taiki-e/create-gh-release-action@eba8ea96c86cca8a37f1b56e94b4d13301fba651 # v1.11.0
+        with:
+          draft: true
+          # the tag's CHANGELOG.md entry becomes the release notes
+          changelog: CHANGELOG.md
+
+      # --clobber replaces files a failed run already attached. The release becomes
+      # latest only when no published stable release has a higher version, so a
+      # maintenance release of an older line leaves the newest one as latest
+      - name: Attach the wheels and sdist, then publish
+        if: steps.existing.outputs.state != 'published'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+
+          version="${GITHUB_REF_NAME#v}"
+          latest=false
+          if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            # a plain assignment, so set -e stops the step when the lookup fails
+            # instead of marking this release latest against an empty list
+            releases="$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases \
+              --limit 1000 --json tagName --jq '.[].tagName')"
+            newest="$(
+              printf '%s\n' "$releases" "$GITHUB_REF_NAME" \
+                | sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1
+            )"
+            if [ "$newest" = "$version" ]; then latest=true; fi
+          fi
+          echo "marking $GITHUB_REF_NAME latest: $latest"
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest="$latest" --repo "$GITHUB_REPOSITORY"

@@ -14,6 +14,11 @@ readme = "README.md"
 keywords = ["parakeet", "speech-to-text", "asr", "cuda", "coreml"]
 categories = ["multimedia::audio"]
 
+# the crate docs link the long-form, VAD and CUDA items, so docs.rs documents every
+# feature; the CUDA code builds without a toolkit because CUDA loads at run time
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 default = ["online"]
 # blocking Hub downloads through hf-fetch, with rustls and no async runtime

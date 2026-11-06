@@ -5,17 +5,15 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 from . import Model, Pipeline, ScriptrsError, TranscriptionResult, __version__
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the command line and return the exit status."""
-    parser = argparse.ArgumentParser(
-        prog="scriptrs", description="Speech-to-text with NVIDIA Parakeet TDT."
-    )
+    parser = argparse.ArgumentParser(prog="scriptrs", description="Speech-to-text with NVIDIA Parakeet TDT.")
     parser.add_argument("--version", action="version", version=f"scriptrs {__version__}")
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -42,7 +40,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         choices=["fp16", "tf32", "fp32"],
         help="CUDA matrix multiply precision (default: fp16)",
     )
-    transcribe.add_argument("--model-dir", type=Path, help="load the model from this directory instead of downloading it")
+    transcribe.add_argument(
+        "--model-dir", type=Path, help="load the model from this directory instead of downloading it"
+    )
     transcribe.add_argument("--cache-dir", type=Path, help="model download cache (default: the Hugging Face hub cache)")
     transcribe.add_argument(
         "--json",
@@ -53,9 +53,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         if args.model_dir is not None:
-            pipeline = Pipeline.from_dir(
-                args.model_dir, args.model, vad=args.vad, precision=args.precision
-            )
+            pipeline = Pipeline.from_dir(args.model_dir, args.model, vad=args.vad, precision=args.precision)
         else:
             pipeline = Pipeline.from_pretrained(
                 args.model, vad=args.vad, precision=args.precision, cache_dir=args.cache_dir
@@ -88,9 +86,7 @@ def _as_json(path: Path, result: TranscriptionResult) -> dict[str, object]:
         "file": str(path),
         "text": result.text,
         "duration_seconds": result.duration_seconds,
-        "chunks": [
-            {"start": chunk.start, "end": chunk.end, "text": chunk.text} for chunk in result.chunks
-        ],
+        "chunks": [{"start": chunk.start, "end": chunk.end, "text": chunk.text} for chunk in result.chunks],
         "tokens": [
             {
                 "text": token.text,

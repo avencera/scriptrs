@@ -730,6 +730,7 @@ The example expects mono 16kHz WAV input.
 
 ## Notes
 
+- [CHANGELOG.md](CHANGELOG.md) lists the changes in each release
 - The public API is still moving
 - `scriptrs` currently targets the exact file layout and model I/O shipped in `avencera/scriptrs-models`; if you swap in a different CoreML Parakeet export, you may need runtime code changes
 - Use `long-form` for the fastest path on clean, dense speech

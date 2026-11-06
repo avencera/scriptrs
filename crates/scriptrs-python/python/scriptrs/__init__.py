@@ -15,11 +15,12 @@ running while a call is in progress.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from enum import Enum
 from importlib import metadata
 from os import PathLike
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Literal
 
 from . import _cuda, _native
 from ._errors import ScriptrsError
@@ -42,7 +43,7 @@ if TYPE_CHECKING:
         @property
         def __array_interface__(self) -> dict[str, Any]: ...
 
-    Samples = Union[Buffer, _ArrayInterface, Sequence[float]]
+    Samples = Buffer | _ArrayInterface | Sequence[float]
 
 try:
     __version__ = metadata.version("scriptrs")
@@ -70,7 +71,7 @@ class Model(str, Enum):
         return _native.languages(self.value)
 
 
-ModelName = Union[Model, Literal["parakeet/v2", "parakeet/v3"], str]
+ModelName = Model | Literal["parakeet/v2", "parakeet/v3"] | str
 """A :class:`Model`, its value, or its upstream model id."""
 
 Precision = Literal["fp16", "tf32", "fp32"]
@@ -80,7 +81,7 @@ Precision = Literal["fp16", "tf32", "fp32"]
 and ``"fp32"`` matches NVIDIA NeMo's FP32 output token for token.
 """
 
-StrPath = Union[str, "PathLike[str]"]
+StrPath = str | PathLike[str]
 
 # upstream model ids, so a name copied from Hugging Face or NeMo works as is
 _UPSTREAM_IDS = {
@@ -127,7 +128,7 @@ class Pipeline:
         *,
         vad: bool = False,
         precision: Precision = "fp16",
-        cache_dir: Optional[StrPath] = None,
+        cache_dir: StrPath | None = None,
     ) -> Pipeline:
         """Download ``model`` from Hugging Face if needed, then load it.
 
@@ -195,9 +196,7 @@ class Pipeline:
         """
         return self._native.max_chunk_seconds
 
-    def transcribe(
-        self, samples: Samples, *, language: Optional[str] = None
-    ) -> TranscriptionResult:
+    def transcribe(self, samples: Samples, *, language: str | None = None) -> TranscriptionResult:
         """Transcribe 16 kHz mono audio.
 
         ``samples`` is a 1-D float32 buffer, such as a NumPy array, or a sequence
@@ -207,9 +206,7 @@ class Pipeline:
         """
         return self._native.transcribe(samples, language)
 
-    def transcribe_file(
-        self, path: StrPath, *, language: Optional[str] = None
-    ) -> TranscriptionResult:
+    def transcribe_file(self, path: StrPath, *, language: str | None = None) -> TranscriptionResult:
         """Decode an audio file, resample it to 16 kHz mono, and transcribe it.
 
         WAV, FLAC, MP3, Ogg Vorbis, and AAC in MP4/M4A are supported. The whole
@@ -221,7 +218,7 @@ class Pipeline:
         self,
         inputs: Sequence[Samples],
         *,
-        language: Optional[str] = None,
+        language: str | None = None,
         max_batch: int = 32,
     ) -> list[TranscriptionResult]:
         """Transcribe many 16 kHz mono clips faster than calling :meth:`transcribe` in a loop.

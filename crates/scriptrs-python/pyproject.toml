@@ -40,6 +40,7 @@ scriptrs = "scriptrs.cli:main"
 [project.urls]
 Repository = "https://github.com/avencera/scriptrs"
 Documentation = "https://github.com/avencera/scriptrs/blob/master/crates/scriptrs-python/README.md"
+Changelog = "https://github.com/avencera/scriptrs/blob/master/CHANGELOG.md"
 
 [dependency-groups]
 test = ["pytest>=8", "numpy>=1.26"]
@@ -52,3 +53,9 @@ features = ["pyo3/extension-module"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["model: loads a Parakeet model, so it needs a backend and downloads the model"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint.isort]
+known-first-party = ["scriptrs", "conftest"]

@@ -1,6 +1,22 @@
 fmt:
     cargo fmt
     cargo fmt --manifest-path crates/scriptrs-python/Cargo.toml
+    uvx ruff@0.17.4 format crates/scriptrs-python
+
+# ruff's lints for the Python package; `just fmt` runs its formatter. ruff is pinned
+# because a release that restyles code would fail CI's formatting check
+python-lint:
+    uvx ruff@0.17.4 check crates/scriptrs-python
+
+# advisories, licenses and sources for the crate and the Python bindings, which are
+# separate workspaces
+deny:
+    cargo deny --all-features check
+    cargo deny --manifest-path crates/scriptrs-python/Cargo.toml --all-features check
+
+# the docs as docs.rs builds them, with every feature
+doc:
+    DOCS_RS=1 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked --all-features
 
 clippy:
     cargo clippy --all --all-targets --all-features -- -D warnings
@@ -19,6 +35,60 @@ no-ort:
     deps=$(cargo tree --all-features --target all -e normal,build --prefix none)
     if grep -qE '^ort(-sys)? ' <<<"$deps"; then echo "ort is in the dependency tree" >&2; exit 1; fi
 
+# package the crate as crates.io receives it, check its size, and build consumers of
+# the unpacked archive, so a file left out of the package fails here instead of after
+# publishing; the CUDA consumer checks the committed PTX ships, on Linux x86_64 only
+package *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # cargo package writes under the effective target directory, which
+    # CARGO_TARGET_DIR or build.target-dir can move away from ./target
+    target=$(cargo metadata --format-version 1 --no-deps | jq -r .target_directory)
+    rm -rf "$target/package"
+    cargo package --locked {{args}}
+    crate=$(find "$target/package" -maxdepth 1 -name 'scriptrs-*.crate' -print -quit)
+    test -n "$crate"
+    # crates.io rejects uploads over 10 MiB unless it raises the crate's limit
+    size=$(wc -c < "$crate")
+    echo "$(basename "$crate"): $size bytes"
+    test "$size" -le $((10 * 1024 * 1024))
+
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' EXIT
+    tar -xzf "$crate" -C "$work"
+    package=$(find "$work" -mindepth 1 -maxdepth 1 -type d -print -quit)
+    # each consumer is its own workspace in a new directory, so keep its build files
+    # in this target too rather than in a fresh build directory per run
+    export CARGO_TARGET_DIR="$target/package-consumers"
+    export CARGO_BUILD_BUILD_DIR="$CARGO_TARGET_DIR/build"
+
+    consumer() {
+        local name=$1 dependency=$2 source=$3
+        mkdir -p "$work/$name/src"
+        printf '[package]\nname = "consumer-%s"\nversion = "0.0.0"\nedition = "2024"\npublish = false\n\n[workspace]\n\n[dependencies]\nscriptrs = %s\n' \
+            "$name" "$dependency" > "$work/$name/Cargo.toml"
+        printf '%s\n' "$source" > "$work/$name/src/lib.rs"
+        echo "building the packaged crate as a dependency: $name"
+        cargo build --manifest-path "$work/$name/Cargo.toml"
+    }
+
+    load='pub fn load(dir: &std::path::Path) -> bool {
+        scriptrs::TranscriptionPipeline::from_dir(dir).is_ok()
+    }'
+    consumer offline "{ path = \"$package\", default-features = false }" "$load"
+    consumer online "{ path = \"$package\" }" "$load
+    pub fn download() -> bool {
+        scriptrs::TranscriptionPipeline::from_pretrained().is_ok()
+    }"
+    consumer vad "{ path = \"$package\", features = [\"vad\"] }" 'pub fn load(dir: &std::path::Path) -> bool {
+        scriptrs::LongFormTranscriptionPipeline::from_dir(dir).is_ok()
+    }'
+    if [ "$(uname -s)-$(uname -m)" = Linux-x86_64 ]; then
+        consumer cuda "{ path = \"$package\", features = [\"cuda\", \"vad\"] }" 'pub fn download() -> bool {
+        scriptrs::ModelBundle::from_pretrained_native(scriptrs::ParakeetDeployment::v3()).is_ok()
+    }'
+    fi
+
 # parity tests against NeMo reference tensors (dev-tools/nemo/dump_ref.py);
 # set SCRIPTRS_NEMO_REF to use a copy other than /shared/datasets/parakeet-ref
 parity *args:
@@ -26,8 +96,11 @@ parity *args:
 
 check:
     just fmt
+    just python-lint
     just no-ort
+    just deny
     just clippy
+    just doc
     just test
 
 # GPU tests (`gpu_` prefix): NeMo parity and the scheduler; they need the GPU, so
