@@ -41,9 +41,12 @@ no-ort:
 package *args:
     #!/usr/bin/env bash
     set -euo pipefail
-    rm -rf target/package
+    # cargo package writes under the effective target directory, which
+    # CARGO_TARGET_DIR or build.target-dir can move away from ./target
+    target=$(cargo metadata --format-version 1 --no-deps | jq -r .target_directory)
+    rm -rf "$target/package"
     cargo package --locked {{args}}
-    crate=$(find target/package -maxdepth 1 -name 'scriptrs-*.crate' -print -quit)
+    crate=$(find "$target/package" -maxdepth 1 -name 'scriptrs-*.crate' -print -quit)
     test -n "$crate"
     # crates.io rejects uploads over 10 MiB unless it raises the crate's limit
     size=$(wc -c < "$crate")
@@ -56,7 +59,7 @@ package *args:
     package=$(find "$work" -mindepth 1 -maxdepth 1 -type d -print -quit)
     # each consumer is its own workspace in a new directory, so keep its build files
     # in this target too rather than in a fresh build directory per run
-    export CARGO_TARGET_DIR="$PWD/target/package-consumers"
+    export CARGO_TARGET_DIR="$target/package-consumers"
     export CARGO_BUILD_BUILD_DIR="$CARGO_TARGET_DIR/build"
 
     consumer() {

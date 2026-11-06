@@ -432,12 +432,30 @@ jobs:
           # the tag's CHANGELOG.md entry becomes the release notes
           changelog: CHANGELOG.md
 
-      # --clobber replaces files a failed run already attached
+      # --clobber replaces files a failed run already attached. The release becomes
+      # latest only when no published stable release has a higher version, so a
+      # maintenance release of an older line leaves the newest one as latest
       - name: Attach the wheels and sdist, then publish
         if: steps.existing.outputs.state != 'published'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
           set -euo pipefail
           gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
-          gh release edit "$GITHUB_REF_NAME" --draft=false --latest --repo "$GITHUB_REPOSITORY"
+
+          version="${GITHUB_REF_NAME#v}"
+          latest=false
+          if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            # a plain assignment, so set -e stops the step when the lookup fails
+            # instead of marking this release latest against an empty list
+            releases="$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases \
+              --limit 1000 --json tagName --jq '.[].tagName')"
+            newest="$(
+              printf '%s\n' "$releases" "$GITHUB_REF_NAME" \
+                | sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1
+            )"
+            if [ "$newest" = "$version" ]; then latest=true; fi
+          fi
+          echo "marking $GITHUB_REF_NAME latest: $latest"
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest="$latest" --repo "$GITHUB_REPOSITORY"
