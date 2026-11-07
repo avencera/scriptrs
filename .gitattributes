@@ -1,0 +1,4 @@
+# LF in every checkout, Windows included: the PTX kernels are embedded with
+# include_str!, so CRLF would change what a Windows build ships to the driver
+* text=auto eol=lf
+*.wav binary
