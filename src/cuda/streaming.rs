@@ -13,11 +13,11 @@ use std::collections::hash_map::Entry;
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 
-use cudakit::{Graph, Library, Options};
+use cudakit::{Graph, Library};
 
 use crate::cuda::decoder::{CudaDecoder, DecodeRow, DecodeWorkspace, DecoderStates};
 use crate::cuda::encoder::{ChunkRow, CudaEncoder, StreamCaches, StreamWorkspace};
-use crate::cuda::kernels::CudaRuntime;
+use crate::cuda::kernels::{CudaRuntime, open_runtime};
 use crate::cuda::model::{ExclusiveTeardown, exclusive_device_work};
 use crate::cuda::{math, replay_or_capture};
 use crate::decode::RawTranscription;
@@ -143,7 +143,7 @@ impl StreamEngine {
         // taken before the runtime opens, so it outlives everything a failed load
         // drops on its way out, as in the offline engine
         let _exclusive = exclusive_device_work();
-        let runtime = CudaRuntime::open(0, Options::default())?;
+        let runtime = open_runtime()?;
         runtime.prepare(Library::Cublas)?;
         let encoder = CudaEncoder::load(&runtime, &file, spec.encoder, math(precision))?;
         let prompt = spec

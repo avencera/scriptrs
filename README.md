@@ -398,11 +398,16 @@ instead. cuBLASLt loads through cudarc's CUDA 12.4 bindings, which never look fo
 `cublasLt64_13.dll`, so with only a CUDA 13 toolkit the `low-precision` modes
 report cuBLASLt as missing.
 
-The driver and cuBLAS are opened by name with Windows' default DLL search, which
-looks in the current directory before `PATH`. cudarc tries several names for
-each library before the real one, such as `cuda.dll` before `nvcuda.dll` and
-`cublas.dll` before `cublas64_12.dll`, so a DLL with one of those names in the
-directory you run from would load. Run from folders you trust.
+cudarc opens the driver and cuBLAS by name, and tries several names before the
+real one, such as `cuda.dll` before `nvcuda.dll` and `cublas.dll` before
+`cublas64_12.dll`. Windows' default search would look for those in the current
+directory, so before the first model loads, scriptrs takes the current directory
+out of the DLL search with `SetDllDirectoryW("")`. It skips this if the host
+program already set a DLL directory, which removes the current directory too.
+The setting covers the whole process, including the host's own DLL loads. The
+executable's directory, System32, the Windows directory and `PATH` are still
+searched, and a relative `PATH` entry resolves against the current directory, so
+keep `PATH` to absolute directories you trust.
 
 ## Usage
 

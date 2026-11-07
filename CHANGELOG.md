@@ -18,7 +18,9 @@ The first release on PyPI. It has breaking changes to the Rust API; the README's
 - Windows x86_64 builds of the `cuda` feature. They open `nvcuda.dll`,
   `cublas64_12.dll` and, for `low-precision`, `cublasLt64_12.dll` at run time, and
   the Windows wheel installs cuBLAS from `nvidia-cublas-cu12` and loads it before the
-  first model. CI builds and tests them on a runner without a GPU; they haven't run
+  first model. Before the first model loads, scriptrs takes the current directory out
+  of the process's DLL search, so a DLL planted there under a name cudarc tries
+  can't load. CI builds and tests them on a runner without a GPU; they haven't run
   on a Windows GPU yet.
 - `TranscriptionScheduler` batches windows across concurrent requests on CUDA, for
   servers with many short requests. `SchedulerConfig::max_requests` bounds the requests

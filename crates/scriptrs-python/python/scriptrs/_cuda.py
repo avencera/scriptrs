@@ -9,9 +9,10 @@ resolve the ``libcublas.so.12`` lookup to the already-loaded copy, though a
 ``libcublas.so`` on the loader path, from a CUDA toolkit, still comes first.
 Windows reuses a loaded DLL with the requested name, from whatever directory it
 came from, so the wheel's copy wins there even over a toolkit on ``PATH``, which
-ships the same names. A ``cublas.dll`` or ``cublas64.dll`` on the search path
-would still load first, since the backend tries those names before
-``cublas64_12.dll``.
+ships the same names. A ``cublas.dll`` or ``cublas64.dll`` in the interpreter's
+directory or on ``PATH`` would still load first, since the backend tries those
+names before ``cublas64_12.dll``; it takes the current directory out of the
+search before its first load, so a copy there never does.
 """
 
 from __future__ import annotations
