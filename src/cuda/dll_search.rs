@@ -26,8 +26,9 @@ pub(crate) fn exclude_current_directory() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         // SAFETY: a zero-length buffer is never written; the call only reports the
-        // length of the directory the host set, 0 when there is none
-        if unsafe { GetDllDirectoryW(0, std::ptr::null_mut()) } > 0 {
+        // buffer the directory the host set would need, counting its terminating NUL,
+        // so 1 when there is none (and 0 if the query fails)
+        if unsafe { GetDllDirectoryW(0, std::ptr::null_mut()) } > 1 {
             return;
         }
 
@@ -51,7 +52,7 @@ mod tests {
     use std::path::PathBuf;
     use std::process::Command;
 
-    use super::exclude_current_directory;
+    use super::{SetDllDirectoryW, exclude_current_directory};
 
     /// Set only in the child run, to the probe DLL's file name
     const PROBE: &str = "SCRIPTRS_DLL_SEARCH_PROBE";
@@ -106,6 +107,11 @@ mod tests {
             return;
         };
 
+        // a child inherits its parent's DLL directory, so restore the default search,
+        // which includes the current directory, whatever launched the test runner
+        // SAFETY: a null path is the documented way to restore the default search
+        let reset = unsafe { SetDllDirectoryW(std::ptr::null()) };
+        assert_ne!(reset, 0, "reset the DLL search");
         assert!(
             loads(&name),
             "the probe should load from the current directory at first"
