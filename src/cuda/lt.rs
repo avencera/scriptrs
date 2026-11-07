@@ -5,7 +5,9 @@
 //! a handle of their own. cudakit's cudarc carries the CUDA 12.4 bindings, which
 //! predate the block-scale modes and the FP4 type, so the descriptor
 //! attributes and matrix layouts go through the raw entry points with the values of
-//! CUDA 13's `cublasLt.h`; the library itself is whatever cudakit loaded
+//! CUDA 13's `cublasLt.h`; the library itself is whatever cudakit's cudarc loads.
+//! The names it tries follow those 12.4 bindings, so on Windows it opens
+//! `cublasLt64_12.dll` and never `cublasLt64_13.dll`
 //!
 //! Each product shape gets a plan the first time it runs: the heuristic's candidates
 //! are timed into a scratch output and the fastest is kept, as cuBLASLt's first
@@ -107,6 +109,12 @@ pub(crate) struct LtProduct {
     pub(crate) beta: f32,
 }
 
+/// The cuBLASLt that cudarc's loader finds, for the error when there is none
+#[cfg(windows)]
+const LT_LIBRARY: &str = "cublasLt64_12.dll";
+#[cfg(not(windows))]
+const LT_LIBRARY: &str = "libcublasLt";
+
 /// Raw cuBLASLt entry points whose enum arguments cudakit's bindings lack
 struct Raw {
     set_attribute:
@@ -120,7 +128,7 @@ fn raw() -> Result<&'static Raw, Error> {
     RAW.get_or_init(|| {
         // SAFETY: checks for the library without loading symbols
         if !unsafe { sys::is_culib_present() } {
-            return Err("libcublasLt is not loadable".to_owned());
+            return Err(format!("{LT_LIBRARY} is not loadable"));
         }
         // SAFETY: the library is present, and both symbols have these C signatures in
         // every cuBLASLt from 11 on, with the enums passed as 32-bit integers

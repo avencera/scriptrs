@@ -37,8 +37,8 @@ symphonia = { version = "0.6.1", default-features = false, features = [
 ] }
 
 # one wheel per platform carries the backend that platform runs: Core ML on macOS
-# and native CUDA on Linux x86_64, so a plain `maturin build` produces the release
-# wheel. CUDA is loaded at run time, so the Linux wheel builds without a GPU or
-# CUDA toolkit
-[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+# and native CUDA on Linux and Windows x86_64, so a plain `maturin build` produces
+# the release wheel. CUDA is loaded at run time, so the Linux and Windows wheels
+# build without a GPU or CUDA toolkit
+[target.'cfg(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64"))'.dependencies]
 scriptrs = { path = "../..", features = ["online", "vad", "cuda"] }

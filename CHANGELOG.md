@@ -13,8 +13,13 @@ The first release on PyPI. It has breaking changes to the Rust API; the README's
 ### Added
 
 - Python package `scriptrs` on PyPI, with one wheel for every Python version from 3.11:
-  Core ML on macOS arm64 and CUDA on Linux x86_64. It includes the `scriptrs transcribe`
-  command.
+  Core ML on macOS arm64 and CUDA on Linux x86_64 and Windows x86_64. It includes the
+  `scriptrs transcribe` command.
+- Windows x86_64 builds of the `cuda` feature. They open `nvcuda.dll`,
+  `cublas64_12.dll` and, for `low-precision`, `cublasLt64_12.dll` at run time, and
+  the Windows wheel installs cuBLAS from `nvidia-cublas-cu12` and loads it before the
+  first model. CI builds and tests them on a runner without a GPU; they haven't run
+  on a Windows GPU yet.
 - `TranscriptionScheduler` batches windows across concurrent requests on CUDA, for
   servers with many short requests. `SchedulerConfig::max_requests` bounds the requests
   held at once, and `try_submit` returns `TranscriptionError::SchedulerFull` past it.

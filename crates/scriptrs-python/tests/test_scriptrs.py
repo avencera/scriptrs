@@ -30,8 +30,8 @@ def test_model_languages():
 
 
 def test_backend_matches_platform():
-    expected = {"darwin": "coreml", "linux": "cuda"}.get(sys.platform)
-    if sys.platform == "linux" and not _is_x86_64():
+    expected = {"darwin": "coreml", "linux": "cuda", "win32": "cuda"}.get(sys.platform)
+    if sys.platform in ("linux", "win32") and not _is_x86_64():
         expected = None
     assert scriptrs.BACKEND == expected
 
@@ -44,7 +44,7 @@ def _is_x86_64() -> bool:
 
 @pytest.mark.skipif(
     scriptrs.BACKEND != "cuda" or backend_available(),
-    reason="checks the error on a Linux machine without an NVIDIA driver",
+    reason="checks the error on a Linux or Windows machine without an NVIDIA driver",
 )
 def test_missing_driver_fails_before_download(tmp_path):
     with pytest.raises(scriptrs.ScriptrsError) as raised:

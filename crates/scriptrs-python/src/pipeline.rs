@@ -261,7 +261,13 @@ fn load(py: Python<'_>, bundle: ModelBundle, vad: bool) -> PyResult<PyPipeline> 
     .map_err(crate::transcription_err)
 }
 
-#[cfg(any(target_os = "macos", all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(any(
+    target_os = "macos",
+    all(
+        any(target_os = "linux", target_os = "windows"),
+        target_arch = "x86_64"
+    )
+))]
 fn download_err(error: impl std::fmt::Display) -> PyErr {
     scriptrs_err("model_download", format!("model download failed: {error}"))
 }
@@ -300,8 +306,11 @@ mod backend {
     }
 }
 
-/// Native CUDA weights on Linux x86_64
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+/// Native CUDA weights on Linux and Windows x86_64
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    target_arch = "x86_64"
+))]
 mod backend {
     use std::path::PathBuf;
 
@@ -338,7 +347,13 @@ mod backend {
 }
 
 /// No backend: the package imports, and loading a model reports the platform
-#[cfg(not(any(target_os = "macos", all(target_os = "linux", target_arch = "x86_64"))))]
+#[cfg(not(any(
+    target_os = "macos",
+    all(
+        any(target_os = "linux", target_os = "windows"),
+        target_arch = "x86_64"
+    )
+)))]
 mod backend {
     use std::path::PathBuf;
 
@@ -359,7 +374,7 @@ mod backend {
     ) -> PyResult<ModelBundle> {
         Err(scriptrs_err(
             "unsupported_platform",
-            "scriptrs runs on macOS (Core ML) and Linux x86_64 (CUDA) only",
+            "scriptrs runs on macOS (Core ML) and Linux or Windows x86_64 (CUDA) only",
         ))
     }
 

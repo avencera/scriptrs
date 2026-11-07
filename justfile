@@ -149,4 +149,7 @@ python-test *args: python-build
     uv venv -q --python 3.12 "$venv"
     version=$(cargo pkgid | sed 's/.*[#@]//')
     uv pip install -q --python "$venv" "target/wheels/scriptrs-${version}"-*.whl pytest numpy
-    "$venv"/bin/python -m pytest -rA {{args}}
+    # Windows venvs keep the interpreter in Scripts, not bin
+    python="$venv/bin/python"
+    if [ -x "$venv/Scripts/python.exe" ]; then python="$venv/Scripts/python.exe"; fi
+    "$python" -m pytest -rA {{args}}

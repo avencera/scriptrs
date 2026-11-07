@@ -4,7 +4,8 @@ Fast [NVIDIA Parakeet TDT](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) s
 
 - Parakeet TDT 0.6B v2 (English) and v3 (25 European languages)
 - Core ML on macOS
-- Native CUDA on Linux, with no ONNX Runtime or PyTorch (`cuda` feature)
+- Native CUDA on Linux, with no ONNX Runtime or PyTorch (`cuda` feature), and a
+  Windows build that has not run on a GPU yet (see [Windows](#windows))
 - Long-form transcription of hour-long recordings, with optional VAD
 - Token-level timestamps and confidences
 
@@ -28,15 +29,16 @@ The base crate exposes a single-chunk `TranscriptionPipeline`. Fast long-audio c
 - Optional VAD-backed long-form region planning
 - Scheduler for many inputs or concurrent requests of any length, batched on CUDA
 - Native CoreML inference on macOS
-- CUDA inference on Linux (`cuda` feature)
+- CUDA inference on Linux (`cuda` feature), and on Windows x86_64 untested on a GPU
 - Streaming transcription of many live streams at once with Nemotron Speech
   Streaming EN 0.6B and Nemotron 3.5 ASR Streaming 0.6B on CUDA
 - Hugging Face download support with optional local model loading
-- Python package on PyPI, with wheels for macOS arm64 and Linux x86_64
+- Python package on PyPI, with wheels for macOS arm64, Linux x86_64 and Windows x86_64
 
 ## What it does not do yet
 
-- Windows support
+- Tested Windows support: the Windows build passes CI, which has no GPU, and has
+  not transcribed on a Windows GPU yet
 - Other ASR models
 - Streaming on Core ML
 - Stable public guarantees around model layout or long-form behavior
@@ -48,7 +50,7 @@ The base crate exposes a single-chunk `TranscriptionPipeline`. Fast long-audio c
 scriptrs = "0.5"
 ```
 
-For native CUDA on Linux:
+For native CUDA on Linux or Windows:
 
 ```toml
 [dependencies]
@@ -378,6 +380,29 @@ requirements and measurements.
 Model downloads use [`hf-fetch`](https://github.com/avencera/hf-fetch), a small
 blocking client with rustls and the shared Python Hugging Face cache. The `online`
 feature enables downloads; local model loading works without it.
+
+### Windows
+
+The `cuda` feature builds for Windows x86_64 with the MSVC toolchain. CUDA loads
+at run time, so building needs no GPU or CUDA toolkit. CI runs clippy and the
+tests on a Windows runner and builds and tests the Windows Python wheel there,
+but that runner has no GPU, and nobody has transcribed on a Windows GPU yet.
+Treat Windows as untested until then, and please open an issue with what you
+find.
+
+At run time it needs the NVIDIA driver, which installs `nvcuda.dll`, and cuBLAS
+12: `cublas64_12.dll`, plus `cublasLt64_12.dll` for the `low-precision` modes. A
+CUDA 12 toolkit keeps them in `%CUDA_PATH%\bin`, so put that directory on
+`PATH`. The Python wheel installs its own from the `nvidia-cublas-cu12` package
+instead. cuBLASLt loads through cudarc's CUDA 12.4 bindings, which never look for
+`cublasLt64_13.dll`, so with only a CUDA 13 toolkit the `low-precision` modes
+report cuBLASLt as missing.
+
+The driver and cuBLAS are opened by name with Windows' default DLL search, which
+looks in the current directory before `PATH`. cudarc tries several names for
+each library before the real one, such as `cuda.dll` before `nvcuda.dll` and
+`cublas.dll` before `cublas64_12.dll`, so a DLL with one of those names in the
+directory you run from would load. Run from folders you trust.
 
 ## Usage
 
