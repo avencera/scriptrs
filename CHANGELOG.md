@@ -5,7 +5,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions f
 [Semantic Versioning](https://semver.org/). The Rust crate and the Python package share
 one version.
 
-## [Unreleased]
+## [0.5.0] - 2026-11-07
 
 The first release on PyPI. It has breaking changes to the Rust API; the README's
 "Breaking changes in 0.5.0" section lists what to write instead.
@@ -77,5 +77,5 @@ The first release on PyPI. It has breaking changes to the Rust API; the README's
 - VAD regions are padded by 0.2 s so soft first words are kept.
 - The relative-position attention runs as one fused kernel on CUDA.
 
-[Unreleased]: https://github.com/avencera/scriptrs/compare/v0.4.0...HEAD
+[0.5.0]: https://github.com/avencera/scriptrs/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/avencera/scriptrs/releases/tag/v0.4.0
