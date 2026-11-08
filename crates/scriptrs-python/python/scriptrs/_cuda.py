@@ -1,18 +1,14 @@
 """Find the NVIDIA driver and make pip-installed cuBLAS visible to the CUDA backend.
 
-The native CUDA backend opens the driver and cuBLAS 12 at run time by name:
-``libcuda.so.1``, then ``libcublas.so`` and ``libcublas.so.12`` on Linux, and
-``nvcuda.dll``, ``cublas64_12.dll`` and ``cublasLt64_12.dll`` on Windows. The
+The native CUDA backend opens the driver and cuBLAS at run time by name:
+``libcuda.so.1`` and ``libcublas.so.12`` on Linux, and ``nvcuda.dll`` and
+``cublas64_12.dll`` on Windows, then the CUDA 13 names. The
 ``nvidia-cublas-cu12`` wheel installs cuBLAS inside site-packages, where neither
-loader looks, so it is loaded here first. On Linux ``RTLD_GLOBAL`` makes glibc
-resolve the ``libcublas.so.12`` lookup to the already-loaded copy, though a
-``libcublas.so`` on the loader path, from a CUDA toolkit, still comes first.
-Windows reuses a loaded DLL with the requested name, from whatever directory it
-came from, so the wheel's copy wins there even over a toolkit on ``PATH``, which
-ships the same names. A ``cublas.dll`` or ``cublas64.dll`` in the interpreter's
-directory or on ``PATH`` would still load first, since the backend tries those
-names before ``cublas64_12.dll``; it takes the current directory out of the
-search before its first load, so a copy there never does.
+loader looks, so it is loaded here first. Both loaders reuse a library the
+process already holds under the name they ask for: glibc matches the
+``libcublas.so.12`` lookup to the loaded copy's soname, and on Windows the
+backend checks for a loaded module of that name before it searches. The wheel's
+copy therefore wins over a CUDA toolkit's, which ships the same names.
 """
 
 from __future__ import annotations

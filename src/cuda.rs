@@ -5,8 +5,6 @@
 
 pub(crate) mod batcher;
 pub(crate) mod decoder;
-#[cfg(windows)]
-mod dll_search;
 pub(crate) mod encoder;
 pub(crate) mod fp16;
 pub(crate) mod kernels;

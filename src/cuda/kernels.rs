@@ -9,8 +9,8 @@ use cudakit::cudarc::driver::{
     CudaFunction, CudaStream, CudaView, CudaViewMut, LaunchArgs, LaunchConfig, PushKernelArg,
 };
 use cudakit::{
-    AreaPtx, EmbeddedPtx, Error, ExtraSymbols, KernelArea, LibraryPolicy, LoadedKernels, Options,
-    Profile, PtxTier, Runtime, TierSet, check_len, element_count,
+    AreaPtx, EmbeddedPtx, Error, ExtraSymbols, KernelArea, LibraryPolicy, LoadedKernels, Profile,
+    PtxTier, Runtime, TierSet, check_len, element_count,
 };
 
 use crate::cuda::fp16;
@@ -98,16 +98,6 @@ impl KernelArea for KernelModule {
 }
 
 pub(crate) type CudaRuntime = Runtime<KernelModule>;
-
-/// Opens the runtime on the first GPU, the first CUDA library load a model makes
-///
-/// On Windows the current directory leaves the DLL search first, since cudarc opens
-/// the driver and cuBLAS by bare name (see `dll_search`)
-pub(crate) fn open_runtime() -> Result<CudaRuntime, Error> {
-    #[cfg(windows)]
-    crate::cuda::dll_search::exclude_current_directory();
-    CudaRuntime::open(0, Options::default())
-}
 
 /// Threads per block for the one-thread-per-element kernels
 pub(crate) const ELEMENT_THREADS: u32 = 256;

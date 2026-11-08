@@ -13,12 +13,12 @@ use std::ops::Deref;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use cudakit::{Graph, Library};
+use cudakit::{Graph, Library, Options};
 
 use crate::backend::{ChunkDecode, DecodePolicy, EncoderChunk, LanguageMask};
 use crate::cuda::decoder::{CudaDecoder, DecodeWorkspace};
 use crate::cuda::encoder::{CudaEncoder, EncoderWorkspace};
-use crate::cuda::kernels::{CudaRuntime, open_runtime};
+use crate::cuda::kernels::CudaRuntime;
 use crate::cuda::{math, replay_or_capture};
 use crate::deployment::ParakeetDeployment;
 use crate::error::TranscriptionError;
@@ -228,7 +228,7 @@ impl CudaModel {
         // taken before the runtime opens, so it outlives everything a failed load
         // drops on its way out, which is the same teardown an engine's drop does
         let _exclusive = exclusive_device_work();
-        let runtime = open_runtime()?;
+        let runtime = CudaRuntime::open(0, Options::default())?;
         runtime.prepare(Library::Cublas)?;
         let encoder = CudaEncoder::load(&runtime, &file, spec.encoder, math(precision))?;
         let decoder = CudaDecoder::load(&runtime, &file, &spec.transducer)?;

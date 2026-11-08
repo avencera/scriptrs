@@ -391,23 +391,18 @@ Treat Windows as untested until then, and please open an issue with what you
 find.
 
 At run time it needs the NVIDIA driver, which installs `nvcuda.dll`, and cuBLAS
-12: `cublas64_12.dll`, plus `cublasLt64_12.dll` for the `low-precision` modes. A
-CUDA 12 toolkit keeps them in `%CUDA_PATH%\bin`, so put that directory on
-`PATH`. The Python wheel installs its own from the `nvidia-cublas-cu12` package
-instead. cuBLASLt loads through cudarc's CUDA 12.4 bindings, which never look for
-`cublasLt64_13.dll`, so with only a CUDA 13 toolkit the `low-precision` modes
-report cuBLASLt as missing.
+12 or 13: `cublas64_12.dll` or `cublas64_13.dll`, with the matching
+`cublasLt64_*.dll` beside it. scriptrs looks for them in the executable's
+directory and System32, then each absolute `PATH` entry, then
+`%CUDA_PATH%\bin\x64` (where CUDA 13 keeps its DLLs) and `%CUDA_PATH%\bin`
+(CUDA 12), so an installed CUDA toolkit is found without changing `PATH`. The
+Python wheel installs cuBLAS 12 from the `nvidia-cublas-cu12` package instead.
 
-cudarc opens the driver and cuBLAS by name, and tries several names before the
-real one, such as `cuda.dll` before `nvcuda.dll` and `cublas.dll` before
-`cublas64_12.dll`. Windows' default search would look for those in the current
-directory, so before the first model loads, scriptrs takes the current directory
-out of the DLL search with `SetDllDirectoryW("")`. It skips this if the host
-program already set a DLL directory, which removes the current directory too.
-The setting covers the whole process, including the host's own DLL loads. The
-executable's directory, System32, the Windows directory and `PATH` are still
-searched, and a relative `PATH` entry resolves against the current directory, so
-keep `PATH` to absolute directories you trust.
+The driver loads only from System32, and no CUDA library loads from the current
+directory or a relative `PATH` entry, so a DLL planted in the folder a program
+runs from is never picked up. Each library found on `PATH` or under `CUDA_PATH`
+loads by full path, and its own imports come from its directory, so cuBLAS
+always pairs with the cuBLASLt from the same install.
 
 ## Usage
 
