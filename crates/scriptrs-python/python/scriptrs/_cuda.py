@@ -53,11 +53,22 @@ def prepare() -> None:
             _prepared = True
 
 
+def _driver_path() -> str:
+    """The driver to load: System32's copy on Windows, the loader's soname elsewhere."""
+    if sys.platform != "win32":
+        return DRIVER
+    # a full System32 path, as the backend loads the driver, since a bare name would
+    # also search the interpreter's directory for a planted nvcuda.dll
+    buffer = ctypes.create_unicode_buffer(260)
+    length = ctypes.windll.kernel32.GetSystemDirectoryW(buffer, len(buffer))
+    if not 0 < length < len(buffer):
+        raise OSError("could not find the System32 directory")
+    return str(Path(buffer.value) / DRIVER)
+
+
 def _check_driver() -> None:
     try:
-        # on Windows a bare name searches the application directory and System32,
-        # where the driver puts nvcuda.dll, but not the current directory
-        ctypes.CDLL(DRIVER)
+        ctypes.CDLL(_driver_path())
     except OSError:
         raise ScriptrsError(
             "cuda",

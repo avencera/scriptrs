@@ -398,11 +398,13 @@ directory and System32, then each absolute `PATH` entry, then
 (CUDA 12), so an installed CUDA toolkit is found without changing `PATH`. The
 Python wheel installs cuBLAS 12 from the `nvidia-cublas-cu12` package instead.
 
-The driver loads only from System32, and no CUDA library loads from the current
-directory or a relative `PATH` entry, so a DLL planted in the folder a program
-runs from is never picked up. Each library found on `PATH` or under `CUDA_PATH`
-loads by full path, and its own imports come from its directory, so cuBLAS
-always pairs with the cuBLASLt from the same install.
+The driver loads only from System32, in the Python package's driver check too,
+and no CUDA library loads from the current directory or a relative `PATH`
+entry, so a DLL planted in the folder a program runs from is never picked up.
+Each library found on `PATH` or under `CUDA_PATH` loads by full path, and its
+own imports come from its directory, so cuBLAS binds the cuBLASLt beside it.
+The exception is a process that already loaded a cuBLASLt from another install:
+Windows reuses that one, and a mismatched pair can fail its first product.
 
 ## Usage
 
