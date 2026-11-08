@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 import scriptrs
+from scriptrs._cuda import _driver_path
 
 DATA = Path(__file__).resolve().parent / "data"
 # LibriSpeech test-clean 1089-134686-0007, CC BY 4.0
@@ -35,7 +36,7 @@ def normalize(text: str) -> str:
 def backend_available() -> bool:
     if scriptrs.BACKEND == "cuda":
         try:
-            ctypes.CDLL("libcuda.so.1")
+            ctypes.CDLL(_driver_path())
         except OSError:
             return False
     return scriptrs.BACKEND is not None

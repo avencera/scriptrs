@@ -6,7 +6,9 @@
 //! `scriptrs` is currently a narrow transcription crate:
 //!
 //! - CoreML on macOS, and CUDA on Linux behind the `cuda` feature
-//!   (see `ModelBundle::from_pretrained_native` and `ModelBundle::from_native_dir`)
+//!   (see `ModelBundle::from_pretrained_native` and `ModelBundle::from_native_dir`).
+//!   The `cuda` feature also builds for Windows x86_64, where CI checks it on a
+//!   runner without a GPU; it has not run on a Windows GPU yet
 //! - Parakeet TDT v2 and v3
 //! - mono 16kHz `&[f32]` input
 //!

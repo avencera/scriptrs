@@ -12,6 +12,7 @@ pip install scriptrs
 | --- | --- |
 | macOS arm64 | Core ML |
 | Linux x86_64 (glibc 2.28+) | CUDA, on a Turing (RTX 20, T4) or newer NVIDIA GPU |
+| Windows x86_64 | CUDA, as on Linux; not yet run on a GPU |
 
 The package needs Python 3.11 or newer. One wheel covers every Python version.
 
@@ -113,14 +114,19 @@ uv tool install scriptrs
 
 ## CUDA
 
-The Linux wheel needs an NVIDIA driver, but no CUDA toolkit: it installs cuBLAS
-from the `nvidia-cublas-cu12` package. The default `precision="fp16"` is the
-fastest. `"tf32"` keeps the weights in FP32, and `"fp32"` matches NVIDIA NeMo's
-FP32 output token for token:
+The Linux and Windows wheels need an NVIDIA driver, but no CUDA toolkit: they
+install cuBLAS from the `nvidia-cublas-cu12` package. The default
+`precision="fp16"` is the fastest. `"tf32"` keeps the weights in FP32, and
+`"fp32"` matches NVIDIA NeMo's FP32 output token for token:
 
 ```python
 pipeline = scriptrs.Pipeline.from_pretrained("parakeet/v3", precision="fp32")
 ```
+
+The Windows wheel builds and passes its tests in CI on a runner without a GPU,
+but nobody has transcribed with it on a Windows GPU yet. It loads the driver's
+`nvcuda.dll` and the `nvidia-cublas-cu12` package's `cublas64_12.dll` and
+`cublasLt64_12.dll`. If transcription fails there, please open an issue.
 
 ## Models
 
@@ -129,7 +135,7 @@ when given, else the Hugging Face hub cache that `HF_HUB_CACHE` or `HF_HOME`
 sets, else `~/.cache/huggingface/hub`. On macOS a model is about
 0.6 GB of Core ML models from
 [`avencera/scriptrs-models`](https://huggingface.co/avencera/scriptrs-models).
-On Linux it is about 2.5 GB of weights from
+On Linux and Windows it is about 2.5 GB of weights from
 [`avencera/parakeet-tdt-0.6b-v2-cuda`](https://huggingface.co/avencera/parakeet-tdt-0.6b-v2-cuda)
 or [`avencera/parakeet-tdt-0.6b-v3-cuda`](https://huggingface.co/avencera/parakeet-tdt-0.6b-v3-cuda).
 

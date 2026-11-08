@@ -1,4 +1,4 @@
-"""Fast NVIDIA Parakeet TDT speech-to-text, on Core ML (macOS) and CUDA (Linux).
+"""Fast NVIDIA Parakeet TDT speech-to-text, on Core ML (macOS) and CUDA (Linux and Windows).
 
 Pick a model when you load the pipeline, then transcribe files or 16 kHz mono
 samples::
@@ -133,8 +133,8 @@ class Pipeline:
         """Download ``model`` from Hugging Face if needed, then load it.
 
         The first call downloads the model, about 0.6 GB of Core ML models on
-        macOS or 2.5 GB of weights on Linux, into ``cache_dir`` when given, else
-        the Hugging Face hub cache that ``HF_HUB_CACHE`` or ``HF_HOME`` sets, else
+        macOS or 2.5 GB of weights on Linux and Windows, into ``cache_dir`` when
+        given, else the Hugging Face hub cache that ``HF_HUB_CACHE`` or ``HF_HOME`` sets, else
         ``~/.cache/huggingface/hub``; later calls load from the cache. Setting
         ``SCRIPTRS_MODELS_DIR`` loads a local directory instead, as
         :meth:`from_dir` does.
@@ -144,7 +144,7 @@ class Pipeline:
         when the higher of its v5 and v6 speech probabilities is at least 0.6.
 
         Raises :class:`ScriptrsError` with code ``model_download`` when a
-        download fails, or ``cuda`` when Linux has no NVIDIA driver.
+        download fails, or ``cuda`` when Linux or Windows has no NVIDIA driver.
         """
         model = _model(model)
         precision = _precision(precision)
@@ -163,8 +163,8 @@ class Pipeline:
     ) -> Pipeline:
         """Load ``model`` from a local directory instead of downloading it.
 
-        On macOS the directory holds Core ML models, and on Linux native weights,
-        in the layouts the scriptrs README describes.
+        On macOS the directory holds Core ML models, and on Linux and Windows
+        native weights, in the layouts the scriptrs README describes.
         """
         model = _model(model)
         precision = _precision(precision)

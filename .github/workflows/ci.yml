@@ -74,6 +74,10 @@ jobs:
             os: ubuntu-24.04
           - name: macOS arm64
             os: macos-15
+          # the CUDA backend and the Python bindings' CUDA path, as on Linux; there is
+          # no GPU here either
+          - name: Windows x86_64
+            os: windows-2025
     steps:
       - uses: actions/checkout@v6
 

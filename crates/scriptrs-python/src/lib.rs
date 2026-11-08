@@ -21,7 +21,10 @@ use results::{PyTimedToken, PyTranscriptChunk, PyTranscriptionResult};
 /// Backend compiled into this build, or `None` where scriptrs has no backend
 const BACKEND: Option<&str> = if cfg!(target_os = "macos") {
     Some("coreml")
-} else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+} else if cfg!(all(
+    any(target_os = "linux", target_os = "windows"),
+    target_arch = "x86_64"
+)) {
     Some("cuda")
 } else {
     None
@@ -50,7 +53,10 @@ pub(crate) fn transcription_code(error: &TranscriptionError) -> &'static str {
             "invalid_model"
         }
         TranscriptionError::UnsupportedPlatform => "unsupported_platform",
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(all(
+            any(target_os = "linux", target_os = "windows"),
+            target_arch = "x86_64"
+        ))]
         TranscriptionError::Cuda(_) => "cuda",
         TranscriptionError::CoreMl(_) => "coreml",
         TranscriptionError::Io(_) => "io",

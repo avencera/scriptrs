@@ -120,7 +120,7 @@ fn raw() -> Result<&'static Raw, Error> {
     RAW.get_or_init(|| {
         // SAFETY: checks for the library without loading symbols
         if !unsafe { sys::is_culib_present() } {
-            return Err("libcublasLt is not loadable".to_owned());
+            return Err("cuBLASLt 12 or 13 is not loadable".to_owned());
         }
         // SAFETY: the library is present, and both symbols have these C signatures in
         // every cuBLASLt from 11 on, with the enums passed as 32-bit integers

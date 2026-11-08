@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "scriptrs"
 dynamic = ["version"]
-description = "Fast NVIDIA Parakeet TDT v2 and v3 speech-to-text on Core ML (macOS) and CUDA (Linux)"
+description = "Fast NVIDIA Parakeet TDT v2 and v3 speech-to-text on Core ML (macOS) and CUDA (Linux and Windows)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -17,6 +17,7 @@ classifiers = [
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
@@ -29,9 +30,10 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Typing :: Typed",
 ]
-# the CUDA backend runs every encoder matrix multiply through cuBLAS
+# the CUDA backend runs every encoder matrix multiply through cuBLAS. Not every
+# cuBLAS 12 release has a Windows wheel, and pip takes the newest one that does
 dependencies = [
-    "nvidia-cublas-cu12>=12.4; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "nvidia-cublas-cu12>=12.4; (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
 ]
 
 [project.scripts]

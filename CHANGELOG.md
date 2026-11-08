@@ -5,7 +5,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions f
 [Semantic Versioning](https://semver.org/). The Rust crate and the Python package share
 one version.
 
-## [Unreleased]
+## [0.5.0] - 2026-11-07
 
 The first release on PyPI. It has breaking changes to the Rust API; the README's
 "Breaking changes in 0.5.0" section lists what to write instead.
@@ -13,8 +13,13 @@ The first release on PyPI. It has breaking changes to the Rust API; the README's
 ### Added
 
 - Python package `scriptrs` on PyPI, with one wheel for every Python version from 3.11:
-  Core ML on macOS arm64 and CUDA on Linux x86_64. It includes the `scriptrs transcribe`
-  command.
+  Core ML on macOS arm64 and CUDA on Linux x86_64 and Windows x86_64. It includes the
+  `scriptrs transcribe` command.
+- Windows x86_64 builds of the `cuda` feature. They open `nvcuda.dll` from System32
+  and cuBLAS 12 or 13 (`cublas64_12.dll` or `cublas64_13.dll` and its cuBLASLt) at
+  run time, never from the current directory. The Windows wheel installs cuBLAS from
+  `nvidia-cublas-cu12` and loads it before the first model. CI builds and tests them
+  on a runner without a GPU; they haven't run on a Windows GPU yet.
 - `TranscriptionScheduler` batches windows across concurrent requests on CUDA, for
   servers with many short requests. `SchedulerConfig::max_requests` bounds the requests
   held at once, and `try_submit` returns `TranscriptionError::SchedulerFull` past it.
@@ -28,6 +33,11 @@ The first release on PyPI. It has breaking changes to the Rust API; the README's
 
 ### Changed
 
+- The CUDA backend uses cudakit 0.3, which loads the CUDA libraries through its cudarc
+  fork. On Linux it opens versioned sonames such as `libcublas.so.12` before a
+  toolkit's unversioned `libcublas.so`, so it reuses the cuBLAS the Python wheel
+  loaded instead of opening a second copy. `low-precision` no longer depends on
+  upstream `cudarc`.
 - `TranscriptionConfig` has only `language`. The frontend settings and the input limit
   come from the model bundle. `from_deployment` and `validate_for` are gone.
 - `TranscriptionError::Control` wraps `TranscriptionControlError` in place of the three
@@ -67,5 +77,5 @@ The first release on PyPI. It has breaking changes to the Rust API; the README's
 - VAD regions are padded by 0.2 s so soft first words are kept.
 - The relative-position attention runs as one fused kernel on CUDA.
 
-[Unreleased]: https://github.com/avencera/scriptrs/compare/v0.4.0...HEAD
+[0.5.0]: https://github.com/avencera/scriptrs/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/avencera/scriptrs/releases/tag/v0.4.0

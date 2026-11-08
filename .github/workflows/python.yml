@@ -60,8 +60,9 @@ jobs:
       - name: Package and build as a dependency
         run: just package
 
-  # one abi3 wheel per platform with the backend that platform runs; the Linux
-  # wheel builds without a GPU or CUDA toolkit because CUDA is loaded at run time
+  # one abi3 wheel per platform with the backend that platform runs; the Linux and
+  # Windows wheels build without a GPU or CUDA toolkit because CUDA is loaded at run
+  # time
   wheels:
     name: Wheel (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
@@ -73,12 +74,35 @@ jobs:
             os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             manylinux: "2_28"
+            rustflags: -D warnings
           - name: macOS arm64, Core ML
             os: macos-15
             target: aarch64-apple-darwin
             manylinux: "off"
+            rustflags: -D warnings
+          # the C runtime is linked statically, so the extension runs without the
+          # Visual C++ redistributable whichever Python loads it. RUSTFLAGS replaces the
+          # per-target flags rather than adding to them, so each target spells out its
+          # full set
+          - name: Windows x86_64, CUDA
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+            manylinux: "off"
+            rustflags: -D warnings -C target-feature=+crt-static
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       - uses: actions/checkout@v6
+
+      # a Windows checkout without symlink support writes the LICENSE symlink as a text
+      # file holding its target, which maturin would ship in the wheel as the license;
+      # removing it first keeps cp from writing through a real symlink onto itself
+      - name: Resolve the LICENSE symlink
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          rm -f crates/scriptrs-python/LICENSE
+          cp LICENSE crates/scriptrs-python/LICENSE
 
       - name: Build wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
@@ -101,6 +125,29 @@ jobs:
             echo "$(basename "$wheel"): $size bytes"
             test "$size" -le "$limit"
           done
+
+      # CUDA must load at run time and the C runtime is static, so the extension may
+      # import only Python's stable ABI and Windows system DLLs
+      - name: Check the extension's imports
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          unpacked="$RUNNER_TEMP/wheel"
+          mkdir -p "$unpacked"
+          # 7-Zip ships on the runner image, and a wheel is a zip
+          7z x -y dist/*.whl -o"$unpacked" > /dev/null
+          ext="$(find "$unpacked" -name '_native*.pyd' -print -quit)"
+          test -n "$ext"
+          rustup component add llvm-tools
+          readobj="$(cygpath -u "$(rustc --print sysroot)")/lib/rustlib/x86_64-pc-windows-msvc/bin/llvm-readobj.exe"
+          # a Windows tool's output ends lines with CRLF
+          imports="$("$readobj" --coff-imports "$ext" | tr -d '\r' | sed -n 's/^ *Name: //p' | sort -u)"
+          echo "$imports"
+          if grep -Eiv '^(python3|kernel32|ntdll|advapi32|bcrypt|bcryptprimitives|ws2_32|userenv|secur32|crypt32|ole32|oleaut32|shell32|user32|synchronization|api-ms-win-core-[a-z0-9-]+)\.dll$' <<< "$imports"; then
+            echo "the extension imports a DLL outside Python and Windows itself" >&2
+            exit 1
+          fi
 
       - name: Upload wheel
         uses: actions/upload-artifact@v7
@@ -175,6 +222,10 @@ jobs:
           - name: macOS arm64
             os: macos-15
             target: aarch64-apple-darwin
+          # no NVIDIA driver either, so the same checks as on Linux
+          - name: Windows x86_64
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
         # the one abi3 wheel serves every version, so test the oldest and the newest
         python: ["3.11", "3.14"]
     env:
@@ -199,8 +250,14 @@ jobs:
           uv pip install --python .venv-wheel dist/*.whl pytest numpy
 
       - name: Run tests
+        shell: bash
         working-directory: crates/scriptrs-python
-        run: ../../.venv-wheel/bin/python -m pytest -rA
+        run: |
+          set -euo pipefail
+          # Windows venvs keep the interpreter in Scripts, not bin
+          python=../../.venv-wheel/bin/python
+          if [ "$RUNNER_OS" = Windows ]; then python=../../.venv-wheel/Scripts/python.exe; fi
+          "$python" -m pytest -rA
 
   # checks a tag before anything is published: the crate's version must match it, and
   # CHANGELOG.md needs its entry, which becomes the GitHub release notes
@@ -260,7 +317,8 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           ls -la dist
-          test "$(find dist -type f | wc -l)" -eq 3
+          # the Linux, macOS and Windows wheels and the sdist
+          test "$(find dist -type f | wc -l)" -eq 4
           for file in dist/*; do
             case "$(basename "$file")" in
               "scriptrs-${version}"-*.whl | "scriptrs-${version}.tar.gz") ;;
@@ -286,6 +344,8 @@ jobs:
             os: ubuntu-24.04
           - name: macOS arm64
             os: macos-15
+          - name: Windows x86_64
+            os: windows-2025
     steps:
       - uses: actions/checkout@v6
 
@@ -309,10 +369,13 @@ jobs:
             test "$attempt" -lt 10
             sleep 30
           done
-          .venv-release/bin/python -c "import scriptrs; print(scriptrs.__version__, scriptrs.BACKEND)"
+          # Windows venvs keep their programs in Scripts, not bin
+          bin=.venv-release/bin
+          if [ "$RUNNER_OS" = Windows ]; then bin=.venv-release/Scripts; fi
+          "$bin/python" -c "import scriptrs; print(scriptrs.__version__, scriptrs.BACKEND)"
           # only the macOS runner has a backend that can transcribe
           if [ "$RUNNER_OS" = "macOS" ]; then
-            text="$(.venv-release/bin/scriptrs transcribe --model parakeet/v2 crates/scriptrs-python/tests/data/librispeech-1089-134686-0007.wav)"
+            text="$("$bin/scriptrs" transcribe --model parakeet/v2 crates/scriptrs-python/tests/data/librispeech-1089-134686-0007.wav)"
             printf '%s\n' "$text"
             grep -qi 'indifference' <<< "$text"
           fi
