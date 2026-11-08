@@ -17,7 +17,7 @@
 # crates.io all trust this workflow through OIDC, so no token is stored. Every publish
 # skips files already uploaded, so "Re-run failed jobs" finishes a partial release
 
-name: Python
+name: Package
 
 on:
   workflow_dispatch: {}
