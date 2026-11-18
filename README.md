@@ -71,50 +71,6 @@ For VAD-backed long-form transcription:
 scriptrs = { version = "0.5", features = ["vad"] }
 ```
 
-## Breaking changes in 0.5.0
-
-- `TranscriptionConfig` has only a `language` field. The frontend settings and
-  the single-chunk limit belong to the model's deployment, so read them from
-  `pipeline.deployment().frontend()` and `pipeline.deployment().hard_sample_max()`
-  instead of `pipeline.config()`. Write `TranscriptionConfig { language }` or
-  `TranscriptionConfig::default()` in place of
-  `TranscriptionConfig::from_deployment(..)`; `validate_for` is gone.
-- With `long-form`, `TranscriptionError::Cancelled`, `DeadlineExpired` and
-  `WindowLimitExceeded` are now wrapped in `TranscriptionError::Control`, with
-  the same messages. Match
-  `TranscriptionError::Control(TranscriptionControlError::Cancelled)` instead of
-  `TranscriptionError::Cancelled`, and likewise for the other two.
-- `VadConfig` is gone. The speech threshold is now
-  `VadSegmentationConfig::threshold`: set `config.segmentation.threshold`
-  instead of `config.vad.default_threshold`.
-- VAD mode defaults to Silero fusion (`VadModel::SileroFusion`): it scores each
-  window with both Silero VAD v5 and v6 and keeps the higher probability, at a 0.6 threshold, in place of v5 alone at 0.5. Set
-  `config.segmentation = VadSegmentationConfig::for_model(VadModel::SileroV5)`
-  to keep v5-only planning. `VadSegmentationConfig` has a new `model` field, so
-  struct literals that list every field need it. VAD bundles need both models
-  (see [Local model layout](#local-model-layout)), and
-  `ModelBundle::validate_long_form` checks for both.
-- `Vocabulary` loads only through a deployment, with
-  `Vocabulary::load(path, &deployment)` or
-  `Vocabulary::from_bytes(bytes, &deployment)`. `load` takes the deployment in
-  place of a `VocabKind`, and the two replace `load_for_deployment`,
-  `from_bytes_for_deployment` and the other `from_file`, `from_json` and
-  SentencePiece constructors. `VocabKind`,
-  `ModelLayout::vocab_kind` and `ParakeetDeployment::vocab_kind` are gone; the
-  deployment's version picks the tokenizer format.
-- Long-form transcription runs audio as one window only up to
-  `config.overlap.max_model_samples` (`LongFormConfig::single_window_samples`),
-  not up to the model's input limit. On native CUDA bundles, clips from 30 to
-  40 s are now split into windows, and in VAD mode scanned for speech. The
-  Python `max_chunk_seconds` is 30 on CUDA.
-- `LongFormConfig::validate_for` rejects `config.overlap.context_samples` that
-  is not a whole number of encoder frames (1280 samples), or that leaves no room
-  for one frame of audio in `config.overlap.max_model_samples`. Round the
-  context to a multiple of 1280 below that limit.
-- `select_language_from_logits` returns `TranscriptionError::InvalidModelOutput`
-  when `languages` and `logits` differ in length, instead of reading only the
-  shorter prefix. Pass one logit per language.
-
 ## Python
 
 ```sh
