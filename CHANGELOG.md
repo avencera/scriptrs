@@ -5,6 +5,17 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions f
 [Semantic Versioning](https://semver.org/). The Rust crate and the Python package share
 one version.
 
+## [0.5.1] - 2026-11-23
+
+### Fixed
+
+- Long-form token timestamps no longer run backward where two overlapping windows
+  meet. When one window heard a short restart that the other missed, such as "solve a
+  this a similar" against "solve a similar", the merge gave a few tokens the earlier
+  window's timestamps, which belong to a later word. A token could then start before
+  the one ahead of it, and a word built from its tokens could end before it started.
+  The text is unchanged, and those tokens now take the later window's timestamps.
+
 ## [0.5.0] - 2026-11-07
 
 The first release on PyPI. It has breaking changes to the Rust API; the README's
@@ -77,5 +88,6 @@ The first release on PyPI. It has breaking changes to the Rust API; the README's
 - VAD regions are padded by 0.2 s so soft first words are kept.
 - The relative-position attention runs as one fused kernel on CUDA.
 
+[0.5.1]: https://github.com/avencera/scriptrs/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/avencera/scriptrs/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/avencera/scriptrs/releases/tag/v0.4.0
