@@ -14,7 +14,9 @@ one version.
   this a similar" against "solve a similar", the merge gave a few tokens the earlier
   window's timestamps, which belong to a later word. A token could then start before
   the one ahead of it, and a word built from its tokens could end before it started.
-  The text is unchanged, and those tokens now take the later window's timestamps.
+  Those tokens now take the later window's timestamps, and the text stays the same.
+  In the rare case where the two windows' timings can't be joined in order, a later
+  window's token that would start too early starts with the token before it instead.
 
 ## [0.5.0] - 2026-11-07
 

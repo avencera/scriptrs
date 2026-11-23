@@ -76,7 +76,7 @@ impl AgreedRun {
             .find(|seam| seam.is_ordered(left, right))
             // no handover point keeps frames in order, as when right's timing runs
             // well ahead of left's along the whole run; the run's end keeps the
-            // most of `left`, and `join` drops the right tokens that run back
+            // most of `left`, and `join` retimes the right tokens that run back
             .unwrap_or(Seam {
                 left_end: self.left + self.len,
                 right_start: self.right + self.len,
@@ -158,21 +158,24 @@ impl Seam {
             .is_none_or(|first_right| first_right.frame >= left.tokens[last_left].frame)
     }
 
-    /// Joins the two sides, dropping any `right` token that would start before
-    /// the token kept ahead of it
+    /// Joins the two sides, moving any `right` token that would start before the
+    /// token kept ahead of it to that token's frame
     ///
-    /// Each window's frames already rise, so with an ordered seam this drops
-    /// nothing; it holds the merged order whatever the windows hold, since a
-    /// token that runs back is a second copy of audio already transcribed
+    /// Each window's frames already rise, so with an ordered seam this moves
+    /// nothing. It holds the merged order whatever the seam: the `right` tokens
+    /// kept are the text after everything kept from `left`, never a second copy of
+    /// it, so a token that runs back is retimed rather than dropped
     fn join(self, left: RawTranscription, right: RawTranscription) -> RawTranscription {
         let mut tokens = left.tokens;
         tokens.truncate(self.left_end);
         let mut last_frame = tokens.last().map_or(0, |token| token.frame);
         let rest = right.tokens.into_iter().skip(self.right_start);
-        tokens.extend(rest.filter(|token: &RawToken| {
-            let in_order = token.frame >= last_frame;
+        tokens.extend(rest.map(|token| {
             last_frame = last_frame.max(token.frame);
-            in_order
+            RawToken {
+                frame: last_frame,
+                ..token
+            }
         }));
         RawTranscription { tokens }
     }
@@ -291,17 +294,18 @@ mod tests {
         );
     }
 
-    /// A run whose every handover point runs back still merges in order, by
-    /// dropping the later window's tokens that start before the kept ones
+    /// A run whose every handover point runs back still merges in order and keeps
+    /// every token, by moving the later window's tokens that start before the
+    /// kept ones up to them
     #[test]
-    fn unordered_run_drops_tokens_that_run_back() {
+    fn unordered_run_retimes_tokens_that_run_back() {
         let left = window(&[(9, 98), (1, 100), (2, 120)]);
         let right = window(&[(1, 90), (2, 95), (3, 110), (4, 130)]);
 
         let merged = merge_overlapping_windows(vec![left, right]);
 
-        assert_eq!(merged.ids(), vec![9, 1, 2, 4]);
-        assert_eq!(merged.frames(), vec![98, 100, 120, 130]);
+        assert_eq!(merged.ids(), vec![9, 1, 2, 3, 4]);
+        assert_eq!(merged.frames(), vec![98, 100, 120, 120, 130]);
     }
 
     /// Merges many windows of a small vocabulary, where repeats and near-miss
